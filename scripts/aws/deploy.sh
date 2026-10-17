@@ -55,6 +55,9 @@ remote_script() {
   [ -z "$agents_repo" ] || echo "export AGENTS_ECR_REPO='$agents_repo'"
   echo "mkdir -p /opt/buzz"
   echo "aws s3 cp 's3://$bucket/releases/$t.tgz' /opt/buzz/release.tgz"
+  # tar adds and overwrites but deletes nothing, so drop the old agent files first.
+  # A file removed from deploy/aws must not survive on the server.
+  echo "rm -rf /opt/buzz/deploy/aws"
   echo "tar xzf /opt/buzz/release.tgz --no-same-owner -C /opt/buzz"
   echo "bash /opt/buzz/scripts/aws/remote-deploy.sh '$t'"
 }
@@ -116,8 +119,13 @@ if [ "${ROLLBACK:-}" = "1" ]; then
   aws s3api head-object --bucket "$bucket" --key "releases/$tag.tgz" > /dev/null \
     || die "no release tarball at s3://$bucket/releases/$tag.tgz, cannot roll back to $tag"
   if [ -n "$agents_repo" ]; then
-    aws ecr describe-images --region "$AWS_REGION" --repository-name "${agents_repo#*/}" --image-ids "imageTag=$tag" > /dev/null 2>&1 \
-      || die "no agents image tagged $tag in ${agents_repo#*/} (it was deployed with AGENTS empty?), cannot roll back to $tag with agents"
+    if ! ecr_err="$(aws ecr describe-images --region "$AWS_REGION" --repository-name "${agents_repo#*/}" --image-ids "imageTag=$tag" 2>&1 > /dev/null)"; then
+      case "$ecr_err" in
+        *ImageNotFoundException*)
+          die "no agents image tagged $tag in ${agents_repo#*/} (was it deployed with AGENTS empty?). To roll back the relay alone, set AGENTS= in .aws.env for this run. That stops all agents." ;;
+        *) die "could not check for the agents image tagged $tag: $ecr_err" ;;
+      esac
+    fi
   fi
 fi
 
@@ -140,6 +148,8 @@ if [ "${ROLLBACK:-}" != "1" ]; then
   cp -R "$REPO_ROOT/deploy/compose" "$stage/deploy/compose"
   cp -R "$REPO_ROOT/deploy/aws" "$stage/deploy/aws"
   find "$stage/deploy/compose" -maxdepth 1 -name '.env*' ! -name '.env.example' -delete
+  find "$stage/deploy/aws" -name '.env*' ! -name '.env.example' -delete
+  find "$stage" -name '.DS_Store' -delete
   cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/render-env.sh" \
     "$REPO_ROOT/scripts/aws/render-agents-env.sh" "$REPO_ROOT/scripts/aws/remote-deploy.sh" \
     "$stage/scripts/aws/"

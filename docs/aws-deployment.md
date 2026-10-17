@@ -35,7 +35,7 @@ You also need two things in AWS that no `make` target creates:
 5. `make secrets` creates the six relay secrets in SSM Parameter Store under `/buzz/`. It skips any that already exist, so running it again is safe.
 6. `make deploy` backs up, builds the image, pushes it, and starts the relay on the server. The working tree must be clean. `DRY_RUN=1 make deploy` runs the checks and the backup, then prints the server command without sending it.
 
-On the first `make deploy` the backup prints `no postgres container` and continues, because no database exists yet. If the deploy fails right after `make apply` because the server has not registered with SSM yet, wait a few minutes and run it again.
+On the first `make deploy` the backup prints `no postgres container` and continues, because no database exists yet. `AGENTS` defaults to `claude,codex`, so the first `make deploy` also ends with an error that says the relay is up and the agents need secrets and registration. Either follow the steps under Agents, or set `AGENTS=` in `.aws.env` to run without agents. If the deploy fails right after `make apply` because the server has not registered with SSM yet, wait a few minutes and run it again.
 
 ## First-deploy check
 
@@ -139,13 +139,13 @@ By default `AGENTS=claude,codex` runs one Claude agent and one Codex agent. Set 
 
 ### Setup order
 
-1. `make apply`, then `make deploy` once, so the relay is up.
+1. `make apply`, then `make deploy` once so the relay is up. Agents need a running relay to register, so this first deploy has no agent keys or credentials. It brings the relay up, then stops with an error that says the relay is up and to run `make agents-secrets` and `make agents-register`. That error is expected. Do not roll back.
 2. Export the credentials in your shell. They never go in `.aws.env`. For example, `set -a; . ./.env; set +a` loads them from a `.env` file.
    - Claude agents: `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` if no token is set.
    - Codex agents: `OPENAI_API_KEY`.
 3. `make agents-secrets` stores them in SSM under `/buzz/agents/`. It skips any that already exist.
 4. `make agents-register` creates one identity per agent and adds it to the relay. It is safe to run again.
-5. `make deploy` builds and pushes the agent image, renders each agent's environment on the server, and starts the agent containers after the relay is healthy.
+5. `make deploy` again. After the relay is healthy, it renders each agent's environment on the server and starts the agent containers. A failure in this agent phase leaves the relay running, fails the deploy, and records no last good image.
 
 ### Defining several agents
 
@@ -180,7 +180,7 @@ Agents bill your own Anthropic and OpenAI accounts, and nothing in this project 
 
 ### Rollback and agents
 
-A rollback restores the relay and the agent image to the same tag. Both images are built and pushed under one tag, and `/buzz/last_good_image` holds it. Before it sends anything, the rollback checks that the agents image with that tag exists in ECR. If it does not, it stops with `no agents image tagged <tag>`. That happens for a release that was deployed with `AGENTS` empty. A release built before agents existed also has no agent files, so a deploy with `AGENTS` set fails early with `release has no deploy/aws agent files`.
+A rollback restores the relay and the agent image to the same tag. Both images are built and pushed under one tag, and `/buzz/last_good_image` holds it. Before it sends anything, the rollback checks that the agents image with that tag exists in ECR. If it does not, it stops with `no agents image tagged <tag>`. That happens for a release that was deployed with `AGENTS` empty. To roll back the relay alone, set `AGENTS=` in `.aws.env` for that run. That stops all agents. Any other ECR error, such as a missing permission or an expired login, is shown as the AWS error text. A release built before agents existed also has no agent files, so a deploy with `AGENTS` set fails early with `release has no deploy/aws agent files`.
 
 ### Troubleshooting agents
 
@@ -213,7 +213,7 @@ STUB_DIR=<dir> STUB_LOG=<file> PATH="$PWD/tests/aws/stubs:$PATH" \
   bash scripts/aws/render-agents-env.sh <outdir> buzz-t9-agent:local deploy/aws/agents
 
 # 5. Point the agent at the local relay, then start it.
-sed -i '' 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=ws://buzz-t9.test:53000#' <outdir>/t9.env
+sed 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=ws://buzz-t9.test:53000#' <outdir>/t9.env > <outdir>/t9.env.new && mv <outdir>/t9.env.new <outdir>/t9.env
 docker compose -p buzz-agent-t9 -f deploy/aws/compose.agents.yml --env-file <outdir>/t9.compose.env up -d
 docker logs buzz-agent-t9-agent-1
 

@@ -1,5 +1,5 @@
 # One agent per Compose project. Run once per agent:
-#   docker compose -p buzz-agent-<name> -f compose.agents.yml --env-file <outdir>/<name>.env up -d
+#   docker compose -p buzz-agent-<name> -f compose.agents.yml --env-file <outdir>/<name>.compose.env up -d
 # The env file supplies the variables below. Each project gets its own network and
 # its own home volume, so agents cannot reach each other or the relay's databases.
 services:

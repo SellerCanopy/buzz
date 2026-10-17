@@ -28,7 +28,8 @@ new_repo() {
   echo "compose-agents" > "$REPO/deploy/aws/compose.agents.yml"
   echo "{}" > "$REPO/deploy/aws/agents/a/mcp.json"
   echo "example" > "$REPO/deploy/compose/.env.example"
-  printf 'ignored.txt\ndeploy/compose/.env\ndeploy/compose/.env.*\n!deploy/compose/.env.example\n' > "$REPO/.gitignore"
+  echo "agent-example" > "$REPO/deploy/aws/.env.example"
+  printf 'ignored.txt\ndeploy/compose/.env\ndeploy/compose/.env.*\n!deploy/compose/.env.example\ndeploy/aws/**/.env*\ndeploy/aws/.env*\n!deploy/aws/.env.example\n.DS_Store\n' > "$REPO/.gitignore"
   (
     cd "$REPO" || exit 1
     git init -q .
@@ -425,6 +426,19 @@ scenario_rollback_without_agents_image_stops() {
   echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" > "$STUB_DIR/ecr-describe-images.err"
   run_deploy "$1" ROLLBACK=1 AGENTS=a:claude -- oldtag5
   [ "$RC" -ne 0 ] && grep -qF "no agents image tagged oldtag5" "$ERR" \
+    && grep -qF "set AGENTS= in .aws.env" "$ERR" && grep -qF "stops all agents" "$ERR" \
+    && [ "$(log_count 'send-command')" -eq 0 ] && [ "$(log_count 'put-parameter')" -eq 0 ]
+}
+
+# Any other ECR error (no permission, expired login, wrong region) must show its
+# own text, not claim that the image is missing.
+scenario_rollback_ecr_error_surfaced() {
+  new_repo; stubs_ok; mk_backups
+  echo 254 > "$STUB_DIR/ecr-describe-images.rc"
+  echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation: not allowed" > "$STUB_DIR/ecr-describe-images.err"
+  run_deploy "$1" ROLLBACK=1 AGENTS=a:claude -- oldtag7
+  [ "$RC" -ne 0 ] && grep -qF "AccessDeniedException" "$ERR" && grep -qF "not allowed" "$ERR" \
+    && ! grep -qF "no agents image tagged" "$ERR" \
     && [ "$(log_count 'send-command')" -eq 0 ] && [ "$(log_count 'put-parameter')" -eq 0 ]
 }
 
@@ -477,6 +491,43 @@ scenario_build_agents_failure_stops() {
 }
 
 # make agents-logs AGENT=c fails when c is not in AGENTS. Runs the real Makefile.
+# Local secrets and editor files must not reach the server. A .env.example stays.
+scenario_tarball_drops_agent_secrets() {
+  new_repo; stubs_ok; mk_backups
+  echo "SECRET=1" > "$REPO/deploy/aws/.env"
+  echo "SECRET=1" > "$REPO/deploy/aws/agents/a/.env.local"
+  echo "x" > "$REPO/deploy/aws/.DS_Store"
+  echo "x" > "$REPO/deploy/aws/agents/a/.DS_Store"
+  echo "x" > "$REPO/deploy/compose/.DS_Store"
+  run_deploy "$1" AGENTS=a:claude
+  [ "$RC" -eq 0 ] || return 1
+  local list
+  list="$(tar tzf "$STUB_DIR/s3-cp.upload")"
+  printf '%s\n' "$list" | grep -qx 'deploy/aws/.env.example' || return 1
+  printf '%s\n' "$list" | grep -qx 'deploy/aws/agents/a/mcp.json' || return 1
+  ! printf '%s\n' "$list" | grep -qE '(^|/)\.env($|\.local$)' || return 1
+  ! printf '%s\n' "$list" | grep -qF '.DS_Store'
+}
+
+# tar deletes nothing, so the server command removes the old release copy of
+# deploy/aws first. The extract lines run for real against a temp directory.
+scenario_release_drops_removed_agent_files() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" DRY_RUN=1 AGENTS=a:claude
+  [ "$RC" -eq 0 ] || return 1
+  local root="$WORK/opt" rel="$WORK/newrel"
+  rm -rf "$root" "$rel"
+  mkdir -p "$root/deploy/aws/agents/gone" "$root/deploy/compose" "$rel/deploy/aws/agents/a"
+  echo old > "$root/deploy/aws/agents/gone/mcp.json"
+  echo keep > "$root/deploy/compose/.env"
+  echo new > "$rel/deploy/aws/agents/a/mcp.json"
+  tar czf "$root/release.tgz" -C "$rel" deploy
+  grep -E '^(rm -rf /opt/buzz/deploy/aws|tar xzf )' "$OUT" | sed "s#/opt/buzz#$root#g" > "$WORK/extract.sh"
+  bash -e "$WORK/extract.sh" || return 1
+  [ ! -e "$root/deploy/aws/agents/gone" ] || return 1
+  [ -f "$root/deploy/aws/agents/a/mcp.json" ] && [ -f "$root/deploy/compose/.env" ]
+}
+
 scenario_make_agents_logs_unknown() {
   new_repo; stubs_ok
   RC=0
@@ -536,6 +587,9 @@ expect_ok "full deploy with agents: relay, sprig, then agents image, then send, 
 expect_ok "full deploy with AGENTS empty builds no agents image" scenario_full_deploy_without_agents "$R"
 expect_ok "rollback checks the agents image and redeploys both under the recorded tag" scenario_rollback_restores_both_tags "$R"
 expect_ok "rollback to a tag with no agents image stops before sending" scenario_rollback_without_agents_image_stops "$R"
+expect_ok "rollback shows an ECR error that is not 'image not found'" scenario_rollback_ecr_error_surfaced "$R"
+expect_ok "tarball drops agent .env files and .DS_Store, keeps .env.example" scenario_tarball_drops_agent_secrets "$R"
+expect_ok "a file removed from deploy/aws is gone on the server after extract" scenario_release_drops_removed_agent_files "$R"
 expect_ok "rollback with AGENTS empty skips the agents image check" scenario_rollback_with_agents_off_skips_image_check "$R"
 expect_ok "build.sh --push builds sprig locally, then pushes the agents image" scenario_build_agents "$R"
 expect_ok "build.sh without --push loads the agents image locally" scenario_build_agents_load "$R"
@@ -602,5 +656,16 @@ expect_caught "agents-logs accepts an unknown agent" scenario_make_agents_logs_u
   's/^  \[ -n "\$match" \] \|\| die .*$/  true/'
 expect_caught "agents files left out of the tarball" scenario_full_deploy deploy.sh \
   's/^  cp -R "\$REPO_ROOT\/deploy\/aws".*$/  true/'
+
+expect_caught "ECR errors reported as image not found" scenario_rollback_ecr_error_surfaced deploy.sh \
+  's/^        \*ImageNotFoundException\*\)$/        *)/'
+expect_caught "no workaround named for a missing agents image" scenario_rollback_without_agents_image_stops deploy.sh \
+  's/ To roll back the relay alone, set AGENTS= in .aws.env for this run\. That stops all agents\.//'
+expect_caught "agent .env files shipped in the tarball" scenario_tarball_drops_agent_secrets deploy.sh \
+  "s/^  find \"\\\$stage\/deploy\/aws\" -name .*\$/  true/"
+expect_caught ".DS_Store shipped in the tarball" scenario_tarball_drops_agent_secrets deploy.sh \
+  "s/^  find \"\\\$stage\" -name '.DS_Store' -delete\$/  true/"
+expect_caught "old deploy/aws kept on the server" scenario_release_drops_removed_agent_files deploy.sh \
+  's/^  echo "rm -rf \/opt\/buzz\/deploy\/aws"$/  true/'
 
 exit "$fail"

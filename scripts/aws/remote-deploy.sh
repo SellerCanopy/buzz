@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs on the server (over SSM) after the release tarball is unpacked into
 # /opt/buzz. Logs in to ECR, renders deploy/compose/.env from SSM, and runs the
-# Compose upgrade with TLS. Then it starts the agents and stops the agent
-# projects that left AGENTS.
+# Compose upgrade with TLS. Then it renders and starts the agents and stops the
+# agent projects that left AGENTS.
 # Usage: remote-deploy.sh <tag>
 # Environment: BUZZ_DOMAIN, RELAY_OWNER_PUBKEY, ECR_REPO (the relay repository
 # URL). AGENTS (empty or unset: no agents), AGENTS_ECR_REPO (required when AGENTS
@@ -10,9 +10,11 @@
 # AGENT_RESPOND_TO_ALLOWLIST (read by render-agents-env.sh), AGENT_SETTLE_SECONDS
 # (how long an agent must stay up, default 15). BUZZ_HOME overrides /opt/buzz for
 # tests.
-# The agent files are rendered before the upgrade, so a missing credential stops
-# the deploy before the relay changes. The agents start only after
-# `run.sh upgrade` returns, which waits for the relay to be healthy.
+# The whole agent phase (render, start, stale cleanup) runs after `run.sh upgrade`
+# returns, which waits for the relay to be healthy. The first deploy has no agent
+# keys or credentials yet, because registering an agent needs a running relay. So
+# a failed render leaves the relay up and fails the deploy with a message that
+# says what to run.
 set -euo pipefail
 umask 077
 
@@ -122,10 +124,13 @@ bash "$BUZZ_HOME/scripts/aws/render-env.sh" "$compose_dir/.env.example" "$ECR_RE
 chmod 600 "$tmp"
 mv "$tmp" "$compose_dir/.env"
 
-render_agents
-
 cd "$compose_dir"
 BUZZ_COMPOSE_TLS=true ./run.sh upgrade
+
+if ! render_agents; then
+  echo "error: the relay is up, but the agents could not be set up. Run make agents-secrets and make agents-register, then make deploy again." >&2
+  exit 1
+fi
 start_agents
 stop_stale_agents
 [ "$failed" -eq 0 ] || exit 1

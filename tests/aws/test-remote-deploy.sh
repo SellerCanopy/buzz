@@ -227,11 +227,42 @@ scenario_agents_need_a_repository() {
   [ "$RC" -ne 0 ] && grep -qF "AGENTS_ECR_REPO must be set" "$WORK/err" && [ ! -s "$WORK/run.log" ]
 }
 
-# A missing credential fails the render, so the relay is not touched.
-scenario_agent_render_failure_stops_before_upgrade() {
+# The first deploy has no agent keys or credentials, because registering an agent
+# needs a running relay. The relay must come up first. A failed render then
+# leaves it up, exits non-zero (so deploy.sh records no last-good image), and says
+# what to run.
+scenario_agent_render_failure_after_upgrade() {
   new_home; with_secrets
   run_remote "$1" "${AGENTS_ENV[@]}"
-  [ "$RC" -ne 0 ] && [ ! -s "$WORK/run.log" ] && [ "$(log_count 'up -d')" -eq 0 ]
+  [ "$RC" -ne 0 ] || return 1
+  [ "$(log_count '^run.sh upgrade$')" -eq 1 ] || return 1
+  [ "$(log_count 'up -d')" -eq 0 ] || return 1
+  grep -qF "the relay is up" "$WORK/err" || return 1
+  grep -qF "make agents-secrets" "$WORK/err" || return 1
+  grep -qF "make agents-register" "$WORK/err"
+}
+
+scenario_agents_render_after_upgrade() {
+  new_home; with_secrets; with_agent_params a b
+  echo "container-id" > "$STUB_DIR/docker-compose-ps.out"
+  run_remote "$1" "${AGENTS_ENV[@]}"
+  [ "$RC" -eq 0 ] || return 1
+  local upgrade render
+  upgrade="$(log_line '^run.sh upgrade$')"
+  render="$(log_line '^aws ssm get-parameters-by-path --path /buzz/agents/ ')"
+  [ -n "$upgrade" ] && [ -n "$render" ] && [ "$render" -gt "$upgrade" ]
+}
+
+# A stale project whose name starts with a wanted agent's name plus a dash is not
+# the wanted agent.
+scenario_stale_project_with_wanted_prefix() {
+  new_home; with_secrets; with_agent_params b
+  echo "container-id" > "$STUB_DIR/docker-compose-ps.out"
+  printf 'buzz-agent-b\nbuzz-agent-b-c\n' > "$STUB_DIR/docker-ps.out"
+  run_remote "$1" AGENTS=b:claude "AGENTS_ECR_REPO=$AGENTS_REPO"
+  [ "$RC" -eq 0 ] || return 1
+  [ "$(log_count '^docker compose -p buzz-agent-b-c down$')" -eq 1 ] || return 1
+  [ "$(log_count '^docker compose -p buzz-agent-b down$')" -eq 0 ]
 }
 
 R="$REPO_ROOT/scripts/aws"
@@ -251,7 +282,9 @@ expect_ok "stale agent projects are stopped when AGENTS is empty" scenario_stale
 expect_ok "with AGENTS empty and no agent files, nothing agent-related runs" scenario_no_agents_without_cleanup_target "$R"
 expect_ok "agents need deploy/aws in the release" scenario_agents_need_the_release_files "$R"
 expect_ok "agents need AGENTS_ECR_REPO" scenario_agents_need_a_repository "$R"
-expect_ok "a failed agent render stops before the relay changes" scenario_agent_render_failure_stops_before_upgrade "$R"
+expect_ok "a failed agent render leaves the relay up, fails the deploy, and says what to run" scenario_agent_render_failure_after_upgrade "$R"
+expect_ok "agent files are rendered after the relay upgrade" scenario_agents_render_after_upgrade "$R"
+expect_ok "a stale project named like a wanted agent plus a suffix is stopped" scenario_stale_project_with_wanted_prefix "$R"
 
 expect_caught "TLS flag dropped" scenario_deploys remote-deploy.sh \
   's/^BUZZ_COMPOSE_TLS=true \.\/run\.sh upgrade$/.\/run.sh upgrade/'
@@ -282,7 +315,15 @@ expect_caught "running agent stopped as stale" scenario_stale_projects_stopped_w
   's/^    case "\$wanted" in$/    case "" in/'
 expect_caught "release files not required" scenario_agents_need_the_release_files remote-deploy.sh \
   's/^  \[ -f "\$agents_compose" \] && \[ -f .*$/  true; true \\/'
-expect_caught "render after the upgrade" scenario_agent_render_failure_stops_before_upgrade remote-deploy.sh \
-  's/^render_agents$/true/; s/^start_agents$/render_agents; start_agents/'
+expect_caught "agents rendered before the upgrade" scenario_agent_render_failure_after_upgrade remote-deploy.sh \
+  's/^BUZZ_COMPOSE_TLS=true \.\/run\.sh upgrade$/render_agents; BUZZ_COMPOSE_TLS=true .\/run.sh upgrade/; s/^if ! render_agents; then$/if false; then/'
+expect_caught "agents rendered before the upgrade (order)" scenario_agents_render_after_upgrade remote-deploy.sh \
+  's/^BUZZ_COMPOSE_TLS=true \.\/run\.sh upgrade$/render_agents; BUZZ_COMPOSE_TLS=true .\/run.sh upgrade/; s/^if ! render_agents; then$/if false; then/'
+expect_caught "render failure does not say what to run" scenario_agent_render_failure_after_upgrade remote-deploy.sh \
+  's/Run make agents-secrets and make agents-register, then make deploy again\./Fix it./'
+expect_caught "render failure exits zero" scenario_agent_render_failure_after_upgrade remote-deploy.sh \
+  's/^  exit 1$/  exit 0/'
+expect_caught "stale project matched by name prefix" scenario_stale_project_with_wanted_prefix remote-deploy.sh \
+  's/^    name="\$\{project#buzz-agent-\}"$/    name="${project#buzz-agent-}"; name="${name%%-*}"/'
 
 exit "$fail"
