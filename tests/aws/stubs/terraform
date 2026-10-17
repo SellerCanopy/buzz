@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Fake terraform CLI for tests/aws. Never touches state or AWS.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "terraform <args>" to $STUB_LOG.
+#   - For "terraform [-chdir=DIR] output -raw <name>", prints the contents of
+#     $STUB_DIR/tf-<name>.out with no added newline, and exits 1 when the file
+#     is missing (like a missing output).
+#   - Any other command prints $STUB_DIR/terraform-<subcommand>.out when it
+#     exists and exits 0.
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "terraform $*" >> "$STUB_LOG"
+
+args=("$@")
+if [ "${args[0]:-}" != "${args[0]#-chdir=}" ]; then
+  args=("${args[@]:1}")
+fi
+
+if [ "${args[0]:-}" = "output" ] && [ "${args[1]:-}" = "-raw" ]; then
+  f="$STUB_DIR/tf-${args[2]:-}.out"
+  if [ -f "$f" ]; then
+    cat "$f"
+    exit 0
+  fi
+  echo "stub terraform: no output named ${args[2]:-}" >&2
+  exit 1
+fi
+
+f="$STUB_DIR/terraform-${args[0]:-}.out"
+[ -f "$f" ] && cat "$f"
+exit 0

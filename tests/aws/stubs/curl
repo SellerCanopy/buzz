@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fake curl for tests/aws. Never opens a connection.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "curl <args>" to $STUB_LOG.
+#   - Prints $STUB_DIR/curl.out when it exists, and exits with the number in
+#     $STUB_DIR/curl.rc (default 0).
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "curl $*" >> "$STUB_LOG"
+
+[ -f "$STUB_DIR/curl.out" ] && cat "$STUB_DIR/curl.out"
+rc=0
+[ -f "$STUB_DIR/curl.rc" ] && rc="$(cat "$STUB_DIR/curl.rc")"
+exit "$rc"

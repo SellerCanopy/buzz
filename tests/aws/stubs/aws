@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Fake aws CLI for tests/aws. Never contacts AWS.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "aws <args>" to $STUB_LOG.
+#   - Prints $STUB_DIR/<command>-<subcommand>.out to stdout when it exists
+#     (for example ssm-get-parameter.out). A missing file means empty output.
+#   - Prints $STUB_DIR/<command>-<subcommand>.err to stderr when it exists.
+#   - Exits with the number in $STUB_DIR/<command>-<subcommand>.rc (default 0).
+#   - For "ssm get-parameter --name /x/NAME", ssm-get-parameter.NAME.rc and
+#     ssm-get-parameter.NAME.err take precedence over the generic files.
+#   - For "ssm put-parameter --value file://PATH", appends the file contents
+#     (one line) to $STUB_DIR/put-values.log so tests can check the value
+#     without it appearing in $STUB_LOG.
+#   - For "s3 cp <local-file> s3://...", copies the local file to
+#     $STUB_DIR/s3-cp.upload.
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "aws $*" >> "$STUB_LOG"
+
+name="${1:-}-${2:-}"
+rcfile="$STUB_DIR/$name.rc"
+errfile="$STUB_DIR/$name.err"
+
+if [ "$name" = "ssm-get-parameter" ]; then
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--name" ]; then
+      base="${arg##*/}"
+      [ -f "$STUB_DIR/$name.$base.rc" ] && rcfile="$STUB_DIR/$name.$base.rc"
+      [ -f "$STUB_DIR/$name.$base.err" ] && errfile="$STUB_DIR/$name.$base.err"
+    fi
+    prev="$arg"
+  done
+fi
+
+if [ "$name" = "ssm-put-parameter" ]; then
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--value" ] && [ "${arg#file://}" != "$arg" ]; then
+      cat "${arg#file://}" >> "$STUB_DIR/put-values.log"
+      echo >> "$STUB_DIR/put-values.log"
+    fi
+    prev="$arg"
+  done
+fi
+
+if [ "$name" = "s3-cp" ] && [ -f "${3:-}" ]; then
+  cp "$3" "$STUB_DIR/s3-cp.upload"
+fi
+
+[ -f "$STUB_DIR/$name.out" ] && cat "$STUB_DIR/$name.out"
+[ -f "$errfile" ] && cat "$errfile" >&2
+rc=0
+[ -f "$rcfile" ] && rc="$(cat "$rcfile")"
+exit "$rc"

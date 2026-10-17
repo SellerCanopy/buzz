@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fake docker CLI for tests/aws. Never builds or pushes anything.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "docker <args>" to $STUB_LOG.
+#   - Drains stdin when --password-stdin is given, without logging it.
+#   - Prints $STUB_DIR/docker-<subcommand>.out when it exists (for example
+#     docker-login.out), prints docker-<subcommand>.err to stderr when it
+#     exists, and exits with the number in docker-<subcommand>.rc (default 0).
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "docker $*" >> "$STUB_LOG"
+
+for arg in "$@"; do
+  if [ "$arg" = "--password-stdin" ]; then
+    cat > /dev/null
+    break
+  fi
+done
+
+name="docker-${1:-}"
+[ -f "$STUB_DIR/$name.out" ] && cat "$STUB_DIR/$name.out"
+[ -f "$STUB_DIR/$name.err" ] && cat "$STUB_DIR/$name.err" >&2
+rc=0
+[ -f "$STUB_DIR/$name.rc" ] && rc="$(cat "$STUB_DIR/$name.rc")"
+exit "$rc"
