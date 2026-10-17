@@ -162,7 +162,7 @@ Each agent gets its own container, home volume, and Compose project (`buzz-agent
 
 ### Per-agent tools
 
-Put an agent's MCP servers (tools it can call) in `deploy/aws/agents/<name>/mcp.json`. The file is committed, so it holds no secrets. Details and limits are in `deploy/aws/agents/README.md`.
+Put an agent's MCP servers (tools it can call) in `deploy/aws/agents/<name>/mcp.json`. The file is committed, so it holds no secrets. If a server needs an API key, write `${NAME}` in the file and store the value with `make agents-env AGENT=<name> VAR=NAME` (export `NAME` in your shell first), then run `make deploy`. Details and limits are in `deploy/aws/agents/README.md`.
 
 ### Using an agent
 

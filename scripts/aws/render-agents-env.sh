@@ -6,8 +6,10 @@
 #   <name>.compose.env      variables for compose.agents.yml (AGENTS_IMAGE,
 #                           AGENT_NAME, BUZZ_DOMAIN, AGENT_ENV_FILE, AGENT_CONFIG_DIR)
 #   <name>/config/mcp.json  copy of <config-src>/<name>/mcp.json, or an empty config
-# and agents.list (one name per line). Env files of agents no longer in AGENTS
-# are removed. Reads BUZZ_DOMAIN, RELAY_OWNER_PUBKEY, AGENTS, AGENT_RESPOND_TO,
+# and agents.list (one name per line). A ${VAR} in an agent's mcp.json (without a
+# :-default) is written to that agent's env file from the SSM parameter
+# /buzz/agents/<name>/env/<VAR>; a missing one is an error. Env files of agents
+# no longer in AGENTS are removed. Reads BUZZ_DOMAIN, RELAY_OWNER_PUBKEY, AGENTS, AGENT_RESPOND_TO,
 # and AGENT_RESPOND_TO_ALLOWLIST from the environment, and the agent keys and
 # credentials from SSM under /buzz/agents/.
 # Each agent's optional <config-src>/<name>/agent.json sets its display_name,
@@ -25,6 +27,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NAME_PATTERN='^[a-z][a-z0-9-]{0,23}$'
 PLAIN_PATTERN='^[A-Za-z0-9._-]+$'
+# Agent secrets for ${VAR} references in mcp.json. Values land unquoted in an env
+# file, so $, #, quotes, backslash, spaces, and line breaks are not allowed.
+SECRET_PATTERN='^[A-Za-z0-9._~+/=:@-]+$'
 
 [ $# -eq 3 ] || die "usage: render-agents-env.sh <outdir> <agents-image> <config-src>"
 outdir="$1"
@@ -67,7 +72,7 @@ secret() {
 # returns 1 after an error on stderr if the key or credential is missing, empty,
 # or misshapen. Safe to run twice.
 agent_env() {
-  local name="$1" runtime="$2" key cred_name cred command
+  local name="$1" runtime="$2" key cred_name cred command mcp_vars var value
   local settings="$config_src/$name/agent.json"
   key="$(secret "$name/BUZZ_PRIVATE_KEY" '^[0-9a-f]{64}$' "64 lowercase hex characters")" \
     || { echo "error: agent $name has no usable key (run make agents-register)" >&2; return 1; }
@@ -103,6 +108,14 @@ agent_env() {
     --default "respond_to=$default_respond_to" --default "respond_to_allowlist=$default_allowlist" \
     || return 1
   echo "$cred_name=$cred"
+  # Secrets for the ${VAR} references in this agent's mcp.json (make agents-env).
+  # Only referenced names are written, so a stored secret nobody uses stays off disk.
+  mcp_vars="$(python3 -I "$SCRIPT_DIR/agent_spec.py" mcp-vars "$config_src/$name/mcp.json")" || return 1
+  for var in $mcp_vars; do
+    value="$(secret "$name/env/$var" "$SECRET_PATTERN" "plain characters [A-Za-z0-9._~+/=:@-]")" \
+      || { echo "error: agent $name: mcp.json uses \${$var} (run make agents-env AGENT=$name VAR=$var)" >&2; return 1; }
+    echo "$var=$value"
+  done
 }
 
 # check_config <name>: returns 1 after an error on stderr if the agent's config

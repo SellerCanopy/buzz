@@ -80,7 +80,12 @@ for name in alpha beta; do
 {"mcpServers": {"$name": {"command": "node", "args": ["/fixtures/probe-mcp.js", "$name"]}}}
 JSON
 done
-mkdir -p "$WORK/none"
+mkdir -p "$WORK/none" "$WORK/sec"
+# A ${VAR} in a server's env block is filled in by Claude Code from the container
+# environment, which is how the deploy passes MCP secrets (make agents-env).
+cat > "$WORK/sec/mcp.json" <<'JSON'
+{"mcpServers": {"sec": {"command": "node", "args": ["/fixtures/probe-mcp.js", "sec"], "env": {"PROBE_ENV": "${PROBE_SECRET}"}}}}
+JSON
 cat > "$WORK/driver.sh" <<'DRIVER'
 #!/bin/bash
 exec node /fixtures/acp-client.js "$@"
@@ -124,6 +129,9 @@ docker run --rm --network none --user 0 -v "$UNREADABLE_VOLUME:/d" -v "$WORK/alp
 run_agent alpha "$WORK/alpha"
 run_agent beta "$WORK/beta"
 run_agent none "$WORK/none"
+run_agent sec "$WORK/sec" -e PROBE_SECRET=s3cr3t-value
+# Same config without the variable in the container: the expectation must not hold.
+run_agent nosec "$WORK/sec"
 # Wrong config on purpose: alpha's expectation must not hold for beta's config.
 run_agent crossed "$WORK/beta"
 # Config mounted but the image's agent-entrypoint skipped: nothing installs it.
@@ -134,7 +142,7 @@ run_agent unreadable "$UNREADABLE_VOLUME"
 # image points at the pinned install. A path that does not exist must stop the probes.
 run_agent badexec "$WORK/alpha" -e CLAUDE_CODE_EXECUTABLE=/nonexistent/claude
 
-for label in alpha beta none crossed skipped; do
+for label in alpha beta none sec nosec crossed skipped; do
   if session_ok "$label"; then
     pass "$label: claude-agent-acp answered initialize and session/new"
   else
@@ -150,6 +158,8 @@ check() {
 check alpha alpha
 check beta beta
 check none ""
+check sec "$(printf 'env:s3cr3t-value\nsec')"
+if [ "$(started nosec)" = "$(printf 'env:s3cr3t-value\nsec')" ]; then bad "mutant survives: secret expanded without the variable"; else pass "mutant fails: secret not expanded without the variable"; fi
 
 # The assertions must be able to fail: the same expectation is checked against a
 # container with the wrong config and one where the install step did not run.

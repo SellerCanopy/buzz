@@ -4,6 +4,8 @@
 // On start it appends <name> to /tmp/probe-started, so a test can see which
 // probe servers an agent actually launched. It answers initialize and
 // tools/list (one tool named <name>) and ignores notifications.
+// When PROBE_ENV is set it also appends "env:<value>", so a test can see what a
+// ${VAR} in the server's env block expanded to.
 "use strict";
 const fs = require("fs");
 const readline = require("readline");
@@ -14,6 +16,9 @@ if (!name) {
   process.exit(2);
 }
 fs.appendFileSync("/tmp/probe-started", name + "\n");
+if (process.env.PROBE_ENV !== undefined) {
+  fs.appendFileSync("/tmp/probe-started", "env:" + process.env.PROBE_ENV + "\n");
+}
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 

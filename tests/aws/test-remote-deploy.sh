@@ -64,7 +64,7 @@ run_remote() {
 
 # up_line <name>: the log line of the Compose start for that agent, empty if none.
 up_line() {
-  log_line "^docker compose -p buzz-agent-$1 -f $HOME_DIR/deploy/aws/compose.agents.yml --env-file $HOME_DIR/agents/$1.compose.env up -d\$"
+  log_line "^docker compose -p buzz-agent-$1 -f $HOME_DIR/deploy/aws/compose.agents.yml --env-file $HOME_DIR/agents/$1.compose.env up -d --force-recreate\$"
 }
 
 mode_of() { ls -ld "$1" | cut -c1-10; }
@@ -319,7 +319,9 @@ expect_caught "agent failure ignored" scenario_agent_failure_fails_deploy_with_l
 expect_caught "agent logs not printed" scenario_agent_failure_fails_deploy_with_logs remote-deploy.sh \
   's/^  agent_compose "\$1" logs .*$/  true/'
 expect_caught "up failure ignored" scenario_agent_up_failure_fails_deploy remote-deploy.sh \
-  's/^    if agent_compose "\$name" up -d; then$/    if agent_compose "$name" up -d || true; then/'
+  's/^    if agent_compose "\$name" up -d --force-recreate; then$/    if agent_compose "$name" up -d --force-recreate || true; then/'
+expect_caught "agents not recreated for a changed secret" scenario_agents_start_after_upgrade remote-deploy.sh \
+  's/ up -d --force-recreate; then$/ up -d; then/'
 expect_caught "stale projects stopped with their volumes" scenario_stale_projects_stopped_without_volumes remote-deploy.sh \
   's/docker compose -p "\$project" down/docker compose -p "$project" down -v/'
 expect_caught "stale cleanup skipped when AGENTS is empty" scenario_stale_cleanup_runs_with_no_agents remote-deploy.sh \

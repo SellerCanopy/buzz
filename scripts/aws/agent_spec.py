@@ -9,8 +9,12 @@ Usage:
     agent_spec.py get <agent.json> <field> [--default VALUE]
     agent_spec.py env <agent.json> [--default FIELD=VALUE ...]
     agent_spec.py fields
+    agent_spec.py mcp-vars <mcp.json>
+    agent_spec.py var <NAME>
 
 A missing file is an empty spec. Errors go to stderr and exit 1.
+mcp-vars prints the variables an mcp.json needs as secrets: each ${NAME} without a
+:-default. var checks that NAME may be stored as an agent secret.
 """
 
 import argparse
@@ -23,6 +27,15 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 TOKEN = re.compile(r"[A-Za-z0-9._:/-]+")
 FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 MAX_INSTRUCTIONS_BYTES = 65536
+
+# ${NAME} or ${NAME:-default} in an mcp.json. Claude Code expands these from the
+# container environment when a session starts.
+MCP_VAR = re.compile(r"\$\{([^}:]*)(:-[^}]*)?\}")
+SECRET_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# Variables every container already has. A reference to one needs no secret.
+AMBIENT_VARS = ("HOME", "PATH", "PWD", "USER", "SHELL")
+# The deploy writes these itself, so a secret may not shadow them.
+RESERVED_PREFIXES = ("BUZZ_", "CLAUDE", "ANTHROPIC_", "OPENAI_", "CODEX_")
 
 
 class Field:
@@ -137,6 +150,29 @@ def check_value(field, value, path):
     return value
 
 
+def check_var_name(name):
+    """Exits 1 unless name may be stored as an agent secret."""
+    if not SECRET_NAME.fullmatch(name):
+        fail("%s is not a valid secret name: use capital letters, digits, and _, starting with a letter (at most 64 characters)" % name)
+    if name.startswith(RESERVED_PREFIXES):
+        fail("%s is reserved: the deploy sets variables starting with %s itself" % (name, ", ".join(RESERVED_PREFIXES)))
+
+
+def mcp_vars(path):
+    """Returns the sorted secret names an mcp.json references. A missing file gives []."""
+    if not os.path.isfile(path):
+        return []
+    with open(path) as handle:
+        text = handle.read()
+    names = set()
+    for name, default in MCP_VAR.findall(text):
+        if default or name in AMBIENT_VARS:
+            continue
+        check_var_name(name)
+        names.add(name)
+    return sorted(names)
+
+
 def load(path):
     """Returns the spec as {field name: checked text}. A missing file gives {}."""
     if not os.path.isfile(path):
@@ -229,10 +265,21 @@ def main():
     env.add_argument("file")
     env.add_argument("--default", action="append")
     sub.add_parser("fields")
+    mcp = sub.add_parser("mcp-vars")
+    mcp.add_argument("file")
+    var = sub.add_parser("var")
+    var.add_argument("name")
     args = parser.parse_args()
 
     if args.command == "fields":
         print(fields_table())
+        return
+    if args.command == "var":
+        check_var_name(args.name)
+        return
+    if args.command == "mcp-vars":
+        for name in mcp_vars(args.file):
+            print(name)
         return
     spec = load(args.file)
     if args.command == "get":

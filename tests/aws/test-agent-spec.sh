@@ -83,12 +83,22 @@ scenario_example_spec_is_valid() {
     && python3 -I "$SPEC" check "$REPO_ROOT/deploy/aws/agents/researcher/agent.json"
 }
 
+scenario_mcp_vars_lists_required_secrets() {
+  local d="${1:-$REPO_ROOT/scripts/aws}"
+  printf '{"a":"${B_KEY}","b":"${A_KEY}","c":"${B_KEY}","d":"${OPT:-x}","e":"${HOME}/y","f":"${PATH}"}' > "$WORK/m.json"
+  python3 -I "$d/agent_spec.py" mcp-vars "$WORK/m.json" > "$WORK/spec.out" 2> "$WORK/spec.err" || return 1
+  [ "$(tr '\n' ' ' < "$WORK/spec.out")" = "A_KEY B_KEY " ] || return 1
+  python3 -I "$d/agent_spec.py" mcp-vars "$WORK/none.json" > "$WORK/spec.out" || return 1
+  [ ! -s "$WORK/spec.out" ]
+}
+
 R="$REPO_ROOT/scripts/aws"
 expect_ok "every field maps to its container variable" scenario_every_field_maps_to_its_variable "$R"
 expect_ok "a missing file gives only the defaults" scenario_missing_file_gives_only_defaults "$R"
 expect_ok "bad values are refused with a message" scenario_bad_values_are_refused "$R"
 expect_ok "allowlist mode needs keys from the spec or the default" scenario_allowlist_mode_needs_keys "$R"
 expect_ok "the allowlist is dropped unless respond_to is allowlist" scenario_allowlist_dropped_unless_allowlist_mode "$R"
+expect_ok "mcp-vars lists each required secret once, sorted" scenario_mcp_vars_lists_required_secrets "$R"
 expect_ok "the README documents every field" scenario_readme_lists_every_field "$R"
 expect_ok "the committed agent specs are valid" scenario_example_spec_is_valid "$R"
 

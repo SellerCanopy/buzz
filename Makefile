@@ -6,7 +6,7 @@ BUILD_TAG = $(or $(TAG),$(shell git rev-parse --short HEAD))
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-register agents-attest agents-status agents-logs
+.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-env agents-register agents-attest agents-status agents-logs
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "} {printf "  %-20s %s\n", $$1, $$2}'
@@ -58,6 +58,9 @@ shell: ## Open an interactive session on the server
 
 agents-secrets: ## Store the agent credentials from your shell in SSM (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, OPENAI_API_KEY)
 	@bash $(SCRIPTS)/agents-secrets.sh
+
+agents-env: ## Store one secret for an agent's mcp.json from your shell (AGENT=<name> VAR=<NAME>; without VAR, list what its mcp.json needs)
+	@AGENT=$(AGENT) VAR=$(VAR) bash $(SCRIPTS)/agents-env.sh
 
 agents-register: ## Create one identity per agent and add it to the relay
 	@bash $(SCRIPTS)/agents-register.sh

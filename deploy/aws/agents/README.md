@@ -117,17 +117,48 @@ Other install locations were not needed.
 
 ## Limits
 
-- **No secrets.** `mcp.json` is committed to git, so it must hold no tokens,
-  keys, or passwords. A later change will add per-agent secret injection.
+- **Secrets go in AWS, not in the file.** `mcp.json` is committed to git, so it must
+  hold no tokens, keys, or passwords. Write `${NAME}` where the server needs one,
+  for example `"env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}`. Then store the value:
+
+  ```bash
+  export GITHUB_TOKEN=...            # in your shell only
+  make agents-env AGENT=coder VAR=GITHUB_TOKEN
+  make deploy
+  ```
+
+  `make agents-env` saves the value encrypted in AWS Parameter Store at
+  `/buzz/agents/<name>/env/<NAME>`. `make agents-env AGENT=coder` with no `VAR`
+  lists the secrets the file needs and which are stored. The deploy finds every
+  `${NAME}` in the file (one with a `:-default`, or `HOME`, `PATH`, `PWD`, `USER`,
+  `SHELL`, needs none), writes those values into that agent's private env file on
+  the server, and recreates the container. A missing secret stops the deploy and
+  names the command to run. To rotate a secret, run `make agents-env` again, then
+  `make deploy`.
+
+  Rules: names use capital letters, digits, and `_`. Names starting with `BUZZ_`,
+  `CLAUDE`, `ANTHROPIC_`, `OPENAI_`, or `CODEX_` are reserved. Values may hold only
+  `A-Z a-z 0-9 . _ ~ + / = : @ -` because the env file stores them unquoted. An agent
+  gets only its own secrets, and only those its `mcp.json` names.
+
+  The agent's tools can read its environment, so a secret is visible to anything the
+  agent runs. Give each server a key with the least access it needs.
 - **`${VAR}` reads the container environment, not the host.** The file is copied as
   written. Claude Code expands `${VAR}` in it at run time from the agent container's
-  environment (checked with a probe server). That environment holds only what the
-  deploy renders into the agent's env file, so a variable set on your laptop or in
-  `.aws.env` is not there.
+  environment (proven for the `env` block by `tests/aws/test-agents-mcp.sh`). A
+  variable set on your laptop or in `.aws.env` is not there unless you store it with
+  `make agents-env`.
 - **File modes matter.** The container user is uid 1001 and the mount is read-only,
   so the staged config directory must be mode 0755 and `mcp.json` mode 0644. If the
   file is unreadable, the container exits with a message naming the path.
 - **Commands must exist in the image.** The image has Node 22, `git`, and `bash`.
   A server that needs another program must install it at run time (for example
   with `npx`) or wait for an image change.
-- **Changes need a deploy.** The file is read when the container starts.
+- **Changes need a deploy.** The file is read when the container starts. The
+  deploy recreates every agent container each time, so the entrypoint copies the
+  new file in and the env file's secrets are read again. The deploy refuses a
+  dirty git tree, so commit a file change first. A secret change alone needs no
+  commit: run `make agents-env`, then `make deploy`.
+
+To pick settings and MCP servers for a job, use the `buzz-agent-config` skill
+(`.claude/skills/buzz-agent-config/SKILL.md`).

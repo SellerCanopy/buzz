@@ -371,6 +371,72 @@ scenario_agent_allowlist_without_keys_exits_1() {
   [ ! -e "$OUT/a.env" ]
 }
 
+# secret_agent_setup: agents a and b. a's mcp.json uses ${GITHUB_TOKEN}, plus a
+# defaulted and an ambient variable that need no secret. Both agents have a stored
+# GITHUB_TOKEN, a also has an unused one, and the values differ per agent. b uses
+# the same mcp.json as a.
+secret_agent_setup() {
+  setup a b
+  printf '{"mcpServers": {"gh": {"command": "echo", "env": {"T": "${GITHUB_TOKEN}", "M": "${MODE:-fast}", "H": "${HOME}"}}}}\n' > "$CFG/a/mcp.json"
+  {
+    printf '/buzz/agents/a/env/GITHUB_TOKEN\t%s\n' "ghp_for-a"
+    printf '/buzz/agents/a/env/UNUSED_KEY\t%s\n' "unused-value"
+    printf '/buzz/agents/b/env/GITHUB_TOKEN\t%s\n' "ghp_for-b"
+  } >> "$STUB_DIR/ssm-get-parameters-by-path.out"
+  mkdir -p "$CFG/b"
+  cp "$CFG/a/mcp.json" "$CFG/b/mcp.json"
+}
+
+scenario_mcp_secret_written_to_that_agent_only() {
+  secret_agent_setup
+  render "$1" a:claude,b:claude
+  [ "$RC" -eq 0 ] || return 1
+  has_line "$OUT/a.env" "GITHUB_TOKEN=ghp_for-a" || return 1
+  ! grep -q "ghp_for-b" "$OUT/a.env" || return 1
+  has_line "$OUT/b.env" "GITHUB_TOKEN=ghp_for-b" || return 1
+  ! grep -q "ghp_for-a" "$OUT/b.env" || return 1
+  [ "$(mode_of "$OUT/a.env")" = "600" ] || return 1
+  ! grep -qE 'UNUSED_KEY|unused-value|MODE|HOME' "$OUT/a.env"
+}
+
+scenario_missing_mcp_secret_exits_1() {
+  secret_agent_setup
+  grep -v 'a/env/GITHUB_TOKEN' "$STUB_DIR/ssm-get-parameters-by-path.out" > "$WORK/p"
+  mv "$WORK/p" "$STUB_DIR/ssm-get-parameters-by-path.out"
+  render "$1" a:claude,b:claude
+  fails_without_writing || return 1
+  grep -qF 'make agents-env AGENT=a VAR=GITHUB_TOKEN' "$WORK/err"
+}
+
+scenario_unsafe_mcp_secret_refused() {
+  local v
+  for v in 'pa$ss' 'two words' 'a"quote' 'a#b' 'a\b'; do
+    secret_agent_setup
+    grep -v 'a/env/GITHUB_TOKEN' "$STUB_DIR/ssm-get-parameters-by-path.out" > "$WORK/p"
+    printf '/buzz/agents/a/env/GITHUB_TOKEN\t%s\n' "$v" >> "$WORK/p"
+    mv "$WORK/p" "$STUB_DIR/ssm-get-parameters-by-path.out"
+    render "$1" a:claude,b:claude
+    fails_without_writing || return 1
+    ! grep -qF -- "$v" "$WORK/err" "$WORK/stdout" || return 1
+  done
+}
+
+scenario_mcp_secret_cannot_shadow_credentials() {
+  secret_agent_setup
+  printf '/buzz/agents/a/env/CLAUDE_CODE_OAUTH_TOKEN\t%s\n' "stored-anyway" >> "$STUB_DIR/ssm-get-parameters-by-path.out"
+  printf '{"mcpServers": {"x": {"command": "echo", "env": {"T": "${CLAUDE_CODE_OAUTH_TOKEN}"}}}}\n' > "$CFG/a/mcp.json"
+  render "$1" a:claude,b:claude
+  fails_without_writing || return 1
+  grep -qF CLAUDE_CODE_OAUTH_TOKEN "$WORK/err"
+}
+
+scenario_mcp_secret_not_on_stdout_or_stderr() {
+  secret_agent_setup
+  render "$1" a:claude,b:claude
+  [ "$RC" -eq 0 ] || return 1
+  ! grep -q "ghp_" "$WORK/stdout" "$WORK/err"
+}
+
 scenario_ssm_call_shape() {
   setup a
   render "$1" a:claude
@@ -407,7 +473,24 @@ expect_ok "an invalid agent.json exits 1 and writes nothing" scenario_bad_agent_
 expect_ok "an agent's respond_to overrides the global default" scenario_agent_json_overrides_respond_to "$R"
 expect_ok "an allowlist agent without keys exits 1" scenario_agent_allowlist_without_keys_exits_1 "$R"
 expect_ok "reads /buzz/agents/ recursively with decryption" scenario_ssm_call_shape "$R"
+expect_ok "an mcp.json secret reaches only its own agent's env file" scenario_mcp_secret_written_to_that_agent_only "$R"
+expect_ok "a missing mcp.json secret exits 1 naming the make target" scenario_missing_mcp_secret_exits_1 "$R"
+expect_ok "an unsafe mcp.json secret is refused, never shown" scenario_unsafe_mcp_secret_refused "$R"
+expect_ok "an mcp.json cannot ask for the agent's own credentials" scenario_mcp_secret_cannot_shadow_credentials "$R"
+expect_ok "mcp.json secrets never reach stdout or stderr" scenario_mcp_secret_not_on_stdout_or_stderr "$R"
 
+expect_caught "mcp.json secrets never written" scenario_mcp_secret_written_to_that_agent_only render-agents-env.sh \
+  's/^    echo "\$var=\$value"$/    true/'
+expect_caught "secrets of every agent written to each" scenario_mcp_secret_written_to_that_agent_only render-agents-env.sh \
+  's#secret "\$name/env/\$var"#secret "a/env/$var"#'
+expect_caught "missing mcp.json secret tolerated" scenario_missing_mcp_secret_exits_1 render-agents-env.sh \
+  's/^      \|\| \{ echo "error: agent \$name: mcp\.json uses .*$/      || value=""; }/'
+expect_caught "mcp.json secret characters unchecked" scenario_unsafe_mcp_secret_refused render-agents-env.sh \
+  's/^SECRET_PATTERN=.*$/SECRET_PATTERN="^.*$"/'
+expect_caught "reserved names allowed" scenario_mcp_secret_cannot_shadow_credentials agent_spec.py \
+  's/^    if name\.startswith\(RESERVED_PREFIXES\):$/    if False:/'
+expect_caught "defaulted variables need a secret" scenario_mcp_secret_written_to_that_agent_only agent_spec.py \
+  's/if default or name in AMBIENT_VARS:/if name in AMBIENT_VARS:/'
 expect_caught "runtime settings never written" scenario_agent_json_sets_model_effort_and_name agent_spec.py \
   's/if field\.env is None or merged\.get\(field\.name, ""\) == "":/if True:/'
 expect_caught "agent.json errors ignored" scenario_bad_agent_json_exits_1_and_writes_nothing render-agents-env.sh \

@@ -83,7 +83,9 @@ start_agents() {
   [ -f "$agents_list" ] || return 0
   while IFS= read -r name || [ -n "$name" ]; do
     [ -n "$name" ] || continue
-    if agent_compose "$name" up -d; then
+    # --force-recreate so a changed secret in the env file takes effect even when
+    # the image tag is unchanged.
+    if agent_compose "$name" up -d --force-recreate; then
       started="$started $name"
     else
       agent_failed "$name" "could not start agent $name"
