@@ -6,7 +6,7 @@ BUILD_TAG = $(or $(TAG),$(shell git rev-parse --short HEAD))
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell
+.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-register
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "} {printf "  %-20s %s\n", $$1, $$2}'
@@ -55,3 +55,9 @@ logs: ## Show the last 100 relay log lines (SERVICE=<name> for another service)
 
 shell: ## Open an interactive session on the server
 	@bash $(SCRIPTS)/ops.sh shell
+
+agents-secrets: ## Store the agent credentials from your shell in SSM (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, OPENAI_API_KEY)
+	@bash $(SCRIPTS)/agents-secrets.sh
+
+agents-register: ## Create one identity per agent and add it to the relay
+	@bash $(SCRIPTS)/agents-register.sh

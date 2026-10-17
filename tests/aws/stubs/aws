@@ -11,6 +11,8 @@
 #     (for example StandardOutputContent). Otherwise the generic file is used.
 #   - For "ssm get-parameter --name /x/NAME", ssm-get-parameter.NAME.rc and
 #     ssm-get-parameter.NAME.err take precedence over the generic files.
+#     For "--name /x/DIR/NAME", ssm-get-parameter.DIR.NAME.rc and .err take
+#     precedence over those (for example ssm-get-parameter.a.BUZZ_PRIVATE_KEY.rc).
 #   - For "ssm put-parameter --value file://PATH", appends the file contents
 #     (one line) to $STUB_DIR/put-values.log so tests can check the value
 #     without it appearing in $STUB_LOG.
@@ -33,6 +35,10 @@ if [ "$name" = "ssm-get-parameter" ]; then
       base="${arg##*/}"
       [ -f "$STUB_DIR/$name.$base.rc" ] && rcfile="$STUB_DIR/$name.$base.rc"
       [ -f "$STUB_DIR/$name.$base.err" ] && errfile="$STUB_DIR/$name.$base.err"
+      dir="${arg%/*}"
+      dir="${dir##*/}"
+      [ -f "$STUB_DIR/$name.$dir.$base.rc" ] && rcfile="$STUB_DIR/$name.$dir.$base.rc"
+      [ -f "$STUB_DIR/$name.$dir.$base.err" ] && errfile="$STUB_DIR/$name.$dir.$base.err"
     fi
     prev="$arg"
   done
