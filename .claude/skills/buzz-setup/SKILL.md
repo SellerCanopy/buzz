@@ -9,6 +9,19 @@ Deploys the Buzz relay and named agent containers to one AWS server. Every value
 
 Status markers: **[verified]** was run end to end. **[unverified]** was written from the design and tests but has not run against real AWS yet. Update this file when a step is proven or a gotcha is found.
 
+## How to run this skill
+
+You guide the person and run the commands. The person only does what no agent can reach: choose settings, approve cost, and click through the desktop or phone app.
+
+- Work through sections 1 to 4b in order. Say which step you are on and what it does in plain words.
+- Ask every question with AskUserQuestion: 2 to 4 options, the recommended one first. Never end a message with a question the person has to type an answer to.
+- Get explicit approval before `make apply` and before the first `make deploy`. Both cost money or change a live server.
+- Run the commands yourself. Do not ask the person to run them, except for app steps.
+- Never print a private key, token, or password unless the person asks for that one key. Load tokens from the shell or a git-ignored file.
+- A step marked **[unverified]** has not run against real AWS. Say so before you run it, and change its marker when it works.
+- Long commands (`make deploy` takes about 20 minutes on a cold build) belong in the background. Tell the person you are waiting.
+- If a command fails, read the full output, then fix the cause. AWS cuts remote error text at about 8000 characters, so read it with `aws ssm get-command-invocation`.
+
 ## 1. Collect values
 
 Ask for these with AskUserQuestion, one decision at a time. Write the answers to the git-ignored `.aws.env` (copy `.aws.env.example`).
@@ -25,7 +38,7 @@ Ask for these with AskUserQuestion, one decision at a time. Write the answers to
 
 Optional: `AWS_REGION` (default `us-east-1`), `INSTANCE_TYPE` (default `t4g.large`).
 
-Owner key: if the person has no Buzz key, generate one outside the repo (mode 600) and give them the hex public key. Never print the private key in chat or commit it.
+Owner key: if the person has no Buzz key, generate one outside the repo (file mode 600) that holds the `nsec`, `npub`, and hex public key, and use the hex public key as `RELAY_OWNER_PUBKEY`. A generated key imported into the desktop app without problems. Never print the private key in chat or commit it. **[verified]**
 
 ## 2. Prerequisites to check before anything else
 
@@ -60,9 +73,43 @@ Run from the repo root with `.aws.env` in place. Show the plan to the person and
 
 To stop an agent for good, send `!shutdown` in its channel. `make deploy` starts it again.
 
-Connect a client: the Buzz desktop app and the iOS app both take a relay address as a "community". Add `wss://<BUZZ_DOMAIN>` and sign in with the owner key. The iOS app has to be built or installed separately (`just mobile-dev`). Choose **Join a community** on the welcome screen and paste the address. Do not choose "Create a community" or "I own the community": those start a hosted-service flow. The relay admits only known keys, so a new app key first gets "membership is required". Copy the public ID (`npub...`) from the Join page, convert it to 64-character hex, and add it on the server with `BUZZ_COMPOSE_TLS=true ./run.sh add-member <hex>` from `/opt/buzz/deploy/compose` over SSM. To act as the owner, import the owner key's `nsec` in the app instead. **[verified for the join and membership steps; owner import not yet confirmed]**
+## 4b. Connect the desktop app as owner
 
-Check who is owner: on the server, `select pubkey, role from relay_members` in the `postgres` container shows one `owner` row, which must equal `RELAY_OWNER_PUBKEY`. In the app, the profile public ID must match the owner key's `npub`. **[verified on the server]**
+The person does these steps in the app. You run the server commands. Tell them each step, wait for them to finish it, and ask with AskUserQuestion when you need a choice or a value from them.
+
+1. Open the Buzz desktop app. On a fresh install it offers to create a new identity key or use an existing one. Choose **use an existing key** and give it the owner key's `nsec` (the line starting `nsec1` in the owner key file). Never print the key unless the person asks; if they do, print only that line and say it is now in the session transcript. **[verified]**
+2. On the community screen choose **Join a community**, then paste `wss://<BUZZ_DOMAIN>`. Do not choose "Create a community" or "I own the community": those start Buzz's hosted-service flow, not a self-hosted relay. **[verified]**
+3. The owner key was registered as `owner` when the relay was deployed, so it joins with no approval step. **[verified]**
+4. Confirm: the profile public ID must equal the owner key's `npub`. On the server, `select pubkey, role from relay_members` in the `postgres` container (over SSM, from `/opt/buzz/deploy/compose`, `docker compose -p buzz-prod exec -T postgres ...`) shows exactly one `owner` row, and it must equal `RELAY_OWNER_PUBKEY`. **[verified]**
+
+### The app shows "membership is required"
+
+The relay admits only keys it knows. This happens when the app has a different key from the owner key, for example after choosing "create new key".
+
+1. Ask the person to open the Join page and click **Copy** next to their public ID (`npub1...`).
+2. Convert it to 64-character hex. This Python snippet decodes the bech32 text (it does not check the checksum):
+   ```python
+   CH="qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+   s="<npub>"; d=[CH.index(c) for c in s[5:]][:-6]; acc=bits=0; out=[]
+   for v in d:
+       acc=(acc<<5)|v; bits+=5
+       while bits>=8: bits-=8; out.append((acc>>bits)&255)
+   print(bytes(out).hex())
+   ```
+3. Add it over SSM from `/opt/buzz/deploy/compose`: `BUZZ_COMPOSE_TLS=true ./run.sh add-member <hex> < /dev/null`. It is safe to rerun. **[verified]**
+4. The person reconnects. They are now a `member`, not the owner.
+
+### Switch from a member key to the owner key
+
+In the app: **Settings**, then the **Sign out** section, then **Delete my data**. This wipes the identity key, agent settings, and cached data on that device. Warn the person first, because it also removes any local agents they set up. The dialog shows the current `nsec`, so they can save it first. After the restart, choose **use an existing key** and import the owner `nsec`, then join again. **[verified]**
+
+### Other clients
+
+The iOS app also takes a relay address as a community. It has to be built or installed separately (`just mobile-dev`). **[unverified]**
+
+### The agents in the app
+
+The cloud agents appear as members named after `AGENTS` (for example `coder`, `researcher`). Agents the person already had in the app, with other names, are local and not on the relay. Check with the `relay_members` query: only the owner, the cloud agents, and keys you added appear. **[verified]**
 
 Other targets: `make backup`, `make rollback TAG=<tag>`, `make shell`, `make sync-upstream` (merges the upstream project into the fork, never pushes), `make destroy`.
 
