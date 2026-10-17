@@ -214,7 +214,7 @@ STUB_DIR=<dir> STUB_LOG=<file> PATH="$PWD/tests/aws/stubs:$PATH" \
   bash scripts/aws/render-agents-env.sh <outdir> buzz-t9-agent:local deploy/aws/agents
 
 # 5. Point the agent at the local relay, then start it.
-sed 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=ws://buzz-t9.test:53000#' <outdir>/t9.env > <outdir>/t9.env.new && mv <outdir>/t9.env.new <outdir>/t9.env
+(umask 077; sed 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=ws://buzz-t9.test:53000#' <outdir>/t9.env > <outdir>/t9.env.new) && mv <outdir>/t9.env.new <outdir>/t9.env
 docker compose -p buzz-agent-t9 -f deploy/aws/compose.agents.yml --env-file <outdir>/t9.compose.env up -d
 docker logs buzz-agent-t9-agent-1
 

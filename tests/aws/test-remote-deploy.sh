@@ -242,6 +242,20 @@ scenario_agent_render_failure_after_upgrade() {
   grep -qF "make agents-register" "$WORK/err"
 }
 
+# `if ! render_agents` turns off set -e inside the function, so each step needs its
+# own guard. A find that cannot clear the old agent files (AGENTS empty) must fail.
+scenario_agent_cleanup_failure_fails_deploy() {
+  new_home; with_secrets
+  mkdir -p "$HOME_DIR/agents/old" "$WORK/failbin"
+  echo "BUZZ_PRIVATE_KEY=secret" > "$HOME_DIR/agents/old.env"
+  printf '#!/usr/bin/env bash\n[ "${1:-}" = "%s" ] && exit 1\nexec /usr/bin/find "$@"\n' "$HOME_DIR/agents" > "$WORK/failbin/find"
+  chmod +x "$WORK/failbin/find"
+  run_remote "$1" AGENTS= "PATH=$WORK/failbin:$PATH"
+  [ "$RC" -ne 0 ] || return 1
+  [ "$(log_count '^run.sh upgrade$')" -eq 1 ] || return 1
+  grep -qF "the relay is up" "$WORK/err" && [ -e "$HOME_DIR/agents/old.env" ]
+}
+
 scenario_agents_render_after_upgrade() {
   new_home; with_secrets; with_agent_params a b
   echo "container-id" > "$STUB_DIR/docker-compose-ps.out"
@@ -283,6 +297,7 @@ expect_ok "with AGENTS empty and no agent files, nothing agent-related runs" sce
 expect_ok "agents need deploy/aws in the release" scenario_agents_need_the_release_files "$R"
 expect_ok "agents need AGENTS_ECR_REPO" scenario_agents_need_a_repository "$R"
 expect_ok "a failed agent render leaves the relay up, fails the deploy, and says what to run" scenario_agent_render_failure_after_upgrade "$R"
+expect_ok "a failed cleanup of old agent files fails the deploy with the relay-is-up message" scenario_agent_cleanup_failure_fails_deploy "$R"
 expect_ok "agent files are rendered after the relay upgrade" scenario_agents_render_after_upgrade "$R"
 expect_ok "a stale project named like a wanted agent plus a suffix is stopped" scenario_stale_project_with_wanted_prefix "$R"
 
@@ -310,7 +325,7 @@ expect_caught "stale projects stopped with their volumes" scenario_stale_project
 expect_caught "stale cleanup skipped when AGENTS is empty" scenario_stale_cleanup_runs_with_no_agents remote-deploy.sh \
   's/^stop_stale_agents$/[ -z "$AGENTS" ] || stop_stale_agents/'
 expect_caught "stale env files kept when AGENTS is empty" scenario_stale_cleanup_runs_with_no_agents remote-deploy.sh \
-  's/^      find "\$agents_dir" .* -exec rm -rf \{\} \+$/      true/'
+  's/^      find "\$agents_dir" .* -exec rm -rf \{\} \+ || return 1$/      true/'
 expect_caught "running agent stopped as stale" scenario_stale_projects_stopped_without_volumes remote-deploy.sh \
   's/^    case "\$wanted" in$/    case "" in/'
 expect_caught "release files not required" scenario_agents_need_the_release_files remote-deploy.sh \
@@ -330,5 +345,8 @@ expect_caught "rendered agents image uses another tag" scenario_agents_start_aft
   's/"\$AGENTS_ECR_REPO:\$tag"/"$AGENTS_ECR_REPO:latest"/'
 expect_caught "rendered agents image uses the relay repository" scenario_agents_start_after_upgrade remote-deploy.sh \
   's/"\$AGENTS_ECR_REPO:\$tag"/"$ECR_REPO:$tag"/'
+
+expect_caught "failed cleanup of old agent files ignored" scenario_agent_cleanup_failure_fails_deploy remote-deploy.sh \
+  's/-exec rm -rf \{\} \+ \|\| return 1$/-exec rm -rf {} +/'
 
 exit "$fail"

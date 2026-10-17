@@ -53,11 +53,11 @@ fi
 render_agents() {
   if [ -z "$AGENTS" ]; then
     if [ -d "$agents_dir" ]; then
-      find "$agents_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      find "$agents_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || return 1
     fi
     return 0
   fi
-  bash "$BUZZ_HOME/scripts/aws/render-agents-env.sh" "$agents_dir" "$AGENTS_ECR_REPO:$tag" "$BUZZ_HOME/deploy/aws/agents"
+  bash "$BUZZ_HOME/scripts/aws/render-agents-env.sh" "$agents_dir" "$AGENTS_ECR_REPO:$tag" "$BUZZ_HOME/deploy/aws/agents" || return 1
 }
 
 # agent_compose <name> <compose args...>: runs Compose in one agent's project.
