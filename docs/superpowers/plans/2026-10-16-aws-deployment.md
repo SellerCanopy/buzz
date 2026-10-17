@@ -34,7 +34,7 @@
 - `BUZZ_DOMAIN` pasted as a URL (`https://buzz.example.com/`): reject, since Caddy and `RELAY_URL` need a bare host name. (Task 1)
 - `sync-upstream` when already up to date, or on a detached HEAD: report and exit as specified, never create an empty merge commit. (Task 2)
 - `make rollback` with no `TAG` and no recorded `/buzz/last_good_image`: fail with a clear message instead of deploying an empty tag. (Task 5)
-- First deploy, when no Postgres container exists yet: skip the pre-deploy backup instead of failing. (Task 5)
+- First deploy, when no Postgres container exists yet: skip the pre-deploy backup instead of failing. (Task 6, in `backup.sh`)
 - `AGENTS=claude` only: no `codex` service, key, or API key requirement appears anywhere. (Tasks 7 and 8)
 - `AGENT_RESPOND_TO=allowlist` with no allowlist, or with a non-hex entry: reject before anything is sent to AWS. (Task 1)
 
@@ -70,7 +70,7 @@
 
 **Interfaces:**
 - Produces in `lib.sh`:
-  - `load_settings` : sources `.aws.env` from the repo root, applies defaults (`AWS_REGION=us-east-1`, `INSTANCE_TYPE=t4g.large`, `AGENTS=claude,codex`, `AGENT_RESPOND_TO=owner-only`), validates, exports all settings. Exits 1 with a message on any invalid value.
+  - `load_settings` : sources `.aws.env` from the repo root (it derives `REPO_ROOT` itself when unset; an `AGENTS` that is unset takes the default, while `AGENTS=` set to empty stays empty and disables agents, so use `${AGENTS-claude,codex}`), applies defaults (`AWS_REGION=us-east-1`, `INSTANCE_TYPE=t4g.large`, `AGENTS=claude,codex`, `AGENT_RESPOND_TO=owner-only`), validates, exports all settings. Exits 1 with a message on any invalid value.
   - `require_tool <name>` : exits 1 with `missing tool: <name>` if not on PATH.
   - `tf_output <name>` : prints `terraform -chdir=infra output -raw <name>`.
 - Produces: `tests/aws/run.sh` runs every `tests/aws/test-*.sh` and exits non-zero if any fails. Each test file exits non-zero on failure and uses `$REPO_ROOT`.
@@ -114,17 +114,17 @@
 ### Task 3: Terraform network, IAM, storage, DNS
 
 **Files:**
-- Create: `infra/versions.tf`, `infra/backend.tf`, `infra/variables.tf`, `infra/network.tf`, `infra/iam.tf`, `infra/storage.tf`, `infra/dns.tf`, `infra/outputs.tf`
+- Create: `infra/versions.tf`, `infra/backend.tf`, `infra/variables.tf`, `infra/network.tf`, `infra/iam.tf`, `infra/storage.tf`, `infra/outputs.tf`
 - Modify: `Makefile` (targets `init`, `plan`, `apply`, `destroy`)
 
 **Interfaces:**
 - Produces variables: `aws_region`, `instance_type`, `domain`, `route53_zone`.
 - Produces resources other files rely on: `aws_security_group.relay`, `aws_iam_instance_profile.server`, `aws_ecr_repository.relay`, `aws_ecr_repository.agents`, `aws_s3_bucket.backups`.
-- Produces outputs: `ecr_repository_url`, `agents_ecr_repository_url`, `backup_bucket`, `instance_id`, `elastic_ip`.
+- Produces outputs: `ecr_repository_url`, `agents_ecr_repository_url`, `backup_bucket`. (`instance_id`, `elastic_ip`, and the Route53 record belong to Task 4, because they reference the server and Elastic IP defined there. Task 3 must validate on its own.)
 - Makefile: `init` runs `require_tool terraform`, checks version is 1.10 or newer, then `terraform -chdir=infra init -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=buzz/terraform.tfstate" -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true"`. `destroy` requires typing `BUZZ_DOMAIN` to confirm.
 
 - [ ] **Step 1: Write `versions.tf` and `backend.tf`** (empty `backend "s3" {}` block, configured at init). Pin `required_version = ">= 1.10"`.
-- [ ] **Step 2: Write the resources** listed in the spec under "What Terraform builds": VPC with one public subnet, internet gateway, route table, security group (80, 443 inbound only), IAM role and instance profile (SSM core, ECR read, `ssm:GetParameter*` on `/buzz/*`, S3 read/write on the backup bucket), ECR repository with a keep-10 lifecycle policy, backup bucket (private, versioned, 30-day expiry, `force_destroy = false`), Route53 `A` record to the Elastic IP (the Elastic IP resource lives in Task 4).
+- [ ] **Step 2: Write the resources** listed in the spec under "What Terraform builds": VPC with one public subnet, internet gateway, route table, security group (80, 443 inbound only), IAM role and instance profile (SSM core, ECR read, `ssm:GetParameter*` on `/buzz/*`, `ssm:PutParameter` on `/buzz/agents/*` so the server can store agent keys, S3 read/write on the backup bucket), two ECR repositories (`relay`, `agents`) each with a keep-10 lifecycle policy, backup bucket (private, versioned, 30-day expiry, `force_destroy = false`).
 - [ ] **Step 3: Write the Makefile targets.** `plan` runs `terraform fmt -check`, `validate`, then `plan` with `-var` flags built from the settings.
 - [ ] **Step 4: Verify offline.** Run `terraform -chdir=infra init -backend=false && terraform -chdir=infra fmt -check && terraform -chdir=infra validate`. Expected: `Success! The configuration is valid.`
 - [ ] **Step 5: Verify the guard.** Run `make destroy` with wrong input at the prompt. Expected: aborts without calling Terraform.
@@ -133,11 +133,12 @@
 ### Task 4: Terraform server and first-boot script
 
 **Files:**
-- Create: `infra/compute.tf`, `infra/user-data.sh.tftpl`
+- Create: `infra/compute.tf`, `infra/dns.tf`, `infra/user-data.sh.tftpl`
+- Modify: `infra/outputs.tf`
 
 **Interfaces:**
-- Consumes from Task 3: `aws_security_group.relay`, `aws_iam_instance_profile.server`, subnet, the `elastic_ip` output, `aws_route53_record`'s reference to `aws_eip.relay`.
-- Produces: `aws_instance.server`, `aws_eip.relay`, `aws_ebs_volume.data`, `aws_dlm_lifecycle_policy.daily`. Output `instance_id` is `aws_instance.server.id`; `elastic_ip` is `aws_eip.relay.public_ip`.
+- Consumes from Task 3: `aws_security_group.relay`, `aws_iam_instance_profile.server`, the subnet, variables `instance_type`, `domain`, `route53_zone`.
+- Produces: `aws_instance.server`, `aws_eip.relay`, `aws_ebs_volume.data`, `aws_dlm_lifecycle_policy.daily`, and in `dns.tf` the Route53 `A` record for `var.domain` pointing at `aws_eip.relay.public_ip`. New outputs: `instance_id` is `aws_instance.server.id`; `elastic_ip` is `aws_eip.relay.public_ip`.
 
 - [ ] **Step 1: Write `compute.tf`:** ARM Amazon Linux 2023 AMI via the SSM public parameter, `metadata_options { http_tokens = "required" }`, the instance, Elastic IP and association, data volume attachment, DLM policy (daily, retain 7).
 - [ ] **Step 2: Write `user-data.sh.tftpl`:** installs Docker, installs the pinned Compose plugin release (2.24.4 or newer), formats the data volume only if it has no filesystem, mounts it at `/var/lib/docker`, enables Docker, creates `/opt/buzz`. Starts nothing.
@@ -147,25 +148,26 @@
 ### Task 5: Secrets, deploy, and rollback
 
 **Files:**
-- Create: `scripts/aws/secrets.sh`, `scripts/aws/render-env.sh`, `scripts/aws/remote-deploy.sh`, `scripts/aws/deploy.sh`, `tests/aws/stubs/aws`, `tests/aws/test-secrets.sh`, `tests/aws/test-render-env.sh`, `tests/aws/test-deploy.sh`
+- Create: `scripts/aws/secrets.sh`, `scripts/aws/render-env.sh`, `scripts/aws/remote-deploy.sh`, `scripts/aws/deploy.sh`, `scripts/aws/build.sh`, `tests/aws/stubs/aws`, `tests/aws/stubs/docker`, `tests/aws/stubs/terraform`, `tests/aws/test-secrets.sh`, `tests/aws/test-render-env.sh`, `tests/aws/test-deploy.sh`
 - Modify: `Makefile` (targets `secrets`, `build`, `push`, `deploy`, `rollback`)
 
 **Interfaces:**
 - Consumes: `load_settings`, `require_tool`, `tf_output` from Task 1; Terraform outputs from Tasks 3 and 4.
 - Produces:
-  - `tests/aws/stubs/aws`: a fake `aws` that appends its arguments to `$STUB_LOG` and prints the contents of `$STUB_DIR/<service>-<subcommand>.out` when present. Tests put `tests/aws/stubs` first on `PATH`.
-  - `secrets.sh` : no arguments. For each of the six names, `aws ssm get-parameter`; if absent, `aws ssm put-parameter --type SecureString` with `openssl rand -hex 32` (passwords use `openssl rand -base64 24`). Never calls put on an existing name.
+  - `tests/aws/stubs/aws`, `tests/aws/stubs/docker`, `tests/aws/stubs/terraform`: fakes that append their arguments to `$STUB_LOG` and print the contents of `$STUB_DIR/<command>-<subcommand>.out` when present (for `terraform output -raw <name>`, the file is `$STUB_DIR/tf-<name>.out`). Tests put `tests/aws/stubs` first on `PATH`.
+  - `build.sh <tag> [--push]` : builds the relay image for `linux/arm64` from the root `Dockerfile`, tagged `<ecr-repo>:<tag>`. With `--push`, logs in to ECR and pushes. Makefile `build` and `push` and `deploy.sh` all call it, so the build command lives in one place. Task 9 extends it for agents.
+  - `secrets.sh` : no arguments. For each of the six names, `aws ssm get-parameter`; if absent, `aws ssm put-parameter --type SecureString` with `openssl rand -hex 32` for keys and `openssl rand -hex 24` for passwords (hex only, because these values are embedded in `DATABASE_URL` and `REDIS_URL`, where `/`, `+`, and `=` break URL parsing). Never calls put on an existing name.
   - `render-env.sh <template> <image>` : prints a complete `.env` to stdout. Takes secrets from `aws ssm get-parameters-by-path --path /buzz/ --with-decryption`, takes `BUZZ_DOMAIN` and `RELAY_OWNER_PUBKEY` from env, sets `RELAY_URL=wss://$BUZZ_DOMAIN`, `BUZZ_CORS_ORIGINS`, `BUZZ_MEDIA_*` from the domain, and `BUZZ_IMAGE=<image>`. Exits 1 if any `CHANGE_ME` remains.
   - `remote-deploy.sh <tag>` : on the server, unpacks `/opt/buzz/release.tgz`, runs the ECR login, runs `render-env.sh`, then `BUZZ_COMPOSE_TLS=true ./run.sh upgrade`.
-  - `deploy.sh [tag]` : with no tag, resolves `git rev-parse --short HEAD` and runs the full flow (clean tree check, backup, build, push, upload release, `aws ssm send-command`, poll, health check, record `/buzz/last_good_image`). With `ROLLBACK=1` and no tag, reads `/buzz/last_good_image` and exits 1 with `no recorded good image` if empty. With `DRY_RUN=1` prints the SSM command instead of sending it.
+  - `deploy.sh [tag]` : with no tag, resolves `git rev-parse --short HEAD` and runs the full flow (clean tree check, backup via `${BACKUP_CMD:-scripts/aws/backup.sh}` which Task 6 creates, `build.sh <tag> --push`, upload release, `aws ssm send-command`, poll, health check, record `/buzz/last_good_image`). The SSM command exports `BUZZ_DOMAIN` and `RELAY_OWNER_PUBKEY` (and, in Task 9, `AGENTS` and the `AGENT_RESPOND_TO*` settings) so the server-side scripts can read them. A failing backup aborts the deploy before the send-command call. With `ROLLBACK=1` and no tag, reads `/buzz/last_good_image` and exits 1 with `no recorded good image` if empty. With `DRY_RUN=1` prints the SSM command instead of sending it.
 
 - [ ] **Step 1: Write failing tests.**
   - `test-secrets.sh`: with the stub reporting all six absent, the log shows six `put-parameter` calls. Run twice with all present: zero `put-parameter` calls.
   - `test-render-env.sh`: given a template with `CHANGE_ME` values and a stub returning the six secrets, output has no `CHANGE_ME`, contains `BUZZ_IMAGE=repo:abc1234` and `RELAY_URL=wss://buzz.example.com`. With one secret missing from the stub, exit 1.
-  - `test-deploy.sh`: dirty tree exits 1 and builds nothing. `ROLLBACK=1` with empty `last_good_image` exits 1 with `no recorded good image`. With `DRY_RUN=1` and no Postgres container reported by the stub, the log shows no backup call (first deploy). With a running container reported, the backup call precedes the send-command call.
+  - `test-deploy.sh`: dirty tree exits 1 and builds nothing. `ROLLBACK=1` with empty `last_good_image` exits 1 with `no recorded good image`. With `DRY_RUN=1` and `BACKUP_CMD` set to a script that logs a line, the backup line precedes the printed SSM command. With `BACKUP_CMD` set to a failing script, deploy exits non-zero and prints no SSM command.
 - [ ] **Step 2:** Run `bash tests/aws/run.sh`. Expected: FAIL for the three new files.
 - [ ] **Step 3: Implement the five scripts** per the Interfaces. `deploy.sh` uses `docker buildx build --platform linux/arm64 --load` replaced by `--push` to the ECR URL from `tf_output ecr_repository_url`, and uploads `tar czf` of `deploy/compose` plus `scripts/aws/render-env.sh` and `scripts/aws/remote-deploy.sh` to `s3://<backup bucket>/releases/<tag>.tgz`.
-- [ ] **Step 4: Add Makefile targets.** `build` and `push` call `docker buildx` and ECR login only. `deploy` calls `deploy.sh`. `rollback` calls `ROLLBACK=1 deploy.sh $(TAG)`.
+- [ ] **Step 4: Add Makefile targets.** `build` calls `build.sh $(TAG)`. `push` calls `build.sh $(TAG) --push`. `TAG` defaults to the short git SHA. `deploy` calls `deploy.sh`. `rollback` calls `ROLLBACK=1 deploy.sh $(TAG)`.
 - [ ] **Step 5:** Run `bash tests/aws/run.sh` and `shellcheck scripts/aws/*.sh`. Expected: all PASS, no shellcheck output.
 - [ ] **Step 6: Commit.** `git add -A && git commit -s -m "feat(aws): add secrets, deploy, and rollback"`
 
