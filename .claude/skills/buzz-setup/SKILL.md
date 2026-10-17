@@ -68,7 +68,7 @@ Run from the repo root with `.aws.env` in place. Show the plan to the person and
 3. `make secrets` creates the relay secrets in SSM Parameter Store. It never overwrites. **[verified]**
 4. `make deploy` backs up, builds, pushes, and releases. The first cold build took about 20 minutes. Then check `https://<BUZZ_DOMAIN>/_liveness`. The relay starts first. If agents are listed in `AGENTS` but have no secrets or registration yet, the agent phase fails, the relay stays up, and the command exits non-zero on purpose. Continue with step 5. The error text on screen is cut off by AWS after about 8000 characters, so read the full output with `aws ssm get-command-invocation`. **[verified: relay answered 200 on the first deploy]**
 5. Export the Claude token (see prerequisites), then run `make agents-secrets` and `make agents-register`. Registration needs the relay running, so it comes after the first `make deploy`. It is safe to rerun: each agent keeps a key, a public key, and a `REGISTERED` marker in Parameter Store, and a failed registration resumes on the next run. **[verified: both agents registered against the real relay]**
-6. Run `make deploy` again. The agents start only after the relay is healthy. A stale agent project (one removed from `AGENTS`) is taken down without deleting its volume. **[unverified against real AWS]**
+6. Run `make deploy` again. The agents start only after the relay is healthy. A stale agent project (one removed from `AGENTS`) is taken down without deleting its volume. Both agent containers started, logged `connected to relay` and `presence set to online`, and reached the relay through the public address. **[verified]**
 7. `make status`, `make agents-status`, and `make logs` (or `make agents-logs AGENT=<name>`) to confirm.
 
 To stop an agent for good, send `!shutdown` in its channel. `make deploy` starts it again.
@@ -102,6 +102,14 @@ The relay admits only keys it knows. This happens when the app has a different k
 ### Switch from a member key to the owner key
 
 In the app: **Settings**, then the **Sign out** section, then **Delete my data**. This wipes the identity key, agent settings, and cached data on that device. Warn the person first, because it also removes any local agents they set up. The dialog shows the current `nsec`, so they can save it first. After the restart, choose **use an existing key** and import the owner `nsec`, then join again. **[verified]**
+
+### Put the agents in a channel
+
+A new agent is a relay member but sits in no channel, so its log says `discovered 0 channel(s)` and `agent will sit idle`, and the person sees nothing to talk to. Join each agent to a channel with the `buzz` command inside its container, over SSM:
+
+`docker exec buzz-agent-<name>-agent-1 buzz --format compact channels join --channel <channel-uuid>`
+
+List channel ids first with `... buzz --format compact channels list`. A fresh relay has `general` and `welcome-everyone`. The running agent notices the membership and logs `subscribing to new channel` with no restart. **[verified]** A reply to a mention in the channel has not been tested. **[unverified]**
 
 ### Other clients
 
