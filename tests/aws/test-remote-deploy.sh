@@ -326,4 +326,9 @@ expect_caught "render failure exits zero" scenario_agent_render_failure_after_up
 expect_caught "stale project matched by name prefix" scenario_stale_project_with_wanted_prefix remote-deploy.sh \
   's/^    name="\$\{project#buzz-agent-\}"$/    name="${project#buzz-agent-}"; name="${name%%-*}"/'
 
+expect_caught "rendered agents image uses another tag" scenario_agents_start_after_upgrade remote-deploy.sh \
+  's/"\$AGENTS_ECR_REPO:\$tag"/"$AGENTS_ECR_REPO:latest"/'
+expect_caught "rendered agents image uses the relay repository" scenario_agents_start_after_upgrade remote-deploy.sh \
+  's/"\$AGENTS_ECR_REPO:\$tag"/"$ECR_REPO:$tag"/'
+
 exit "$fail"

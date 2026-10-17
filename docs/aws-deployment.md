@@ -207,7 +207,8 @@ docker build -f deploy/aws/Dockerfile.agents --build-arg SPRIG_IMAGE=buzz-t9-spr
 
 # 4. Render the agent files with the test stand-in for aws. Put one line per
 #    parameter, "<name><TAB><value>", in $STUB_DIR/ssm-get-parameters-by-path.out:
-#    /buzz/agents/t9/BUZZ_PRIVATE_KEY and /buzz/agents/ANTHROPIC_API_KEY (any dummy text).
+#    /buzz/agents/t9/BUZZ_PRIVATE_KEY (the secret key generated in step 2, not dummy text)
+#    and /buzz/agents/ANTHROPIC_API_KEY (any dummy text).
 STUB_DIR=<dir> STUB_LOG=<file> PATH="$PWD/tests/aws/stubs:$PATH" \
   BUZZ_DOMAIN=buzz-t9.test RELAY_OWNER_PUBKEY=<64 hex> AGENTS=t9:claude \
   bash scripts/aws/render-agents-env.sh <outdir> buzz-t9-agent:local deploy/aws/agents

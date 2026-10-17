@@ -668,4 +668,9 @@ expect_caught ".DS_Store shipped in the tarball" scenario_tarball_drops_agent_se
 expect_caught "old deploy/aws kept on the server" scenario_release_drops_removed_agent_files deploy.sh \
   's/^  echo "rm -rf \/opt\/buzz\/deploy\/aws"$/  true/'
 
+expect_caught "agents image built under another tag" scenario_build_agents build.sh \
+  's/-t "\$agents_repo:\$tag"/-t "$agents_repo:latest"/'
+expect_caught "agents image built into the relay repository" scenario_build_agents build.sh \
+  's/-t "\$agents_repo:\$tag"/-t "$repo:$tag"/'
+
 exit "$fail"
