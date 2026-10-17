@@ -100,6 +100,23 @@ else
   bad "buzz-acp --help exits 0 (rc=$rc, got: $(head -c 300 <<< "$out"))"
 fi
 
+# The pinned Claude Code version. Update it together with the ARG in Dockerfile.agents.
+want_cc="2.1.302"
+out="$(run_in_image claude --version 2>&1)"
+if [ -n "$want_cc" ] && [ "$out" = "$want_cc (Claude Code)" ]; then
+  pass "claude --version prints the pinned $want_cc"
+else
+  bad "claude --version prints the pinned '$want_cc' (got: $out)"
+fi
+# The adapter reads CLAUDE_CODE_EXECUTABLE; it must be an executable that reports the pin.
+# shellcheck disable=SC2016 # expanded inside the container
+out="$(run_in_image bash -c 'test -n "$CLAUDE_CODE_EXECUTABLE" && test -x "$CLAUDE_CODE_EXECUTABLE" && "$CLAUDE_CODE_EXECUTABLE" --version' 2>&1)"
+if [ -n "$want_cc" ] && [ "$out" = "$want_cc (Claude Code)" ]; then
+  pass "CLAUDE_CODE_EXECUTABLE is an executable running Claude Code $want_cc"
+else
+  bad "CLAUDE_CODE_EXECUTABLE is an executable running Claude Code '$want_cc' (got: $out)"
+fi
+
 # The image entrypoint installs the MCP config and ends in the shared entrypoint.
 out="$(docker inspect -f '{{json .Config.Entrypoint}}' "$AGENTS_TAG")"
 if [ "$out" = '["/usr/local/bin/agent-entrypoint"]' ]; then

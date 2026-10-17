@@ -130,6 +130,9 @@ run_agent crossed "$WORK/beta"
 run_agent skipped "$WORK/alpha" --entrypoint /usr/local/bin/sprig-entrypoint
 
 run_agent unreadable "$UNREADABLE_VOLUME"
+# The adapter must take its Claude Code binary from CLAUDE_CODE_EXECUTABLE, which the
+# image points at the pinned install. A path that does not exist must stop the probes.
+run_agent badexec "$WORK/alpha" -e CLAUDE_CODE_EXECUTABLE=/nonexistent/claude
 
 for label in alpha beta none crossed skipped; do
   if session_ok "$label"; then
@@ -152,6 +155,8 @@ check none ""
 # container with the wrong config and one where the install step did not run.
 if [ "$(started crossed)" = "alpha" ]; then bad "mutant survives: alpha expectation holds with beta's config"; else pass "mutant fails: alpha expectation does not hold with beta's config"; fi
 if [ "$(started skipped)" = "alpha" ]; then bad "mutant survives: alpha started without agent-entrypoint"; else pass "mutant fails: alpha does not start without agent-entrypoint"; fi
+
+if [ "$(started badexec)" = "alpha" ]; then bad "mutant survives: alpha started with a missing CLAUDE_CODE_EXECUTABLE"; else pass "mutant fails: alpha does not start with a missing CLAUDE_CODE_EXECUTABLE"; fi
 
 # The installed file is the agent's own, and an agent without one gets an empty list.
 out="$(docker cp "$PREFIX-none:/home/agent/.mcp.json" - 2>/dev/null | tar -xO 2>/dev/null | tr -d ' \n')"

@@ -8,10 +8,16 @@ FROM ${SPRIG_IMAGE} AS sprig
 
 FROM node:22-bookworm-slim
 
-# Adapter versions are pinned so a rebuild cannot change how MCP config loads.
-# tests/aws/test-agents-mcp.sh is the check to run when raising them.
+# Versions are pinned to the current latest so a rebuild cannot change behavior.
+# To refresh: run `npm view <package> version` for each of the three packages,
+# update the ARGs (and want_cc in tests/aws/test-agents-image.sh), rebuild, and run
+# tests/aws/test-agents-image.sh and tests/aws/test-agents-mcp.sh.
+# The Claude adapter bundles its own, older Claude Code binary. Installing
+# @anthropic-ai/claude-code separately and pointing CLAUDE_CODE_EXECUTABLE at it
+# (the adapter reads that variable) makes the agents run the pinned build.
 ARG CLAUDE_ACP_VERSION=0.93.0
 ARG CODEX_ACP_VERSION=2.2.2
+ARG CLAUDE_CODE_VERSION=2.1.302
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl git \
@@ -19,6 +25,7 @@ RUN apt-get update \
     && npm install -g \
          "@agentclientprotocol/claude-agent-acp@${CLAUDE_ACP_VERSION}" \
          "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && useradd --create-home --home-dir /home/agent --shell /bin/bash agent \
     && install -d -o agent -g agent /workspace /home/agent
 
@@ -31,7 +38,8 @@ RUN for name in \
         ln -s sprig "/usr/local/bin/$name"; \
     done
 
-ENV HOME=/home/agent
+ENV HOME=/home/agent \
+    CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 WORKDIR /home/agent
 USER agent
 ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]
