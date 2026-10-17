@@ -33,7 +33,10 @@ data "aws_iam_policy_document" "server" {
       "ssm:GetParameters",
       "ssm:GetParametersByPath",
     ]
-    resources = ["arn:aws:ssm:*:*:parameter/buzz/*"]
+    resources = [
+      "arn:aws:ssm:*:*:parameter/buzz",
+      "arn:aws:ssm:*:*:parameter/buzz/*",
+    ]
   }
 
   statement {

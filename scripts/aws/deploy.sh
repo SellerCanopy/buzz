@@ -4,7 +4,8 @@
 # Usage: deploy.sh [tag]
 #   no tag      the short git SHA of HEAD
 #   ROLLBACK=1  skip the clean-tree check, build, push, and upload; redeploy an
-#               earlier tag, or /buzz/last_good_image when no tag is given
+#               earlier tag, or /buzz/last_good_image when no tag is given. A
+#               failed backup prints a warning and the rollback continues.
 #   DRY_RUN=1   run the checks and the backup, then print the SSM command
 #               instead of building, pushing, uploading, or sending anything
 # Other environment: BACKUP_CMD (default scripts/aws/backup.sh next to this
@@ -56,7 +57,7 @@ remote_script() {
   # Task 9 adds AGENTS and the AGENT_RESPOND_TO* settings to this block.
   echo "mkdir -p /opt/buzz"
   echo "aws s3 cp 's3://$bucket/releases/$t.tgz' /opt/buzz/release.tgz"
-  echo "tar xzf /opt/buzz/release.tgz -C /opt/buzz"
+  echo "tar xzf /opt/buzz/release.tgz --no-same-owner -C /opt/buzz"
   echo "bash /opt/buzz/scripts/aws/remote-deploy.sh '$t'"
 }
 
@@ -75,13 +76,26 @@ parameters_json() {
 # wait_for_command <command-id> <instance-id>: polls until the SSM command
 # succeeds. Exits 1 on any other final status or when the wait runs out.
 wait_for_command() {
-  local id="$1" instance="$2" i status=""
+  local id="$1" instance="$2" i status="" empty_reads=0 warned=0
   for ((i = 0; i < POLL_ATTEMPTS; i++)); do
     status="$(aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" \
-      --query Status --output text 2>/dev/null || true)"
+      --query Status --output text 2> "$work/poll.err" || true)"
     case "$status" in
+      "" | None)
+        # A few empty reads are normal right after send-command. A run of them
+        # means the read itself is failing, so show the error once.
+        empty_reads=$((empty_reads + 1))
+        if [ "$empty_reads" -ge 5 ] && [ "$warned" -eq 0 ]; then
+          warned=1
+          echo "warning: $empty_reads status reads in a row returned nothing. Last aws error: $(tail -n 5 "$work/poll.err")" >&2
+        fi
+        sleep "$POLL_INTERVAL"
+        ;;
       Success) return 0 ;;
-      "" | None | Pending | InProgress | Delayed) sleep "$POLL_INTERVAL" ;;
+      Pending | InProgress | Delayed)
+        empty_reads=0
+        sleep "$POLL_INTERVAL"
+        ;;
       *)
         echo "server command ended with status $status. Last error output:" >&2
         aws ssm get-command-invocation --command-id "$id" --instance-id "$instance" \
@@ -133,7 +147,13 @@ instance="$(tf_output instance_id)"
 echo "deploy: tag $tag to $BUZZ_DOMAIN"
 
 backup_cmd="${BACKUP_CMD:-$SCRIPT_DIR/backup.sh}"
-bash "$backup_cmd" || die "backup failed, deploy aborted before any change"
+if ! bash "$backup_cmd"; then
+  if [ "${ROLLBACK:-}" = "1" ]; then
+    echo "WARNING: backup failed. Continuing because ROLLBACK=1; the current data is NOT backed up." >&2
+  else
+    die "backup failed, deploy aborted before any change"
+  fi
+fi
 
 if [ "${ROLLBACK:-}" = "1" ]; then
   aws s3api head-object --bucket "$bucket" --key "releases/$tag.tgz" > /dev/null \
@@ -151,10 +171,16 @@ fi
 if [ "${ROLLBACK:-}" != "1" ]; then
   bash "$SCRIPT_DIR/build.sh" "$tag" --push
 
-  # The tarball excludes any local .env so no secret ships. COPYFILE_DISABLE
-  # stops macOS tar from adding AppleDouble files.
-  COPYFILE_DISABLE=1 tar czf "$work/release.tgz" --exclude='deploy/compose/.env' -C "$REPO_ROOT" \
-    deploy/compose scripts/aws/lib.sh scripts/aws/render-env.sh scripts/aws/remote-deploy.sh
+  # Stage the files so every local .env* file except .env.example can be
+  # dropped and no secret ships. COPYFILE_DISABLE stops macOS tar from adding
+  # AppleDouble files.
+  stage="$work/stage"
+  mkdir -p "$stage/deploy" "$stage/scripts/aws"
+  cp -R "$REPO_ROOT/deploy/compose" "$stage/deploy/compose"
+  find "$stage/deploy/compose" -maxdepth 1 -name '.env*' ! -name '.env.example' -delete
+  cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/render-env.sh" \
+    "$REPO_ROOT/scripts/aws/remote-deploy.sh" "$stage/scripts/aws/"
+  COPYFILE_DISABLE=1 tar czf "$work/release.tgz" -C "$stage" deploy scripts
   aws s3 cp "$work/release.tgz" "s3://$bucket/releases/$tag.tgz"
 fi
 

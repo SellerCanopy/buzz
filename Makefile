@@ -41,5 +41,5 @@ push: ## Build the relay image and push it to ECR (TAG=<tag>, default short git 
 deploy: ## Back up, build, push, and deploy the current commit (DRY_RUN=1 to preview)
 	@bash $(SCRIPTS)/deploy.sh $(TAG)
 
-rollback: ## Redeploy an earlier image (TAG=<tag>, default the last good image)
+rollback: ## Redeploy an earlier image (TAG=<tag>; without TAG it uses the last good image, which is the running tag after a healthy deploy, so a bad but healthy release needs an explicit TAG)
 	@ROLLBACK=1 bash $(SCRIPTS)/deploy.sh $(TAG)

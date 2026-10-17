@@ -23,7 +23,8 @@ new_repo() {
   echo "lib" > "$REPO/scripts/aws/lib.sh"
   echo "render" > "$REPO/scripts/aws/render-env.sh"
   echo "remote" > "$REPO/scripts/aws/remote-deploy.sh"
-  printf 'ignored.txt\ndeploy/compose/.env\n' > "$REPO/.gitignore"
+  echo "example" > "$REPO/deploy/compose/.env.example"
+  printf 'ignored.txt\ndeploy/compose/.env\ndeploy/compose/.env.*\n!deploy/compose/.env.example\n' > "$REPO/.gitignore"
   (
     cd "$REPO" || exit 1
     git init -q .
@@ -132,6 +133,7 @@ scenario_dry_run_backup_first() {
   grep -qF "export ECR_REPO='$REPO_URL'" "$OUT" || return 1
   grep -qF "aws s3 cp 's3://$BUCKET/releases/$SHA.tgz' /opt/buzz/release.tgz" "$OUT" || return 1
   grep -qF "bash /opt/buzz/scripts/aws/remote-deploy.sh '$SHA'" "$OUT" || return 1
+  grep -qF "tar xzf /opt/buzz/release.tgz --no-same-owner -C /opt/buzz" "$OUT" || return 1
   nothing_shipped
 }
 
@@ -142,6 +144,22 @@ scenario_backup_failure_aborts() {
   grep -qF "backup failed" "$ERR" || return 1
   ! grep -q "SSM command" "$OUT" || return 1
   nothing_shipped
+}
+
+# A failing backup warns loudly but does not stop a rollback.
+scenario_rollback_continues_past_backup_failure() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" BACKUP_CMD="$WORK/backup-fail.sh" ROLLBACK=1 -- oldtag4
+  [ "$RC" -eq 0 ] || return 1
+  grep -qF "WARNING: backup failed" "$ERR" || return 1
+  [ -e "$WORK/backup.ran" ] || return 1
+  [ "$(log_count 'send-command')" -eq 1 ] && [ "$(log_count '^docker ')" -eq 0 ]
+}
+
+scenario_rollback_continues_past_backup_failure_dry_run() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" DRY_RUN=1 BACKUP_CMD="$WORK/backup-fail.sh" ROLLBACK=1 -- oldtag4
+  [ "$RC" -eq 0 ] && grep -qF "WARNING: backup failed" "$ERR" && grep -qF "SSM command (dry run)" "$OUT"
 }
 
 scenario_backup_failure_aborts_dry_run() {
@@ -160,6 +178,8 @@ scenario_missing_backup_script_aborts() {
 scenario_full_deploy() {
   new_repo; stubs_ok; mk_backups
   echo "SECRET=1" > "$REPO/deploy/compose/.env"
+  echo "SECRET=1" > "$REPO/deploy/compose/.env.bak"
+  echo "SECRET=1" > "$REPO/deploy/compose/.env.local"
   run_deploy "$1"
   [ "$RC" -eq 0 ] || return 1
   local login build up send poll health put prev=0 n
@@ -182,7 +202,8 @@ scenario_full_deploy() {
   printf '%s\n' "$list" | grep -qx 'scripts/aws/lib.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/render-env.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/remote-deploy.sh' || return 1
-  ! printf '%s\n' "$list" | grep -q 'deploy/compose/\.env$'
+  printf '%s\n' "$list" | grep -qx 'deploy/compose/.env.example' || return 1
+  ! printf '%s\n' "$list" | grep -qE 'deploy/compose/\.env(\.bak|\.local)?$'
 }
 
 scenario_explicit_tag() {
@@ -214,6 +235,27 @@ scenario_command_timeout() {
   [ "$RC" -eq 1 ] && grep -qF "timed out" "$ERR" \
     && [ "$(log_count 'get-command-invocation .*--query Status')" -eq 3 ] \
     && [ "$(log_count '^curl ')" -eq 0 ] && [ "$(log_count 'put-parameter')" -eq 0 ]
+}
+
+# Seven reads in a row fail: the error is shown once, polling still runs to the timeout.
+scenario_poll_error_surfaced() {
+  new_repo; stubs_ok; mk_backups
+  echo 254 > "$STUB_DIR/ssm-get-command-invocation.rc"
+  echo "An error occurred (AccessDeniedException) when calling the GetCommandInvocation operation" > "$STUB_DIR/ssm-get-command-invocation.err"
+  : > "$STUB_DIR/ssm-get-command-invocation.out"
+  run_deploy "$1" POLL_ATTEMPTS=7
+  [ "$RC" -eq 1 ] && grep -qF "timed out" "$ERR" || return 1
+  [ "$(grep -c 'AccessDeniedException' "$ERR")" -eq 1 ] || return 1
+  [ "$(log_count 'get-command-invocation .*--query Status')" -eq 7 ]
+}
+
+scenario_poll_few_empty_reads_quiet() {
+  new_repo; stubs_ok; mk_backups
+  echo 254 > "$STUB_DIR/ssm-get-command-invocation.rc"
+  echo "An error occurred (AccessDeniedException) when calling the GetCommandInvocation operation" > "$STUB_DIR/ssm-get-command-invocation.err"
+  : > "$STUB_DIR/ssm-get-command-invocation.out"
+  run_deploy "$1" POLL_ATTEMPTS=4
+  [ "$RC" -eq 1 ] && grep -qF "timed out" "$ERR" && ! grep -q 'AccessDeniedException' "$ERR"
 }
 
 scenario_unhealthy_not_recorded() {
@@ -296,6 +338,8 @@ expect_ok "rollback with absent last_good_image: no recorded good image" scenari
 expect_ok "rollback with an SSM read error reports it, not 'no recorded'" scenario_recorded_image_read_error "$R"
 expect_ok "dry run: backup runs before the printed SSM command, nothing sent" scenario_dry_run_backup_first "$R"
 expect_ok "failing backup aborts before build, upload, and send-command" scenario_backup_failure_aborts "$R"
+expect_ok "rollback with a failing backup warns and still sends the command" scenario_rollback_continues_past_backup_failure "$R"
+expect_ok "rollback with a failing backup warns and reaches the dry-run command" scenario_rollback_continues_past_backup_failure_dry_run "$R"
 expect_ok "failing backup aborts a dry run too" scenario_backup_failure_aborts_dry_run "$R"
 expect_ok "missing backup script aborts" scenario_missing_backup_script_aborts "$R"
 expect_ok "full deploy: login, build, upload, send, poll, health, record in order" scenario_full_deploy "$R"
@@ -303,6 +347,8 @@ expect_ok "explicit tag is built and recorded" scenario_explicit_tag "$R"
 expect_ok "a tag with shell characters is rejected before the SSM command is built" scenario_bad_tag_rejected "$R"
 expect_ok "failed server command: no health check, no record" scenario_command_failed "$R"
 expect_ok "server command that never finishes times out" scenario_command_timeout "$R"
+expect_ok "seven failed status reads show the aws error once and still time out" scenario_poll_error_surfaced "$R"
+expect_ok "four failed status reads stay quiet" scenario_poll_few_empty_reads_quiet "$R"
 expect_ok "unhealthy relay: last_good_image is not updated" scenario_unhealthy_not_recorded "$R"
 expect_ok "send-command failure records nothing" scenario_send_failure "$R"
 expect_ok "rollback redeploys last_good_image without build or upload" scenario_rollback_deploys_recorded "$R"
@@ -317,9 +363,13 @@ expect_caught "dirty-tree guard removed" scenario_dirty_untracked deploy.sh \
 expect_caught "dirty-tree guard removed (modified file)" scenario_dirty_modified deploy.sh \
   's/^  \[ -z "\$dirty" \] \|\| die .*/  true; : "$dirty"/'
 expect_caught "backup failure ignored" scenario_backup_failure_aborts deploy.sh \
-  's/^bash "\$backup_cmd" \|\| die .*/bash "$backup_cmd" || true/'
+  's/^    die "backup failed, deploy aborted before any change"$/    echo ignored >\&2/'
 expect_caught "backup step removed" scenario_dry_run_backup_first deploy.sh \
-  's/^bash "\$backup_cmd" \|\| die .*/true/'
+  's/^if ! bash "\$backup_cmd"; then$/if false; then/'
+expect_caught "rollback aborts on backup failure" scenario_rollback_continues_past_backup_failure deploy.sh \
+  's/^    echo "WARNING: backup failed\..*$/    die "backup failed"/'
+expect_caught "rollback backup warning removed" scenario_rollback_continues_past_backup_failure_dry_run deploy.sh \
+  's/^    echo "WARNING: backup failed\..*$/    true/'
 expect_caught "no-recorded-image guard removed" scenario_no_recorded_image_empty deploy.sh \
   's/case "\$tag" in "" \| None\) die/case "$tag" in NOMATCH) die/'
 expect_caught "ssm read errors treated as not found" scenario_recorded_image_read_error deploy.sh \
@@ -330,8 +380,14 @@ expect_caught "failed command treated as success" scenario_command_failed deploy
   's/Success\) return 0 ;;/*) return 0 ;;/'
 expect_caught "poll attempts cut to one" scenario_command_timeout deploy.sh \
   's/for \(\(i = 0; i < POLL_ATTEMPTS; i\+\+\)\); do/for ((i = 0; i < POLL_ATTEMPTS; i = 0)); do break; done; for ((i = 0; i < 1; i++)); do/'
-expect_caught "local .env shipped in the tarball" scenario_full_deploy deploy.sh \
-  "s/ --exclude='deploy\/compose\/\.env'//"
+expect_caught "local .env files shipped in the tarball" scenario_full_deploy deploy.sh \
+  "s/^  find .* -delete\$/  true/"
+expect_caught "tar keeps the build owner" scenario_dry_run_backup_first deploy.sh \
+  's/ --no-same-owner//'
+expect_caught "poll error never shown" scenario_poll_error_surfaced deploy.sh \
+  's/^        if \[ "\$empty_reads" -ge 5 \] && \[ "\$warned" -eq 0 \]; then$/        if false; then/'
+expect_caught "poll error shown on the first empty read" scenario_poll_few_empty_reads_quiet deploy.sh \
+  's/-ge 5 \]/-ge 1 ]/'
 expect_caught "tag not validated" scenario_bad_tag_rejected deploy.sh \
   's/^\[\[ "\$tag" =~ .*$/true/'
 expect_caught "rollback builds again" scenario_rollback_deploys_recorded deploy.sh \

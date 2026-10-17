@@ -127,6 +127,22 @@ scenario_requires_domain() {
   [ "$RC" -eq 1 ] && [ ! -s "$WORK/out" ] && grep -qF "BUZZ_DOMAIN is not set" "$WORK/err"
 }
 
+# Values with characters that break a .env file or a URL are refused without echoing them.
+scenario_unsafe_value_refused() {
+  local v
+  for v in 'pa$ss#word' 'two words' 'a"quote' "a'quote" 'a=b' 'a/b'; do
+    reset_stubs; secrets_out
+    printf '/buzz/POSTGRES_PASSWORD\t%s\n' "$v" > "$STUB_DIR/ssm-get-parameters-by-path.out.tmp"
+    grep -v '^/buzz/POSTGRES_PASSWORD' "$STUB_DIR/ssm-get-parameters-by-path.out" >> "$STUB_DIR/ssm-get-parameters-by-path.out.tmp"
+    mv "$STUB_DIR/ssm-get-parameters-by-path.out.tmp" "$STUB_DIR/ssm-get-parameters-by-path.out"
+    run_render "$1" "$WORK/template.env"
+    [ "$RC" -eq 1 ] || return 1
+    [ ! -s "$WORK/out" ] || return 1
+    grep -qF "/buzz/POSTGRES_PASSWORD has characters outside" "$WORK/err" || return 1
+    ! grep -qF -- "$v" "$WORK/out" "$WORK/err" || return 1
+  done
+}
+
 scenario_secrets_not_on_stderr() {
   reset_stubs; secrets_out POSTGRES_PASSWORD
   run_render "$1" "$WORK/template.env"
@@ -142,12 +158,15 @@ expect_ok "no secrets at all exits 1" scenario_no_secrets_at_all "$R"
 expect_ok "a leftover CHANGE_ME exits 1, prints nothing, names the key" scenario_leftover_change_me_exits_1 "$R"
 expect_ok "a template without a secret line exits 1" scenario_template_without_secret_line "$R"
 expect_ok "missing BUZZ_DOMAIN exits 1" scenario_requires_domain "$R"
+expect_ok "unsafe secret values are refused by parameter name, never shown" scenario_unsafe_value_refused "$R"
 expect_ok "secret values never reach stderr" scenario_secrets_not_on_stderr "$R"
 
 expect_caught "CHANGE_ME check removed" scenario_leftover_change_me_exits_1 render-env.sh \
   's/^\[ -z "\$left" \] \|\| die .*/true/'
 expect_caught "missing-secret check removed" scenario_missing_secret_exits_1 render-env.sh \
   's/^\[ -z "\$missing" \] \|\| die .*/true/'
+expect_caught "value character check removed" scenario_unsafe_value_refused render-env.sh \
+  's/^  \[\[ "\$\{!var\}" =~ .*$/  true \\/'
 expect_caught "template line check removed" scenario_template_without_secret_line render-env.sh \
   's/\*\) die "template has no \$name line: \$template" ;;/*) ;;/'
 expect_caught "recursive read added" scenario_ssm_call_shape render-env.sh \

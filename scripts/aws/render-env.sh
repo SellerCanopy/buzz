@@ -45,6 +45,14 @@ for name in $SECRET_NAMES; do
 done
 [ -z "$missing" ] || die "missing SSM parameters:$missing (run make secrets)"
 
+# Values land unquoted in a .env file and in URLs, so only plain characters are
+# safe. The error names the parameter and never the value.
+for name in $SECRET_NAMES; do
+  var="SECRET_$name"
+  [[ "${!var}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "SSM parameter /buzz/$name has characters outside [A-Za-z0-9._-] (the value is not shown)"
+done
+
 # value_for <name>: prints the value for a managed template key, or returns 1.
 value_for() {
   local var

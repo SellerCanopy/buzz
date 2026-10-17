@@ -152,6 +152,18 @@ f="$WORK/anyone-ok.env"
 write_env "$f" "AGENT_RESPOND_TO=anyone" "AGENT_RESPOND_TO_ALLOWLIST=garbage"
 expect_ok "allowlist ignored unless AGENT_RESPOND_TO=allowlist" "$f" "RESPOND=anyone"
 
+# Region shape.
+for r in "us-east-1; rm -rf /" "US-EAST-1" "useast1" "us-east" "us-east-1 " "-east-1" "us--1" '$(id)'; do
+  f="$WORK/region.env"
+  write_env "$f" "AWS_REGION=\"$r\""
+  expect_fail "AWS_REGION '$r' rejected" "$f" "AWS_REGION must look like"
+done
+for r in eu-west-2 us-gov-west-1 ap-southeast-4; do
+  f="$WORK/region-ok.env"
+  write_env "$f" "AWS_REGION=$r"
+  expect_ok "AWS_REGION '$r' accepted" "$f" "AWS_REGION=$r "
+done
+
 # Valid file with defaults.
 f="$WORK/valid.env"
 write_env "$f"

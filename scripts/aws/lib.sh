@@ -66,6 +66,9 @@ load_settings() {
   AGENT_RESPOND_TO="${AGENT_RESPOND_TO:-owner-only}"
   AGENT_RESPOND_TO_ALLOWLIST="${AGENT_RESPOND_TO_ALLOWLIST:-}"
 
+  [[ "$AWS_REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] \
+    || die "AWS_REGION must look like us-east-1: $AWS_REGION"
+
   local label='[a-z0-9]([a-z0-9-]*[a-z0-9])?'
   [[ "$BUZZ_DOMAIN" =~ ^(${label}\.)+${label}$ ]] \
     || die "BUZZ_DOMAIN must be a bare host name (lowercase letters, digits, hyphens, at least two dot-separated labels; no scheme, port, slash, space, or trailing dot): $BUZZ_DOMAIN"
