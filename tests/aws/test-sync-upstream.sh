@@ -143,6 +143,41 @@ else
   bad "already up to date (rc=$RC, before=$count_before after=$count_after, got: $OUT)"
 fi
 
+# Diverged without conflict: a real merge commit, not a fast-forward or rebase.
+make_repos diverged
+commit_file "$FORK" local.txt "fork only" "fork commit"
+upstream_commit up1.txt "one" "upstream one"
+upstream_commit up2.txt "two" "upstream two"
+fork_commit="$(git -C "$FORK" rev-parse HEAD)"
+up_head="$(git -C "$UP" rev-parse main)"
+origin_before="$(git -C "$ORIGIN" rev-parse main)"
+run_sync
+parents="$(git -C "$FORK" rev-list --parents -n1 HEAD | wc -w | tr -d ' ')"
+if [ "$RC" -eq 0 ] && [ "$parents" = "3" ]; then
+  pass "diverged merge creates a two-parent merge commit"
+else
+  bad "diverged merge (rc=$RC, words in parents line=$parents, got: $OUT)"
+fi
+if git -C "$FORK" merge-base --is-ancestor "$up_head" HEAD \
+  && git -C "$FORK" merge-base --is-ancestor "$fork_commit" HEAD \
+  && [ -f "$FORK/local.txt" ] && [ -f "$FORK/up2.txt" ]; then
+  pass "diverged merge keeps the fork commit and brings in upstream"
+else
+  bad "diverged merge lost a side"
+fi
+if printf '%s' "$OUT" | grep -qF "Merged 2 commit(s)" \
+  && printf '%s' "$OUT" | grep -qF "git push origin main"; then
+  pass "diverged merge prints the commit count and push command"
+else
+  bad "diverged merge message (got: $OUT)"
+fi
+if [ "$(git -C "$ORIGIN" rev-parse main)" = "$origin_before" ] \
+  && [ "$(git -C "$UP" rev-parse main)" = "$up_head" ]; then
+  pass "diverged merge pushes nowhere"
+else
+  bad "diverged merge pushed to a remote"
+fi
+
 # Detached HEAD.
 make_repos detached
 git -C "$FORK" checkout -q --detach
@@ -158,7 +193,7 @@ make_repos conflict
 commit_file "$FORK" shared.txt "fork side" "fork edit"
 upstream_commit shared.txt "upstream side" "upstream edit"
 run_sync
-if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qF "shared.txt"; then
+if [ "$RC" -eq 1 ] && printf '%s\n' "$OUT" | grep -qxF "  shared.txt"; then
   pass "conflict exits 1 and lists the file"
 else
   bad "conflict (rc=$RC, got: $OUT)"
@@ -167,6 +202,23 @@ if [ -f "$FORK/.git/MERGE_HEAD" ]; then
   pass "conflict leaves the merge in place"
 else
   bad "conflict aborted the merge"
+fi
+
+# Merge stops with no conflicting files (failing pre-merge-commit hook).
+make_repos hook
+commit_file "$FORK" local.txt "fork only" "fork commit"
+upstream_commit up1.txt "one" "upstream one"
+mkdir -p "$WORK/hook/hooks"
+printf '#!/bin/sh\nexit 1\n' > "$WORK/hook/hooks/pre-merge-commit"
+chmod +x "$WORK/hook/hooks/pre-merge-commit"
+git -C "$FORK" config core.hooksPath "$WORK/hook/hooks"
+run_sync
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -qF "no conflicting files" \
+  && ! printf '%s' "$OUT" | grep -qF "stopped on conflicts" \
+  && [ -f "$FORK/.git/MERGE_HEAD" ]; then
+  pass "hook failure reports no conflicting files and leaves the merge"
+else
+  bad "hook failure (rc=$RC, got: $OUT)"
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -12,6 +12,7 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git rep
 branch="$(git symbolic-ref --quiet --short HEAD || true)"
 [ -n "$branch" ] || die "HEAD is detached. Check out a branch first."
 
+# Untracked files are ignored on purpose: git refuses a merge that would overwrite one.
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "uncommitted changes in the working tree. Commit or stash them first."
 fi
@@ -42,9 +43,15 @@ count="$(git rev-list --count HEAD..upstream/main)"
 if ! merge_out="$(git merge --no-edit upstream/main 2>&1)"; then
   echo "$merge_out" >&2
   if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
-    echo "sync-upstream: merge stopped on conflicts. Conflicting files:" >&2
-    git diff --name-only --diff-filter=U | sed 's/^/  /' >&2
-    echo "Resolve them, then run 'git commit', or run 'git merge --abort' to undo." >&2
+    conflicts="$(git diff --name-only --diff-filter=U)"
+    if [ -n "$conflicts" ]; then
+      echo "sync-upstream: merge stopped on conflicts. Conflicting files:" >&2
+      printf '%s\n' "$conflicts" | sed 's/^/  /' >&2
+      echo "Resolve them, then run 'git commit', or run 'git merge --abort' to undo." >&2
+    else
+      echo "sync-upstream: merge stopped with no conflicting files (for example a failing hook)." >&2
+      echo "The merge is left in place. Fix the cause, then run 'git commit', or run 'git merge --abort' to undo." >&2
+    fi
   else
     echo "sync-upstream: merge failed before it started." >&2
   fi
