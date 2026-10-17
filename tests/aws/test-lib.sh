@@ -28,9 +28,16 @@ write_env() {
   } > "$f"
 }
 
+# clean_env: drops inherited settings so the caller's shell cannot affect results.
+clean_env() {
+  unset AWS_PROFILE TF_STATE_BUCKET ROUTE53_ZONE BUZZ_DOMAIN RELAY_OWNER_PUBKEY \
+    AWS_REGION INSTANCE_TYPE AGENTS AGENT_RESPOND_TO AGENT_RESPOND_TO_ALLOWLIST
+}
+
 # run_load <env-file>: runs load_settings in a subshell, prints combined output.
 run_load() {
   (
+    clean_env
     export AWS_ENV_FILE="$1"
     # shellcheck source=/dev/null
     . "$REPO_ROOT/scripts/aws/lib.sh"
@@ -79,11 +86,17 @@ for var in AWS_PROFILE TF_STATE_BUCKET ROUTE53_ZONE RELAY_OWNER_PUBKEY; do
 done
 
 # Domain shape.
-for d in "https://buzz.example.com/" "buzz.example.com/" "buzz.example.com." "buzz example.com"; do
+for d in "https://buzz.example.com/" "buzz.example.com/" "buzz.example.com." "buzz example.com" \
+  "buzz.example.com:3000" ".example.com" "Buzz.Example.com" "localhost" "-buzz.example.com" "buzz-.example.com" "buzz..example.com"; do
   f="$WORK/domain.env"
   write_env "$f" "BUZZ_DOMAIN=\"$d\""
   expect_fail "BUZZ_DOMAIN '$d' rejected" "$f" "bare host name"
 done
+
+# Whitespace-only required value.
+f="$WORK/blank.env"
+write_env "$f" "AWS_PROFILE=\"   \""
+expect_fail "whitespace-only AWS_PROFILE rejected" "$f" "AWS_PROFILE"
 
 # Owner pubkey.
 f="$WORK/npub.env"
@@ -103,6 +116,24 @@ expect_ok "empty AGENTS disables agents" "$f" "AGENTS= "
 f="$WORK/agents-one.env"
 write_env "$f" "AGENTS=codex"
 expect_ok "single agent accepted" "$f" "AGENTS=codex "
+
+# List shape.
+for a in "claude," ",claude" "claude,,codex"; do
+  f="$WORK/agents-shape.env"
+  write_env "$f" "AGENTS=$a"
+  expect_fail "AGENTS '$a' rejected as empty entry" "$f" "empty entry"
+done
+f="$WORK/agents-dup.env"
+write_env "$f" "AGENTS=claude,claude"
+expect_fail "duplicate agent rejected" "$f" "duplicate"
+for a in "$PUBKEY," ",$PUBKEY" "$PUBKEY,,$PUBKEY2"; do
+  f="$WORK/allow-shape.env"
+  write_env "$f" "AGENT_RESPOND_TO=allowlist" "AGENT_RESPOND_TO_ALLOWLIST=$a"
+  expect_fail "allowlist '${a:0:5}...' rejected as empty entry" "$f" "empty entry"
+done
+f="$WORK/allow-dup.env"
+write_env "$f" "AGENT_RESPOND_TO=allowlist" "AGENT_RESPOND_TO_ALLOWLIST=$PUBKEY,$PUBKEY"
+expect_fail "duplicate allowlist pubkey rejected" "$f" "duplicate"
 
 # Respond-to.
 f="$WORK/respond-bad.env"
@@ -129,6 +160,7 @@ expect_ok "valid file exports defaults" "$f" \
 
 # Exported to child processes.
 out="$(
+  clean_env
   export AWS_ENV_FILE="$f"
   . "$REPO_ROOT/scripts/aws/lib.sh"
   load_settings

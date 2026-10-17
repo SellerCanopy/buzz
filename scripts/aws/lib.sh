@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the AWS deployment scripts. Source this file; do not run it.
+# This file does not set -euo pipefail: shell options set in a sourced library
+# would change the caller's shell. Callers set their own options.
 
 if [ -z "${REPO_ROOT:-}" ]; then
   REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -25,8 +27,26 @@ tf_output() {
   terraform -chdir=infra output -raw "$1"
 }
 
+# check_list_shape <setting> <value>: exits 1 if a comma-separated list has an
+# empty entry (leading, trailing, or doubled comma) or a duplicate entry.
+check_list_shape() {
+  local name="$1" value="$2"
+  case "$value" in
+    ,* | *, | *,,*) die "$name has an empty entry (leading, trailing, or doubled comma): '$value'" ;;
+  esac
+  local -a items
+  IFS=',' read -r -a items <<< "$value"
+  local i j
+  for ((i = 0; i < ${#items[@]}; i++)); do
+    for ((j = i + 1; j < ${#items[@]}; j++)); do
+      [ "${items[i]}" != "${items[j]}" ] || die "$name has a duplicate entry: '${items[i]}'"
+    done
+  done
+}
+
 # load_settings: sources the settings file, applies defaults, validates, and
-# exports every setting. Reads ${AWS_ENV_FILE:-$REPO_ROOT/.aws.env}. Exits 1
+# exports every setting. Exported shell variables are overridden by values in
+# the settings file and fill in anything the file leaves out. Reads ${AWS_ENV_FILE:-$REPO_ROOT/.aws.env}. Exits 1
 # with a message on any invalid or missing value.
 load_settings() {
   local env_file="${AWS_ENV_FILE:-$REPO_ROOT/.aws.env}"
@@ -36,7 +56,7 @@ load_settings() {
 
   local var
   for var in AWS_PROFILE TF_STATE_BUCKET ROUTE53_ZONE BUZZ_DOMAIN RELAY_OWNER_PUBKEY; do
-    [ -n "${!var:-}" ] || die "$var is required in $env_file"
+    [[ "${!var:-}" =~ [^[:space:]] ]] || die "$var is required in $env_file"
   done
 
   AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -46,17 +66,16 @@ load_settings() {
   AGENT_RESPOND_TO="${AGENT_RESPOND_TO:-owner-only}"
   AGENT_RESPOND_TO_ALLOWLIST="${AGENT_RESPOND_TO_ALLOWLIST:-}"
 
-  case "$BUZZ_DOMAIN" in
-    *://* | */* | *[[:space:]]* | *.)
-      die "BUZZ_DOMAIN must be a bare host name (no scheme, slash, space, or trailing dot): $BUZZ_DOMAIN"
-      ;;
-  esac
+  local label='[a-z0-9]([a-z0-9-]*[a-z0-9])?'
+  [[ "$BUZZ_DOMAIN" =~ ^(${label}\.)+${label}$ ]] \
+    || die "BUZZ_DOMAIN must be a bare host name (lowercase letters, digits, hyphens, at least two dot-separated labels; no scheme, port, slash, space, or trailing dot): $BUZZ_DOMAIN"
 
   [[ "$RELAY_OWNER_PUBKEY" =~ ^[0-9a-f]{64}$ ]] \
     || die "RELAY_OWNER_PUBKEY must be 64 hex characters (lowercase), not an npub"
 
   local agent
   if [ -n "$AGENTS" ]; then
+    check_list_shape AGENTS "$AGENTS"
     local -a agent_list
     IFS=',' read -r -a agent_list <<< "$AGENTS"
     for agent in "${agent_list[@]}"; do
@@ -72,6 +91,7 @@ load_settings() {
     allowlist)
       [ -n "$AGENT_RESPOND_TO_ALLOWLIST" ] \
         || die "AGENT_RESPOND_TO_ALLOWLIST is required when AGENT_RESPOND_TO=allowlist"
+      check_list_shape AGENT_RESPOND_TO_ALLOWLIST "$AGENT_RESPOND_TO_ALLOWLIST"
       local key
       local -a keys
       IFS=',' read -r -a keys <<< "$AGENT_RESPOND_TO_ALLOWLIST"
