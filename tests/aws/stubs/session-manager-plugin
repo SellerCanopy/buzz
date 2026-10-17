@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake session-manager-plugin for tests/aws. The real one only has to exist on
+# PATH for `aws ssm start-session`; the aws stub never calls it. Does nothing.
+exit 0

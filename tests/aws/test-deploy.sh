@@ -376,17 +376,17 @@ expect_caught "ssm read errors treated as not found" scenario_recorded_image_rea
   's/^    if \[ "\$rc" -ne 0 \] && ! grep -q ParameterNotFound "\$ERR_FILE"; then/    if false; then/'
 expect_caught "health check skipped" scenario_unhealthy_not_recorded deploy.sh \
   's/^wait_for_health$/true/'
-expect_caught "failed command treated as success" scenario_command_failed deploy.sh \
+expect_caught "failed command treated as success" scenario_command_failed ssm.sh \
   's/Success\) return 0 ;;/*) return 0 ;;/'
-expect_caught "poll attempts cut to one" scenario_command_timeout deploy.sh \
+expect_caught "poll attempts cut to one" scenario_command_timeout ssm.sh \
   's/for \(\(i = 0; i < POLL_ATTEMPTS; i\+\+\)\); do/for ((i = 0; i < POLL_ATTEMPTS; i = 0)); do break; done; for ((i = 0; i < 1; i++)); do/'
 expect_caught "local .env files shipped in the tarball" scenario_full_deploy deploy.sh \
   "s/^  find .* -delete\$/  true/"
 expect_caught "tar keeps the build owner" scenario_dry_run_backup_first deploy.sh \
   's/ --no-same-owner//'
-expect_caught "poll error never shown" scenario_poll_error_surfaced deploy.sh \
+expect_caught "poll error never shown" scenario_poll_error_surfaced ssm.sh \
   's/^        if \[ "\$empty_reads" -ge 5 \] && \[ "\$warned" -eq 0 \]; then$/        if false; then/'
-expect_caught "poll error shown on the first empty read" scenario_poll_few_empty_reads_quiet deploy.sh \
+expect_caught "poll error shown on the first empty read" scenario_poll_few_empty_reads_quiet ssm.sh \
   's/-ge 5 \]/-ge 1 ]/'
 expect_caught "tag not validated" scenario_bad_tag_rejected deploy.sh \
   's/^\[\[ "\$tag" =~ .*$/true/'

@@ -6,6 +6,9 @@
 #     (for example ssm-get-parameter.out). A missing file means empty output.
 #   - Prints $STUB_DIR/<command>-<subcommand>.err to stderr when it exists.
 #   - Exits with the number in $STUB_DIR/<command>-<subcommand>.rc (default 0).
+#   - For "ssm get-command-invocation ... --query FIELD", prints
+#     ssm-get-command-invocation.FIELD.out instead when that file exists
+#     (for example StandardOutputContent). Otherwise the generic file is used.
 #   - For "ssm get-parameter --name /x/NAME", ssm-get-parameter.NAME.rc and
 #     ssm-get-parameter.NAME.err take precedence over the generic files.
 #   - For "ssm put-parameter --value file://PATH", appends the file contents
@@ -35,6 +38,17 @@ if [ "$name" = "ssm-get-parameter" ]; then
   done
 fi
 
+outfile="$STUB_DIR/$name.out"
+if [ "$name" = "ssm-get-command-invocation" ]; then
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--query" ] && [ -f "$STUB_DIR/$name.$arg.out" ]; then
+      outfile="$STUB_DIR/$name.$arg.out"
+    fi
+    prev="$arg"
+  done
+fi
+
 if [ "$name" = "ssm-put-parameter" ]; then
   prev=""
   for arg in "$@"; do
@@ -50,7 +64,7 @@ if [ "$name" = "s3-cp" ] && [ -f "${3:-}" ]; then
   cp "$3" "$STUB_DIR/s3-cp.upload"
 fi
 
-[ -f "$STUB_DIR/$name.out" ] && cat "$STUB_DIR/$name.out"
+[ -f "$outfile" ] && cat "$outfile"
 [ -f "$errfile" ] && cat "$errfile" >&2
 rc=0
 [ -f "$rcfile" ] && rc="$(cat "$rcfile")"

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fake timeout for tests/aws. Never runs the wrapped command.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "timeout <args>" to $STUB_LOG.
+#   - Prints $STUB_DIR/timeout.out when it exists, and exits with the number in
+#     $STUB_DIR/timeout.rc (default 124, which real timeout returns when the
+#     time limit ends the command).
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "timeout $*" >> "$STUB_LOG"
+
+[ -f "$STUB_DIR/timeout.out" ] && cat "$STUB_DIR/timeout.out"
+rc=124
+[ -f "$STUB_DIR/timeout.rc" ] && rc="$(cat "$STUB_DIR/timeout.rc")"
+exit "$rc"

@@ -6,7 +6,7 @@ BUILD_TAG = $(or $(TAG),$(shell git rev-parse --short HEAD))
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback
+.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "} {printf "  %-20s %s\n", $$1, $$2}'
@@ -43,3 +43,15 @@ deploy: ## Back up, build, push, and deploy the current commit (DRY_RUN=1 to pre
 
 rollback: ## Redeploy an earlier image (TAG=<tag>; without TAG it uses the last good image, which is the running tag after a healthy deploy, so a bad but healthy release needs an explicit TAG)
 	@ROLLBACK=1 bash $(SCRIPTS)/deploy.sh $(TAG)
+
+backup: ## Dump Postgres on the server and upload it to the backup bucket
+	@bash $(SCRIPTS)/backup.sh
+
+status: ## Show the Compose services running on the server
+	@bash $(SCRIPTS)/ops.sh status
+
+logs: ## Show the last 100 relay log lines (SERVICE=<name> for another service)
+	@SERVICE=$(SERVICE) bash $(SCRIPTS)/ops.sh logs
+
+shell: ## Open an interactive session on the server
+	@bash $(SCRIPTS)/ops.sh shell
