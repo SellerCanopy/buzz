@@ -272,6 +272,15 @@ scenario_stale_env_removed() {
   [ -e "$OUT/notes.txt" ] && [ -e "$OUT/Not_An_Agent.env" ]
 }
 
+# An output directory that already exists keeps its old mode unless it is set.
+scenario_existing_outdir_becomes_0700() {
+  setup a
+  mkdir -p "$OUT"
+  chmod 0755 "$OUT"
+  render "$1" a:claude
+  [ "$RC" -eq 0 ] && [ "$(mode_of "$OUT")" = 700 ]
+}
+
 scenario_stale_config_dir_removed() {
   setup a b-c
   mkdir -p "$OUT/old/config" "$OUT/b/config" "$OUT/Not_An_Agent/config"
@@ -340,6 +349,7 @@ expect_ok "no SSM parameters at all exits 1" scenario_no_stub_output_exits_1 "$R
 expect_ok "unsafe credential characters are refused, never shown" scenario_unsafe_credential_refused "$R"
 expect_ok "invalid or wrong-shaped JSON exits 1 naming the agent" scenario_invalid_json_exits_1_naming_agent "$R"
 expect_ok "stale env files are removed, other files are kept" scenario_stale_env_removed "$R"
+expect_ok "an existing output directory is set to 0700" scenario_existing_outdir_becomes_0700 "$R"
 expect_ok "a removed agent's staged config directory is removed too" scenario_stale_config_dir_removed "$R"
 expect_ok "a failed run leaves the previous files untouched" scenario_failed_run_keeps_old_files "$R"
 expect_ok "empty AGENTS clears all agent files" scenario_empty_agents_clears_everything "$R"
@@ -364,6 +374,8 @@ expect_caught "JSON error does not name the agent" scenario_invalid_json_exits_1
   's/error: agent \$1: /error: /'
 expect_caught "stale env files kept" scenario_stale_env_removed render-agents-env.sh \
   's/^    \*\) rm -rf .*$/    *) ;;/'
+expect_caught "output directory mode left as found" scenario_existing_outdir_becomes_0700 render-agents-env.sh \
+  's/^chmod 0700 "\$outdir"$/true/'
 expect_caught "stale config directory kept" scenario_stale_config_dir_removed render-agents-env.sh \
   's/rm -rf "\$\{outdir:\?\}\/\$stem" /rm -f /'
 expect_caught "stale match is a substring" scenario_stale_env_removed render-agents-env.sh \

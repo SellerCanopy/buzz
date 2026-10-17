@@ -129,6 +129,7 @@ while read -r name runtime; do
 done <<< "$agents"
 
 mkdir -p "$outdir"
+chmod 0700 "$outdir"
 outdir="$(cd "$outdir" && pwd)"
 
 names=$'\n'
