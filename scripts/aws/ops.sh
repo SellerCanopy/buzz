@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Operations on the running server: service status, recent relay logs, and an
-# interactive shell. status and logs run over SSM and print the output here.
-# Usage: ops.sh status|logs|shell
+# Operations on the running server: service status, recent relay logs, the agent
+# containers, one agent's logs, and an interactive shell. Every action except
+# shell runs over SSM and prints the output here.
+# Usage: ops.sh status|logs|agents-status|agents-logs|shell
 # Environment: SERVICE (logs only; Compose service name, default relay),
-# POLL_INTERVAL and POLL_ATTEMPTS (seconds, count; SSM command wait).
+# AGENT (agents-logs only; a name from AGENTS), POLL_INTERVAL and POLL_ATTEMPTS (seconds, count; SSM command wait).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_LINES=100
 LOG_SECONDS=10
 
-# remote_script <status|logs> <service>: prints the commands the server runs.
+# remote_script <action> <service-or-agent>: prints the commands the server runs.
 remote_script() {
   echo "#!/bin/bash"
   echo "set -euo pipefail"
@@ -23,6 +24,16 @@ remote_script() {
   echo "cd /opt/buzz/deploy/compose"
   case "$1" in
     status) echo "BUZZ_COMPOSE_TLS=true ./run.sh status" ;;
+    agents-status)
+      # Stopped agents stay in the list: a clean exit after !shutdown is expected.
+      # shellcheck disable=SC2028 # docker needs the literal backslash-t
+      echo "docker ps -a --filter label=buzz.agent --format 'table {{.Label \"buzz.agent\"}}\t{{.Status}}\t{{.Image}}'"
+      ;;
+    agents-logs)
+      echo "rc=0"
+      echo "timeout $LOG_SECONDS docker compose -p 'buzz-agent-$2' -f /opt/buzz/deploy/aws/compose.agents.yml --env-file '/opt/buzz/agents/$2.compose.env' logs --follow --no-color --tail $LOG_LINES agent || rc=\$?"
+      echo "[ \"\$rc\" -eq 0 ] || [ \"\$rc\" -eq 124 ] || exit \"\$rc\""
+      ;;
     logs)
       # run.sh logs always follows, so timeout ends it. Exit 124 is the
       # expected end of a follow, not a failure.
@@ -33,7 +44,7 @@ remote_script() {
   esac
 }
 
-# run_remote <status|logs> <service>: runs the command on the server and prints
+# run_remote <action> <service-or-agent>: runs the command on the server and prints
 # its output.
 run_remote() {
   local command_id
@@ -43,11 +54,12 @@ run_remote() {
   ssm_output "$command_id" "$instance"
 }
 
-[ $# -eq 1 ] || die "usage: ops.sh status|logs|shell"
+usage="usage: ops.sh status|logs|agents-status|agents-logs|shell"
+[ $# -eq 1 ] || die "$usage"
 action="$1"
 case "$action" in
-  status | logs | shell) ;;
-  *) die "usage: ops.sh status|logs|shell" ;;
+  status | logs | agents-status | agents-logs | shell) ;;
+  *) die "$usage" ;;
 esac
 
 service="${SERVICE:-relay}"
@@ -59,10 +71,21 @@ require_tool terraform
 load_settings
 cd "$REPO_ROOT"
 
+agent="${AGENT:-}"
+if [ "$action" = "agents-logs" ]; then
+  [ -n "$agent" ] || die "AGENT is required (make agents-logs AGENT=<name>)"
+  match=""
+  while read -r name _; do
+    [ "$name" != "$agent" ] || match="$name"
+  done < <(agent_list)
+  [ -n "$match" ] || die "$agent is not an agent in AGENTS (${AGENTS:-empty}). Known agents: $(agent_list | cut -d' ' -f1 | paste -sd, -)"
+fi
+
 instance="$(tf_output instance_id)"
 [ -n "$instance" ] || die "terraform output instance_id is empty (run make apply first)"
 
 case "$action" in
   shell) exec aws ssm start-session --target "$instance" ;;
+  agents-logs) run_remote "$action" "$agent" ;;
   *) run_remote "$action" "$service" ;;
 esac

@@ -6,7 +6,7 @@ BUILD_TAG = $(or $(TAG),$(shell git rev-parse --short HEAD))
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-register
+.PHONY: help test-aws sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-register agents-status agents-logs
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "} {printf "  %-20s %s\n", $$1, $$2}'
@@ -32,10 +32,10 @@ destroy: ## Destroy all infrastructure (you must type BUZZ_DOMAIN to confirm)
 secrets: ## Create the relay secrets in SSM Parameter Store if absent
 	@bash $(SCRIPTS)/secrets.sh
 
-build: ## Build the relay image for linux/arm64 (TAG=<tag>, default short git SHA)
+build: ## Build the relay image, and the agents image when AGENTS is set, for linux/arm64 (TAG=<tag>, default short git SHA)
 	@bash $(SCRIPTS)/build.sh $(BUILD_TAG)
 
-push: ## Build the relay image and push it to ECR (TAG=<tag>, default short git SHA)
+push: ## Build the images and push them to ECR (TAG=<tag>, default short git SHA)
 	@bash $(SCRIPTS)/build.sh $(BUILD_TAG) --push
 
 deploy: ## Back up, build, push, and deploy the current commit (DRY_RUN=1 to preview)
@@ -61,3 +61,9 @@ agents-secrets: ## Store the agent credentials from your shell in SSM (CLAUDE_CO
 
 agents-register: ## Create one identity per agent and add it to the relay
 	@bash $(SCRIPTS)/agents-register.sh
+
+agents-status: ## Show the agent containers on the server
+	@bash $(SCRIPTS)/ops.sh agents-status
+
+agents-logs: ## Show one agent's recent logs for about 10 seconds (AGENT=<name from AGENTS>)
+	@AGENT=$(AGENT) bash $(SCRIPTS)/ops.sh agents-logs

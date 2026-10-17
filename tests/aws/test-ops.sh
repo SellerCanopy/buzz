@@ -144,6 +144,89 @@ scenario_missing_instance_output() {
   [ "$RC" -ne 0 ] && [ "$(log_count 'send-command')" -eq 0 ]
 }
 
+scenario_agents_status() {
+  stubs_ok
+  run_ops "$1" agents-status
+  [ "$RC" -eq 0 ] || return 1
+  local line
+  line="$(sent_line)"
+  case "$line" in *"docker ps -a --filter label=buzz.agent --format "*) ;; *) return 1 ;; esac
+  # The decoded command must be one valid shell command that docker (the stub) receives.
+  decode_command "$WORK/server.sh"
+  : > "$STUB_LOG"
+  rm -rf "$OPT"
+  mkdir -p "$OPT/deploy/compose"
+  RC=0
+  bash "$WORK/server.sh" > "$WORK/srv.out" 2> "$WORK/srv.err" || RC=$?
+  [ "$RC" -eq 0 ] \
+    && [ "$(log_count '^docker ps -a --filter label=buzz.agent --format table \{\{.Label "buzz.agent"\}\}\\t\{\{.Status\}\}\\t\{\{.Image\}\}$')" -eq 1 ]
+}
+
+scenario_agents_status_needs_no_agent_list() {
+  stubs_ok
+  run_ops "$1" agents-status AGENTS=
+  [ "$RC" -eq 0 ] && [ "$(log_count 'send-command')" -eq 1 ]
+}
+
+scenario_agents_logs_known_agent() {
+  stubs_ok
+  echo "agent log line" > "$STUB_DIR/ssm-get-command-invocation.StandardOutputContent.out"
+  run_ops "$1" agents-logs AGENTS=a:claude,b:claude AGENT=b
+  [ "$RC" -eq 0 ] || return 1
+  local line
+  line="$(sent_line)"
+  case "$line" in *"timeout 10 docker compose -p 'buzz-agent-b' -f /opt/buzz/deploy/aws/compose.agents.yml --env-file '/opt/buzz/agents/b.compose.env' logs --follow --no-color --tail 100 agent"*) ;; *) return 1 ;; esac
+  grep -qF "agent log line" "$OUT"
+}
+
+scenario_agents_logs_bare_runtime_name() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS=claude,codex AGENT=codex
+  [ "$RC" -eq 0 ] && case "$(sent_line)" in *"-p 'buzz-agent-codex'"*) true ;; *) false ;; esac
+}
+
+scenario_agents_logs_unknown_agent() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS=a:claude,b:claude AGENT=c
+  [ "$RC" -ne 0 ] && grep -qF "c is not an agent in AGENTS" "$ERR" && grep -qF "a,b" "$ERR" \
+    && [ "$(log_count 'send-command')" -eq 0 ]
+}
+
+scenario_agents_logs_needs_agent() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS=a:claude
+  [ "$RC" -ne 0 ] && grep -qF "AGENT is required" "$ERR" && [ "$(log_count 'send-command')" -eq 0 ]
+}
+
+# A prefix of a real name is not a match, and neither is shell text.
+scenario_agents_logs_exact_match_only() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS=alpha:claude AGENT=alp || return 1
+  [ "$RC" -ne 0 ] || return 1
+  run_ops "$1" agents-logs AGENTS=alpha:claude "AGENT=alpha';touch /tmp/pwned;'"
+  [ "$RC" -ne 0 ] && [ "$(log_count 'send-command')" -eq 0 ]
+}
+
+scenario_agents_logs_with_agents_off() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS= AGENT=a
+  [ "$RC" -ne 0 ] && grep -qF "a is not an agent in AGENTS" "$ERR" && [ "$(log_count 'send-command')" -eq 0 ]
+}
+
+# Real timeout exits 124 when it ends the follow; that is the normal end.
+scenario_agents_logs_command_follow_end_is_ok() {
+  stubs_ok
+  run_ops "$1" agents-logs AGENTS=a:claude AGENT=a || return 1
+  decode_command "$WORK/server.sh"
+  : > "$STUB_LOG"
+  echo 124 > "$STUB_DIR/timeout.rc"
+  rm -rf "$OPT"
+  mkdir -p "$OPT/deploy/compose"
+  RC=0
+  bash "$WORK/server.sh" > "$WORK/srv.out" 2> "$WORK/srv.err" || RC=$?
+  [ "$RC" -eq 0 ]
+}
+
 D="$REPO_ROOT/scripts/aws"
 expect_ok "status runs run.sh status from the compose directory and prints the output" scenario_status "$D"
 expect_ok "status exits nonzero when the server command fails" scenario_status_failure "$D"
@@ -156,6 +239,16 @@ expect_ok "shell opens an SSM session on the instance" scenario_shell "$D"
 expect_ok "shell stops when session-manager-plugin is missing" scenario_shell_without_plugin "$D"
 expect_ok "an unknown action prints usage" scenario_usage "$D"
 expect_ok "missing instance_id output sends nothing" scenario_missing_instance_output "$D"
+
+expect_ok "agents-status lists the buzz.agent containers, stopped ones included" scenario_agents_status "$D"
+expect_ok "agents-status works with AGENTS empty" scenario_agents_status_needs_no_agent_list "$D"
+expect_ok "agents-logs follows one agent's Compose project, bounded by timeout" scenario_agents_logs_known_agent "$D"
+expect_ok "agents-logs accepts a bare runtime name" scenario_agents_logs_bare_runtime_name "$D"
+expect_ok "agents-logs rejects an agent that is not in AGENTS, listing the known ones" scenario_agents_logs_unknown_agent "$D"
+expect_ok "agents-logs requires AGENT" scenario_agents_logs_needs_agent "$D"
+expect_ok "agents-logs matches the whole name and rejects shell text" scenario_agents_logs_exact_match_only "$D"
+expect_ok "agents-logs rejects every name when AGENTS is empty" scenario_agents_logs_with_agents_off "$D"
+expect_ok "agents-logs treats the timeout end of a follow as success" scenario_agents_logs_command_follow_end_is_ok "$D"
 
 expect_caught "plugin check removed" scenario_shell_without_plugin ops.sh \
   's/^\[ "\$action" != "shell" \] \|\| require_tool session-manager-plugin$/true/'
@@ -172,6 +265,21 @@ expect_caught "logs not tailed" scenario_logs_default_service ops.sh \
 expect_caught "status runs the wrong command" scenario_status ops.sh \
   's/\.\/run\.sh status/.\/run.sh config/'
 expect_caught "usage check removed" scenario_usage ops.sh \
-  's/^  \*\) die "usage: ops.sh status\|logs\|shell" ;;$/  *) true ;;/'
+  's/^  \*\) die "\$usage" ;;$/  *) true ;;/'
+
+expect_caught "agents-logs accepts any agent" scenario_agents_logs_unknown_agent ops.sh \
+  's/^  \[ -n "\$match" \] \|\| die .*$/  true/'
+expect_caught "agents-logs matches a prefix" scenario_agents_logs_exact_match_only ops.sh \
+  's/\[ "\$name" != "\$agent" \] \|\| match="\$name"/case "$name" in "$agent"*) match="$name" ;; esac/'
+expect_caught "agents-logs does not need AGENT" scenario_agents_logs_needs_agent ops.sh \
+  's/^  \[ -n "\$agent" \] \|\| die .*$/  true/'
+expect_caught "agents-logs unbounded" scenario_agents_logs_known_agent ops.sh \
+  's/timeout \$LOG_SECONDS docker/docker/'
+expect_caught "agents-logs treats the end of the follow as failure" scenario_agents_logs_command_follow_end_is_ok ops.sh \
+  's/\[ \\"\\\$rc\\" -eq 0 \] \|\| \[ \\"\\\$rc\\" -eq 124 \] \|\| exit/exit/'
+expect_caught "agents-status drops stopped agents" scenario_agents_status ops.sh \
+  's/docker ps -a --filter/docker ps --filter/'
+expect_caught "agents-logs reads another agent's project" scenario_agents_logs_known_agent ops.sh \
+  's/buzz-agent-\$2/buzz-agent-$service/'
 
 exit "$fail"

@@ -133,7 +133,96 @@ The server runs `infra/user-data.sh.tftpl` once, on its first boot. Terraform ig
 
 ## Agents
 
-Cloud agents are covered later in this document once they ship.
+Cloud agents are AI assistants that run on the same server as the relay. Each one is its own container with its own identity. You talk to an agent by mentioning it in a channel.
+
+By default `AGENTS=claude,codex` runs one Claude agent and one Codex agent. Set `AGENTS=` (empty) to run none.
+
+### Setup order
+
+1. `make apply`, then `make deploy` once, so the relay is up.
+2. Export the credentials in your shell. They never go in `.aws.env`. For example, `set -a; . ./.env; set +a` loads them from a `.env` file.
+   - Claude agents: `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` if no token is set.
+   - Codex agents: `OPENAI_API_KEY`.
+3. `make agents-secrets` stores them in SSM under `/buzz/agents/`. It skips any that already exist.
+4. `make agents-register` creates one identity per agent and adds it to the relay. It is safe to run again.
+5. `make deploy` builds and pushes the agent image, renders each agent's environment on the server, and starts the agent containers after the relay is healthy.
+
+### Defining several agents
+
+`AGENTS` is a comma-separated list. An entry is `claude`, `codex`, or `<name>:<runtime>`. Names must be unique.
+
+```
+AGENTS=reviewer:claude,docs:claude,codex
+```
+
+Each agent gets its own container, home volume, and Compose project (`buzz-agent-<name>`). Run `make agents-register` and `make deploy` after you change the list. An agent you remove is stopped by the next deploy. If the list becomes empty, the deploy also deletes `/opt/buzz/agents` on the server.
+
+`AGENT_RESPOND_TO` (`owner-only` by default, or `allowlist`, `anyone`, `nobody`) sets who an agent answers. `allowlist` also needs `AGENT_RESPOND_TO_ALLOWLIST`.
+
+### Per-agent tools
+
+Put an agent's MCP servers (tools it can call) in `deploy/aws/agents/<name>/mcp.json`. The file is committed, so it holds no secrets. Details and limits are in `deploy/aws/agents/README.md`.
+
+### Using an agent
+
+Add the agent to a channel and mention it, such as `@reviewer please look at this thread`. `!shutdown` stops an agent for good, and the container does not restart by itself. The next `make deploy` starts it again.
+
+### Spend limits
+
+Agents bill your own Anthropic and OpenAI accounts, and nothing in this project caps that. Set a monthly spend limit in each provider's console before you start an agent.
+
+### Checking agents
+
+| Command | What it does |
+|---|---|
+| `make agents-status` | List the agent containers on the server and their state. |
+| `make agents-logs AGENT=<name>` | Show that agent's recent logs for about 10 seconds. `<name>` must be in `AGENTS`. |
+
+### Rollback and agents
+
+A rollback restores the relay and the agent image to the same tag. Both images are built and pushed under one tag, and `/buzz/last_good_image` holds it. Before it sends anything, the rollback checks that the agents image with that tag exists in ECR. If it does not, it stops with `no agents image tagged <tag>`. That happens for a release that was deployed with `AGENTS` empty. A release built before agents existed also has no agent files, so a deploy with `AGENTS` set fails early with `release has no deploy/aws agent files`.
+
+### Troubleshooting agents
+
+**An agent starts and exits.** Run `make agents-logs AGENT=<name>`. A missing credential, a bad `mcp.json`, or a relay that rejects the agent shows up there. If the cause is the identity, run `make agents-register` again.
+
+**Building the agent image on your laptop.** The agent image is built on top of the relay's agent runner image (`buzz-sprig:<tag>`). The build needs Docker's default builder, either the `docker` driver or the containerd image store, so the first image is visible to the second. A `docker-container` builder cannot see it.
+
+**Checking an agent against a local relay.** `just setup` and `just relay` use ports 5432, 6379, and 3000, so they fail when other containers already hold those ports. This runs an isolated relay and one agent instead, with throwaway keys. It never touches the AWS account.
+
+```
+# 1. Relay stack. Copy deploy/compose/compose.yml and write a .env beside it with
+#    throwaway secrets, BUZZ_DOMAIN=buzz-t9.test, BUZZ_HTTP_PORT=53000,
+#    BUZZ_REQUIRE_RELAY_MEMBERSHIP=true, BUZZ_GIT_CONFORMANCE_PROBE=false.
+#    Always pass -p: compose.yml is named buzz-prod, the same as a real deployment.
+docker compose -p buzz-t9 --env-file .env up -d
+
+# 2. Make an identity and add it as a member. No -T or TTY is needed.
+docker compose -p buzz-t9 exec relay /usr/local/bin/buzz-admin generate-key < /dev/null
+docker compose -p buzz-t9 exec relay /usr/local/bin/buzz-admin add-member --pubkey <public key> < /dev/null
+
+# 3. Build the images (a cold sprig build takes several minutes).
+docker build -f Dockerfile.sprig -t buzz-t9-sprig:local .
+docker build -f deploy/aws/Dockerfile.agents --build-arg SPRIG_IMAGE=buzz-t9-sprig:local -t buzz-t9-agent:local .
+
+# 4. Render the agent files with the test stand-in for aws. Put one line per
+#    parameter, "<name><TAB><value>", in $STUB_DIR/ssm-get-parameters-by-path.out:
+#    /buzz/agents/t9/BUZZ_PRIVATE_KEY and /buzz/agents/ANTHROPIC_API_KEY (any dummy text).
+STUB_DIR=<dir> STUB_LOG=<file> PATH="$PWD/tests/aws/stubs:$PATH" \
+  BUZZ_DOMAIN=buzz-t9.test RELAY_OWNER_PUBKEY=<64 hex> AGENTS=t9:claude \
+  bash scripts/aws/render-agents-env.sh <outdir> buzz-t9-agent:local deploy/aws/agents
+
+# 5. Point the agent at the local relay, then start it.
+sed -i '' 's#^BUZZ_RELAY_URL=.*#BUZZ_RELAY_URL=ws://buzz-t9.test:53000#' <outdir>/t9.env
+docker compose -p buzz-agent-t9 -f deploy/aws/compose.agents.yml --env-file <outdir>/t9.compose.env up -d
+docker logs buzz-agent-t9-agent-1
+
+# 6. Clean up.
+docker compose -p buzz-agent-t9 -f deploy/aws/compose.agents.yml --env-file <outdir>/t9.compose.env down -v
+docker compose -p buzz-t9 --env-file .env down -v
+```
+
+A working agent logs `connected to relay`, and the relay logs `NIP-42 auth successful` for the agent's key. Inside the container, `/etc/buzz-agent/mcp.json` and `~/.mcp.json` both read `{"mcpServers": {}}` for an agent with no config. The staged config is readable even though the render directory is mode 0700, because the container sees only the mounted `config` directory. On Docker Compose v5, `exec` without `-T` works with no terminal, so `run.sh add-member` runs fine over SSM.
 
 ## Running the script tests
 

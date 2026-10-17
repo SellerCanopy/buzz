@@ -8,6 +8,10 @@
 #               failed backup prints a warning and the rollback continues.
 #   DRY_RUN=1   run the checks and the backup, then print the SSM command
 #               instead of building, pushing, uploading, or sending anything
+# With AGENTS set, the agents image is built and pushed under the same tag as the
+# relay image, the release carries deploy/aws, and the server starts the agents
+# after the relay is healthy. One tag names both images, so /buzz/last_good_image
+# and a rollback cover both.
 # Other environment: BACKUP_CMD (default scripts/aws/backup.sh next to this
 # file), POLL_INTERVAL and POLL_ATTEMPTS (seconds, count; SSM command wait),
 # HEALTH_INTERVAL and HEALTH_ATTEMPTS (seconds, count; health check wait).
@@ -35,17 +39,20 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 ERR_FILE="$work/err"
 
-# remote_script <ecr-repo> <bucket> <tag>: prints the commands the server runs,
-# one per line.
+# remote_script <ecr-repo> <agents-ecr-repo> <bucket> <tag>: prints the commands
+# the server runs, one per line. The agents repository is empty when AGENTS is.
 remote_script() {
-  local repo="$1" bucket="$2" t="$3"
+  local repo="$1" agents_repo="$2" bucket="$3" t="$4"
   echo "set -eu"
   echo "export HOME=/root"
   echo "export AWS_DEFAULT_REGION='$AWS_REGION'"
   echo "export BUZZ_DOMAIN='$BUZZ_DOMAIN'"
   echo "export RELAY_OWNER_PUBKEY='$RELAY_OWNER_PUBKEY'"
   echo "export ECR_REPO='$repo'"
-  # Task 9 adds AGENTS and the AGENT_RESPOND_TO* settings to this block.
+  echo "export AGENTS='$AGENTS'"
+  echo "export AGENT_RESPOND_TO='$AGENT_RESPOND_TO'"
+  echo "export AGENT_RESPOND_TO_ALLOWLIST='$AGENT_RESPOND_TO_ALLOWLIST'"
+  [ -z "$agents_repo" ] || echo "export AGENTS_ECR_REPO='$agents_repo'"
   echo "mkdir -p /opt/buzz"
   echo "aws s3 cp 's3://$bucket/releases/$t.tgz' /opt/buzz/release.tgz"
   echo "tar xzf /opt/buzz/release.tgz --no-same-owner -C /opt/buzz"
@@ -88,6 +95,11 @@ bucket="$(tf_output backup_bucket)"
 instance="$(tf_output instance_id)"
 [ -n "$ecr_repo" ] && [ -n "$bucket" ] && [ -n "$instance" ] \
   || die "terraform outputs are empty (run make apply first)"
+agents_repo=""
+if [ -n "$AGENTS" ]; then
+  agents_repo="$(tf_output agents_ecr_repository_url)"
+  [ -n "$agents_repo" ] || die "terraform output agents_ecr_repository_url is empty (run make apply first)"
+fi
 
 echo "deploy: tag $tag to $BUZZ_DOMAIN"
 
@@ -103,13 +115,17 @@ fi
 if [ "${ROLLBACK:-}" = "1" ]; then
   aws s3api head-object --bucket "$bucket" --key "releases/$tag.tgz" > /dev/null \
     || die "no release tarball at s3://$bucket/releases/$tag.tgz, cannot roll back to $tag"
+  if [ -n "$agents_repo" ]; then
+    aws ecr describe-images --region "$AWS_REGION" --repository-name "${agents_repo#*/}" --image-ids "imageTag=$tag" > /dev/null 2>&1 \
+      || die "no agents image tagged $tag in ${agents_repo#*/} (it was deployed with AGENTS empty?), cannot roll back to $tag with agents"
+  fi
 fi
 
 if [ "${DRY_RUN:-}" = "1" ]; then
   echo "dry run: would build, push, and upload release $tag; sending nothing."
   echo "SSM command (dry run):"
   echo "aws ssm send-command --instance-ids $instance --document-name AWS-RunShellScript --parameters <below>"
-  remote_script "$ecr_repo" "$bucket" "$tag"
+  remote_script "$ecr_repo" "$agents_repo" "$bucket" "$tag"
   exit 0
 fi
 
@@ -122,14 +138,16 @@ if [ "${ROLLBACK:-}" != "1" ]; then
   stage="$work/stage"
   mkdir -p "$stage/deploy" "$stage/scripts/aws"
   cp -R "$REPO_ROOT/deploy/compose" "$stage/deploy/compose"
+  cp -R "$REPO_ROOT/deploy/aws" "$stage/deploy/aws"
   find "$stage/deploy/compose" -maxdepth 1 -name '.env*' ! -name '.env.example' -delete
   cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/render-env.sh" \
-    "$REPO_ROOT/scripts/aws/remote-deploy.sh" "$stage/scripts/aws/"
+    "$REPO_ROOT/scripts/aws/render-agents-env.sh" "$REPO_ROOT/scripts/aws/remote-deploy.sh" \
+    "$stage/scripts/aws/"
   COPYFILE_DISABLE=1 tar czf "$work/release.tgz" -C "$stage" deploy scripts
   aws s3 cp "$work/release.tgz" "s3://$bucket/releases/$tag.tgz"
 fi
 
-command_id="$(remote_script "$ecr_repo" "$bucket" "$tag" | ssm_send "$instance" "buzz deploy $tag")"
+command_id="$(remote_script "$ecr_repo" "$agents_repo" "$bucket" "$tag" | ssm_send "$instance" "buzz deploy $tag")"
 [ -n "$command_id" ] || die "send-command returned no command id"
 echo "sent SSM command $command_id, waiting"
 

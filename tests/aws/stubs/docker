@@ -2,7 +2,7 @@
 # Fake docker CLI for tests/aws. Never builds or pushes anything.
 # Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
 #   - Appends "docker <args>" to $STUB_LOG.
-#   - For "docker compose [--env-file F] [-f F]... <subcommand> ...", the
+#   - For "docker compose [-p P] [--env-file F] [-f F]... <subcommand> ...", the
 #     subcommand named below is compose-<subcommand> (for example
 #     docker-compose-ps.out, docker-compose-exec.rc).
 #   - Drains stdin when --password-stdin is given, without logging it.
@@ -27,7 +27,7 @@ if [ "$sub" = "compose" ]; then
   shift
   while [ $# -gt 0 ]; do
     case "$1" in
-      --env-file | -f) shift 2 ;;
+      --env-file | -f | -p) shift 2 ;;
       *) break ;;
     esac
   done

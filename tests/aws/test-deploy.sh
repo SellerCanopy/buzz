@@ -7,6 +7,7 @@ set -uo pipefail
 
 REPO_URL="123456789012.dkr.ecr.us-east-1.amazonaws.com/buzz/relay"
 REGISTRY="123456789012.dkr.ecr.us-east-1.amazonaws.com"
+AGENTS_REPO_URL="123456789012.dkr.ecr.us-east-1.amazonaws.com/buzz/agents"
 BUCKET="buzz-backups-test"
 OUT="$WORK/out"
 ERR="$WORK/err"
@@ -18,11 +19,14 @@ write_aws_env
 # Sets SHA to its short HEAD.
 new_repo() {
   rm -rf "$REPO"
-  mkdir -p "$REPO/deploy/compose" "$REPO/scripts/aws"
+  mkdir -p "$REPO/deploy/compose" "$REPO/deploy/aws/agents/a" "$REPO/scripts/aws"
   echo "run" > "$REPO/deploy/compose/run.sh"
   echo "lib" > "$REPO/scripts/aws/lib.sh"
   echo "render" > "$REPO/scripts/aws/render-env.sh"
   echo "remote" > "$REPO/scripts/aws/remote-deploy.sh"
+  echo "render-agents" > "$REPO/scripts/aws/render-agents-env.sh"
+  echo "compose-agents" > "$REPO/deploy/aws/compose.agents.yml"
+  echo "{}" > "$REPO/deploy/aws/agents/a/mcp.json"
   echo "example" > "$REPO/deploy/compose/.env.example"
   printf 'ignored.txt\ndeploy/compose/.env\ndeploy/compose/.env.*\n!deploy/compose/.env.example\n' > "$REPO/.gitignore"
   (
@@ -38,6 +42,7 @@ new_repo() {
 stubs_ok() {
   reset_stubs
   printf '%s' "$REPO_URL" > "$STUB_DIR/tf-ecr_repository_url.out"
+  printf '%s' "$AGENTS_REPO_URL" > "$STUB_DIR/tf-agents_ecr_repository_url.out"
   printf '%s' "$BUCKET" > "$STUB_DIR/tf-backup_bucket.out"
   printf '%s' "i-0abc123" > "$STUB_DIR/tf-instance_id.out"
   echo "cmd-1" > "$STUB_DIR/ssm-send-command.out"
@@ -203,6 +208,9 @@ scenario_full_deploy() {
   printf '%s\n' "$list" | grep -qx 'scripts/aws/render-env.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/remote-deploy.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'deploy/compose/.env.example' || return 1
+  printf '%s\n' "$list" | grep -qx 'deploy/aws/compose.agents.yml' || return 1
+  printf '%s\n' "$list" | grep -qx 'deploy/aws/agents/a/mcp.json' || return 1
+  printf '%s\n' "$list" | grep -qx 'scripts/aws/render-agents-env.sh' || return 1
   ! printf '%s\n' "$list" | grep -qE 'deploy/compose/\.env(\.bak|\.local)?$'
 }
 
@@ -329,6 +337,168 @@ scenario_build_login_failure_stops() {
   [ "$RC" -ne 0 ] && [ "$(log_count 'buildx')" -eq 0 ]
 }
 
+# Agents. The tag is one value for both images: the relay and agents images are
+# built and pushed under the same tag, and /buzz/last_good_image records it once.
+
+scenario_dry_run_agents_command() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" DRY_RUN=1 AGENTS=a:claude,b:claude AGENT_RESPOND_TO=anyone
+  [ "$RC" -eq 0 ] || return 1
+  grep -qF "export AGENTS='a:claude,b:claude'" "$OUT" || return 1
+  grep -qF "export AGENTS_ECR_REPO='$AGENTS_REPO_URL'" "$OUT" || return 1
+  grep -qF "export AGENT_RESPOND_TO='anyone'" "$OUT" || return 1
+  grep -qF "export AGENT_RESPOND_TO_ALLOWLIST=''" "$OUT" || return 1
+  grep -qF "bash /opt/buzz/scripts/aws/remote-deploy.sh '$SHA'" "$OUT" || return 1
+  nothing_shipped
+}
+
+scenario_dry_run_no_agents_command() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" DRY_RUN=1 AGENTS=
+  [ "$RC" -eq 0 ] || return 1
+  grep -qF "export AGENTS=''" "$OUT" || return 1
+  ! grep -qF "AGENTS_ECR_REPO" "$OUT" || return 1
+  [ "$(log_count 'agents_ecr_repository_url')" -eq 0 ] || return 1
+  nothing_shipped
+}
+
+scenario_agents_settings_reach_server() {
+  new_repo; stubs_ok; mk_backups
+  local allow
+  allow="$(printf 'b%.0s' $(seq 1 64))"
+  run_deploy "$1" DRY_RUN=1 AGENTS=a:claude AGENT_RESPOND_TO=allowlist AGENT_RESPOND_TO_ALLOWLIST="$allow"
+  [ "$RC" -eq 0 ] && grep -qF "export AGENT_RESPOND_TO='allowlist'" "$OUT" \
+    && grep -qF "export AGENT_RESPOND_TO_ALLOWLIST='$allow'" "$OUT"
+}
+
+scenario_missing_agents_output_stops() {
+  new_repo; stubs_ok; mk_backups
+  rm "$STUB_DIR/tf-agents_ecr_repository_url.out"
+  run_deploy "$1" AGENTS=a:claude
+  [ "$RC" -ne 0 ] && nothing_shipped
+}
+
+scenario_full_deploy_with_agents() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" AGENTS=a:claude,b:claude
+  [ "$RC" -eq 0 ] || return 1
+  local relay sprig agents send put prev=0 n
+  relay="$(log_line '^docker buildx build --platform linux/arm64 -t '"$REPO_URL:$SHA"' --push ')"
+  sprig="$(log_line '^docker buildx build --platform linux/arm64 -f .*Dockerfile.sprig -t buzz-sprig:'"$SHA"' --load ')"
+  agents="$(log_line '^docker buildx build --platform linux/arm64 -f .*deploy/aws/Dockerfile.agents --build-arg SPRIG_IMAGE=buzz-sprig:'"$SHA"' -t '"$AGENTS_REPO_URL:$SHA"' --push ')"
+  send="$(log_line '^aws ssm send-command ')"
+  put="$(log_line '^aws ssm put-parameter --name /buzz/last_good_image --type String --value '"$SHA"' --overwrite$')"
+  for n in "$relay" "$sprig" "$agents" "$send" "$put"; do
+    [ -n "$n" ] && [ "$n" -gt "$prev" ] || return 1
+    prev="$n"
+  done
+  # One recorded tag serves both images.
+  [ "$(log_count 'put-parameter')" -eq 1 ] && grep -qF "export AGENTS_ECR_REPO='$AGENTS_REPO_URL'" "$STUB_LOG"
+}
+
+scenario_full_deploy_without_agents() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" AGENTS=
+  [ "$RC" -eq 0 ] || return 1
+  [ "$(log_count 'Dockerfile.sprig')" -eq 0 ] && [ "$(log_count 'Dockerfile.agents')" -eq 0 ] \
+    && [ "$(log_count 'agents_ecr_repository_url')" -eq 0 ] \
+    && [ "$(log_count 'put-parameter --name /buzz/last_good_image .* --value '"$SHA"' ')" -eq 1 ]
+}
+
+scenario_rollback_restores_both_tags() {
+  new_repo; stubs_ok; mk_backups
+  echo "oldtag1" > "$STUB_DIR/ssm-get-parameter.out"
+  run_deploy "$1" ROLLBACK=1 AGENTS=a:claude
+  [ "$RC" -eq 0 ] || return 1
+  [ "$(log_count 'ecr describe-images --region us-east-1 --repository-name buzz/agents --image-ids imageTag=oldtag1$')" -eq 1 ] || return 1
+  [ "$(log_count '^docker ')" -eq 0 ] || return 1
+  grep -qF "export AGENTS_ECR_REPO='$AGENTS_REPO_URL'" "$STUB_LOG" \
+    && grep -qF "remote-deploy.sh 'oldtag1'" "$STUB_LOG" \
+    && [ "$(log_count 'put-parameter --name /buzz/last_good_image --type String --value oldtag1 ')" -eq 1 ]
+}
+
+# A tag deployed while AGENTS was empty has no agents image, so the rollback
+# stops before it changes anything.
+scenario_rollback_without_agents_image_stops() {
+  new_repo; stubs_ok; mk_backups
+  echo 254 > "$STUB_DIR/ecr-describe-images.rc"
+  echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" > "$STUB_DIR/ecr-describe-images.err"
+  run_deploy "$1" ROLLBACK=1 AGENTS=a:claude -- oldtag5
+  [ "$RC" -ne 0 ] && grep -qF "no agents image tagged oldtag5" "$ERR" \
+    && [ "$(log_count 'send-command')" -eq 0 ] && [ "$(log_count 'put-parameter')" -eq 0 ]
+}
+
+scenario_rollback_with_agents_off_skips_image_check() {
+  new_repo; stubs_ok; mk_backups
+  run_deploy "$1" ROLLBACK=1 AGENTS= -- oldtag6
+  [ "$RC" -eq 0 ] && [ "$(log_count 'ecr describe-images')" -eq 0 ] && [ "$(log_count 'send-command')" -eq 1 ]
+}
+
+scenario_build_agents() {
+  new_repo; stubs_ok
+  RC=0
+  AGENTS=a:claude bash "$1/build.sh" abc1234 --push > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -eq 0 ] || return 1
+  local login relay sprig agents prev=0 n
+  login="$(log_line '^docker login --username AWS --password-stdin '"$REGISTRY"'$')"
+  relay="$(log_line '^docker buildx build --platform linux/arm64 -t '"$REPO_URL"':abc1234 --push ')"
+  sprig="$(log_line '^docker buildx build --platform linux/arm64 -f .*/Dockerfile.sprig -t buzz-sprig:abc1234 --load ')"
+  agents="$(log_line '^docker buildx build --platform linux/arm64 -f .*/deploy/aws/Dockerfile.agents --build-arg SPRIG_IMAGE=buzz-sprig:abc1234 -t '"$AGENTS_REPO_URL"':abc1234 --push ')"
+  for n in "$login" "$relay" "$sprig" "$agents"; do
+    [ -n "$n" ] && [ "$n" -gt "$prev" ] || return 1
+    prev="$n"
+  done
+}
+
+scenario_build_agents_load() {
+  new_repo; stubs_ok
+  RC=0
+  AGENTS=a:claude bash "$1/build.sh" abc1234 > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -eq 0 ] \
+    && [ "$(log_count 'buzz-sprig:abc1234 --load ')" -eq 1 ] \
+    && [ "$(log_count '-t '"$AGENTS_REPO_URL"':abc1234 --load ')" -eq 1 ] \
+    && [ "$(log_count 'docker login')" -eq 0 ]
+}
+
+scenario_build_without_agents() {
+  new_repo; stubs_ok
+  RC=0
+  AGENTS='' bash "$1/build.sh" abc1234 --push > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -eq 0 ] && [ "$(log_count 'buildx build')" -eq 1 ] && [ "$(log_count 'Dockerfile')" -eq 0 ] \
+    && [ "$(log_count 'agents_ecr_repository_url')" -eq 0 ]
+}
+
+scenario_build_agents_failure_stops() {
+  new_repo; stubs_ok
+  rm "$STUB_DIR/tf-agents_ecr_repository_url.out"
+  RC=0
+  AGENTS=a:claude bash "$1/build.sh" abc1234 --push > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -ne 0 ] && [ "$(log_count 'buildx')" -eq 0 ]
+}
+
+# make agents-logs AGENT=c fails when c is not in AGENTS. Runs the real Makefile.
+scenario_make_agents_logs_unknown() {
+  new_repo; stubs_ok
+  RC=0
+  (cd "$REPO_ROOT" && env AGENTS=a:claude,b:claude AGENT=c POLL_INTERVAL=0 POLL_ATTEMPTS=3 \
+    make SCRIPTS="$1" agents-logs AGENT=c) > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -ne 0 ] && grep -qF "c is not an agent" "$ERR" && [ "$(log_count 'send-command')" -eq 0 ]
+}
+
+scenario_make_agents_logs_known() {
+  new_repo; stubs_ok
+  RC=0
+  (cd "$REPO_ROOT" && env AGENTS=a:claude,b:claude POLL_INTERVAL=0 POLL_ATTEMPTS=3 \
+    make SCRIPTS="$1" agents-logs AGENT=b) > "$OUT" 2> "$ERR" || RC=$?
+  [ "$RC" -eq 0 ] && [ "$(log_count 'send-command')" -eq 1 ]
+}
+
+scenario_make_help_lists_agent_targets() {
+  local out
+  out="$(cd "$REPO_ROOT" && make help)"
+  printf '%s\n' "$out" | grep -qE '^  agents-status ' && printf '%s\n' "$out" | grep -qE '^  agents-logs '
+}
+
 R="$REPO_ROOT/scripts/aws"
 expect_ok "dirty tree (untracked file) exits 1 and ships nothing" scenario_dirty_untracked "$R"
 expect_ok "dirty tree (modified file) exits 1 and ships nothing" scenario_dirty_modified "$R"
@@ -357,6 +527,23 @@ expect_ok "rollback to a tag with no release tarball fails before sending" scena
 expect_ok "build.sh without --push loads locally and does not log in" scenario_build_load "$R"
 expect_ok "build.sh --push logs in to ECR before building" scenario_build_push "$R"
 expect_ok "build.sh stops when the ECR login fails" scenario_build_login_failure_stops "$R"
+
+expect_ok "dry run with agents: the SSM command carries the agent list, the agents repository, and the tag" scenario_dry_run_agents_command "$R"
+expect_ok "dry run with AGENTS empty: no agents repository, and no output lookup" scenario_dry_run_no_agents_command "$R"
+expect_ok "AGENT_RESPOND_TO and its allowlist reach the server" scenario_agents_settings_reach_server "$R"
+expect_ok "a missing agents repository output stops before anything ships" scenario_missing_agents_output_stops "$R"
+expect_ok "full deploy with agents: relay, sprig, then agents image, then send, then one record" scenario_full_deploy_with_agents "$R"
+expect_ok "full deploy with AGENTS empty builds no agents image" scenario_full_deploy_without_agents "$R"
+expect_ok "rollback checks the agents image and redeploys both under the recorded tag" scenario_rollback_restores_both_tags "$R"
+expect_ok "rollback to a tag with no agents image stops before sending" scenario_rollback_without_agents_image_stops "$R"
+expect_ok "rollback with AGENTS empty skips the agents image check" scenario_rollback_with_agents_off_skips_image_check "$R"
+expect_ok "build.sh --push builds sprig locally, then pushes the agents image" scenario_build_agents "$R"
+expect_ok "build.sh without --push loads the agents image locally" scenario_build_agents_load "$R"
+expect_ok "build.sh with AGENTS empty builds only the relay image" scenario_build_without_agents "$R"
+expect_ok "build.sh stops when the agents repository output is missing" scenario_build_agents_failure_stops "$R"
+expect_ok "make agents-logs AGENT=c fails when c is not in AGENTS" scenario_make_agents_logs_unknown "$R"
+expect_ok "make agents-logs AGENT=b works when b is in AGENTS" scenario_make_agents_logs_known "$R"
+expect_ok "make help lists the agent targets" scenario_make_help_lists_agent_targets "$R"
 
 expect_caught "dirty-tree guard removed" scenario_dirty_untracked deploy.sh \
   's/^  \[ -z "\$dirty" \] \|\| die .*/  true; : "$dirty"/'
@@ -396,5 +583,24 @@ expect_caught "login after build" scenario_build_push build.sh \
   's/^if \[ "\$mode" = "--push" \]; then$/if false; then/'
 expect_caught "push not conditional on flag" scenario_build_load build.sh \
   's/^mode="--load"$/mode="--push"/'
+
+expect_caught "agents repository never sent to the server" scenario_dry_run_agents_command deploy.sh \
+  's/^  \[ -z "\$agents_repo" \] \|\| echo "export AGENTS_ECR_REPO=.*$/  true/'
+expect_caught "agents image never built" scenario_full_deploy_with_agents build.sh \
+  's/^if \[ -n "\$AGENTS" \]; then$/if false; then/'
+expect_caught "sprig build dropped" scenario_build_agents build.sh \
+  's|-f "\$REPO_ROOT/Dockerfile.sprig"|-f "$REPO_ROOT/Other"|'
+expect_caught "agents image pushed without --push" scenario_build_agents build.sh \
+  's/-t "\$agents_repo:\$tag" "\$mode"/-t "$agents_repo:$tag" --load/'
+expect_caught "rollback skips the agents image check" scenario_rollback_without_agents_image_stops deploy.sh \
+  's/^  if \[ -n "\$agents_repo" \]; then$/  if false; then/'
+expect_caught "rollback checks another tag for the agents image" scenario_rollback_restores_both_tags deploy.sh \
+  's/imageTag=\$tag/imageTag=latest/'
+expect_caught "agents lookup runs with AGENTS empty" scenario_dry_run_no_agents_command deploy.sh \
+  's/^if \[ -n "\$AGENTS" \]; then$/if true; then/'
+expect_caught "agents-logs accepts an unknown agent" scenario_make_agents_logs_unknown ops.sh \
+  's/^  \[ -n "\$match" \] \|\| die .*$/  true/'
+expect_caught "agents files left out of the tarball" scenario_full_deploy deploy.sh \
+  's/^  cp -R "\$REPO_ROOT\/deploy\/aws".*$/  true/'
 
 exit "$fail"
