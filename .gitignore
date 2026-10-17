@@ -77,3 +77,4 @@ deploy/charts/*/charts/*.tgz
 .aws.env
 infra/.terraform/
 infra/*.tfstate*
+infra/*.tfplan
