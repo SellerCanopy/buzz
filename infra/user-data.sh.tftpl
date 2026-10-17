@@ -41,13 +41,24 @@ while [ ! -e "$DEVICE" ]; do
   sleep 5
 done
 
-# Format only a disk with no filesystem. An existing filesystem is never touched.
-if ! blkid "$DEVICE" > /dev/null 2>&1; then
+# Format only a disk where a low-level probe finds nothing (blkid exit 2).
+# Exit 0 means a filesystem or partition table exists, so it is never touched.
+# Any other exit code is a probe failure: stop without formatting.
+rc=0
+blkid -p "$DEVICE" > /dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then
   mkfs.ext4 -L buzz-data "$DEVICE"
+elif [ "$rc" -ne 0 ]; then
+  echo "ERROR: blkid failed ($rc) on $DEVICE" >&2
+  exit 1
 fi
 
 mkdir -p "$DOCKER_DIR"
-uuid="$(blkid -s UUID -o value "$DEVICE")"
+uuid="$(blkid -p -s UUID -o value "$DEVICE")"
+if [ -z "$uuid" ]; then
+  echo "ERROR: $DEVICE has no filesystem UUID; refusing to mount it" >&2
+  exit 1
+fi
 if ! grep -q "^UUID=$uuid " /etc/fstab; then
   echo "UUID=$uuid $DOCKER_DIR ext4 defaults,nofail 0 2" >> /etc/fstab
 fi

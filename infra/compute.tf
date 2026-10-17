@@ -25,8 +25,9 @@ resource "aws_instance" "server" {
   user_data_replace_on_change = false
 
   metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
   }
 
   root_block_device {
@@ -38,6 +39,9 @@ resource "aws_instance" "server" {
   tags = {
     Name = "buzz"
   }
+
+  # First boot needs the internet route, and user_data never reruns.
+  depends_on = [aws_route_table_association.public]
 
   # A new AMI release or an edited first-boot script must never replace the server.
   lifecycle {

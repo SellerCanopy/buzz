@@ -51,13 +51,13 @@ has_no_markers() { ! grep -qE '%\{|\$\{' "$1"; }
 has_strict_mode() { grep -qxF 'set -euo pipefail' "$1"; }
 has_shebang() { [ "$(head -n 1 "$1")" = '#!/usr/bin/env bash' ]; }
 
-# Every mkfs call must sit directly under an "if ! blkid" guard.
+# Every mkfs call must sit directly under the blkid exit-code guard.
 mkfs_is_guarded() {
   local f="$1" n prev
   grep -q 'mkfs' "$f" || return 1
   while IFS=: read -r n _; do
     prev="$(head -n "$((n - 1))" "$f" | grep -vE '^\s*(#|$)' | tail -n 1)"
-    printf '%s' "$prev" | grep -qE '^\s*if ! blkid .*; then$' || return 1
+    printf '%s' "$prev" | grep -qE '^\s*if \[ "\$rc" -eq 2 \]; then$' || return 1
   done < <(grep -n 'mkfs' "$f")
 }
 
@@ -93,6 +93,20 @@ verifies_checksum_before_install() {
   [ -n "$s" ] && [ -n "$i" ] && [ "$s" -lt "$i" ]
 }
 
+# Docker must refuse to start when the data volume is not mounted.
+requires_data_mount() {
+  grep -qF 'RequiresMountsFor=%s' "$1" && grep -qF '10-data-volume.conf' "$1" \
+    && grep -qE 'systemctl daemon-reload$' "$1"
+}
+
+# An empty UUID must stop the script before the fstab line is written.
+stops_on_empty_uuid() {
+  local f="$1" z a
+  z="$(first_line 'if \[ -z "\$uuid" \]; then$' "$f")"
+  a="$(first_line '>> /etc/fstab$' "$f")"
+  [ -n "$z" ] && [ -n "$a" ] && [ "$z" -lt "$a" ]
+}
+
 creates_opt_buzz() { grep -qE 'install -d -m 0755 -o root -g root /opt/buzz$' "$1"; }
 logs_to_file() { grep -qF '/var/log/buzz-first-boot.log' "$1"; }
 
@@ -103,7 +117,7 @@ check "rendered text has no template markers"          0 has_no_markers "$OUT"
 check "raw template carries its three variables"       0 template_has_variables "$TEMPLATE"
 check "rendered text starts with the bash shebang"     0 has_shebang "$OUT"
 check "rendered text uses set -euo pipefail"           0 has_strict_mode "$OUT"
-check "mkfs only under an if ! blkid guard"            0 mkfs_is_guarded "$OUT"
+check "mkfs only under the blkid exit-code guard"      0 mkfs_is_guarded "$OUT"
 check "mounts before Docker is enabled"                0 mounts_before_docker_start "$OUT"
 check "enables and starts Docker"                      0 enables_docker_now "$OUT"
 check "finds the disk by its by-id link"               0 uses_by_id_link "$OUT"
@@ -111,6 +125,8 @@ check "fstab entry uses UUID and nofail"               0 fstab_uses_uuid_nofail 
 check "volume wait is bounded and fails clearly"       0 wait_is_bounded "$OUT"
 check "starts no Compose stack"                        0 starts_no_compose_stack "$OUT"
 check "checks the Compose checksum before install"     0 verifies_checksum_before_install "$OUT"
+check "Docker requires the data mount"                 0 requires_data_mount "$OUT"
+check "empty UUID stops before fstab"                  0 stops_on_empty_uuid "$OUT"
 check "creates /opt/buzz owned by root, mode 0755"     0 creates_opt_buzz "$OUT"
 check "logs to /var/log/buzz-first-boot.log"           0 logs_to_file "$OUT"
 
@@ -126,6 +142,37 @@ else
   bad "placeholder values reach the rendered text"
 fi
 
+# guard_section <script> <out>: the format guard, from its comment to the mkdir after it.
+guard_section() {
+  awk '/^# Format only a disk/ {on=1} /^mkdir -p "\$DOCKER_DIR"$/ {on=0} on' "$1" > "$2"
+}
+
+# run_guard <script> <blkid-exit-code>: runs only the guard with stub blkid and
+# mkfs.ext4 on PATH. Sets GUARD_RC and GUARD_MKFS_CALLS (lines in the mkfs log).
+run_guard() {
+  local script="$1" code="$2" d="$WORK/guard"
+  rm -rf "$d"; mkdir -p "$d/bin"
+  printf '#!/bin/sh\nexit %s\n' "$code" > "$d/bin/blkid"
+  printf '#!/bin/sh\necho "$@" >> "%s/mkfs.log"\n' "$d" > "$d/bin/mkfs.ext4"
+  chmod +x "$d/bin/blkid" "$d/bin/mkfs.ext4"
+  : > "$d/mkfs.log"
+  guard_section "$script" "$d/guard.sh"
+  [ -s "$d/guard.sh" ] || { GUARD_RC=99; GUARD_MKFS_CALLS=0; return; }
+  { echo 'set -euo pipefail'; echo 'DEVICE=/dev/fake'; cat "$d/guard.sh"; } > "$d/harness.sh"
+  PATH="$d/bin:$PATH" bash "$d/harness.sh" > "$d/out" 2>&1
+  GUARD_RC=$?
+  GUARD_MKFS_CALLS="$(wc -l < "$d/mkfs.log" | tr -d ' ')"
+}
+
+# guard_behaves <script>: formats on 2, skips on 0, stops without formatting on 4.
+guard_behaves() {
+  run_guard "$1" 2; [ "$GUARD_RC" -eq 0 ] && [ "$GUARD_MKFS_CALLS" -eq 1 ] || return 1
+  run_guard "$1" 0; [ "$GUARD_RC" -eq 0 ] && [ "$GUARD_MKFS_CALLS" -eq 0 ] || return 1
+  run_guard "$1" 4; [ "$GUARD_RC" -ne 0 ] && [ "$GUARD_MKFS_CALLS" -eq 0 ] || return 1
+}
+
+check "guard formats on blkid 2, skips on 0, fails on 4" 0 guard_behaves "$OUT"
+
 # Falsifiability: each check must fail on a script that breaks its rule.
 mutate() { # <name> <check-fn> <sed-expr>: applies the edit, expects the check to fail.
   local name="$1" fn="$2" expr="$3" m="$WORK/mutant.sh"
@@ -134,7 +181,13 @@ mutate() { # <name> <check-fn> <sed-expr>: applies the edit, expects the check t
   check "mutant fails: $name" 1 "$fn" "$m"
 }
 
-mutate "guard removed from mkfs" mkfs_is_guarded 's/^if ! blkid .*; then$/if true; then/'
+mutate "guard removed from mkfs" mkfs_is_guarded 's/^if \[ "\$rc" -eq 2 \]; then$/if true; then/'
+# The old form formatted on any non-zero blkid exit.
+awk '/^rc=0$/ {print "if ! blkid \"$DEVICE\" > /dev/null 2>&1; then"; print "  mkfs.ext4 -L buzz-data \"$DEVICE\""; print "fi"; skip=1; next}
+  skip && /^fi$/ {skip=0; next} !skip' "$OUT" > "$WORK/old-form.sh"
+check "mutant fails: old if ! blkid form restored" 1 guard_behaves "$WORK/old-form.sh"
+grep -qF 'if ! blkid' "$WORK/old-form.sh" || bad "old-form mutant was built"
+mutate "always-true guard" mkfs_is_guarded 's/^if \[ "\$rc" -eq 2 \]; then$/if ! blkid "$DEVICE" || true; then/'
 mutate "unguarded mkfs added" mkfs_is_guarded 's/^mkdir -p "\$DOCKER_DIR"$/mkfs.ext4 "$DEVICE"\nmkdir -p "$DOCKER_DIR"/'
 mutate "docker enabled before mount" mounts_before_docker_start 's/^mkdir -p "\$DOCKER_DIR"$/systemctl enable --now docker\nmkdir -p "$DOCKER_DIR"/'
 mutate "strict mode dropped" has_strict_mode 's/^set -euo pipefail$/set -e/'
@@ -142,6 +195,8 @@ mutate "raw device name used" uses_by_id_link 's#^DEVICE=.*#DEVICE=/dev/nvme1n1#
 mutate "nofail dropped" fstab_uses_uuid_nofail 's/defaults,nofail/defaults/'
 mutate "checksum check removed" verifies_checksum_before_install 's/sha256sum -c -$/true/'
 mutate "compose stack started" starts_no_compose_stack 's#^install -d -m 0755 -o root -g root /opt/buzz$#docker compose up -d#'
+mutate "mount requirement drop-in removed" requires_data_mount 's/RequiresMountsFor=%s/Description=data/'
+mutate "empty UUID check removed" stops_on_empty_uuid 's/^if \[ -z "\$uuid" \]; then$/if false; then/'
 mutate "template marker left" has_no_markers 's/^COMPOSE_VERSION=.*/COMPOSE_VERSION="${compose_version}"/'
 
 exit "$fail"
