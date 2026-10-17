@@ -162,8 +162,8 @@ done <<< "$agents"
 
 printf '%s' "${names#$'\n'}" > "$outdir/agents.list"
 
-# Remove env files of agents that left AGENTS.
-for f in "$outdir"/*.env; do
+# Remove the env files and staged config of agents that left AGENTS.
+for f in "$outdir"/*.env "$outdir"/*/; do
   [ -e "$f" ] || continue
   stem="$(basename "$f")"
   stem="${stem%.compose.env}"
@@ -171,6 +171,6 @@ for f in "$outdir"/*.env; do
   [[ "$stem" =~ $NAME_PATTERN ]] || continue
   case "$names" in
     *$'\n'"$stem"$'\n'*) ;;
-    *) rm -f "$outdir/$stem.env" "$outdir/$stem.compose.env" ;;
+    *) rm -rf "${outdir:?}/$stem" "$outdir/$stem.env" "$outdir/$stem.compose.env" ;;
   esac
 done

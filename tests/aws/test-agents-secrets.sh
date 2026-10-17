@@ -55,7 +55,7 @@ scenario_oauth_wins_over_api_key() {
   [ "$RC" -eq 0 ] || return 1
   [ "$(puts)" -eq 1 ] || return 1
   grep -qF '/buzz/agents/CLAUDE_CODE_OAUTH_TOKEN ' "$STUB_LOG" || return 1
-  ! grep -qF ANTHROPIC_API_KEY "$STUB_LOG" || return 1
+  ! grep -qE 'put-parameter.*ANTHROPIC_API_KEY' "$STUB_LOG" || return 1
   ! grep -qF "$APIKEY" "$STUB_DIR/put-values.log"
 }
 
@@ -80,7 +80,39 @@ scenario_second_run_stores_nothing() {
   run_secrets "$1" claude,codex CLAUDE_CODE_OAUTH_TOKEN="$OAUTH" OPENAI_API_KEY="$OPENAI"
   [ "$RC" -eq 0 ] || return 1
   [ "$(puts)" -eq 0 ] || return 1
-  [ "$(log_count '^aws ssm get-parameter ')" -eq 2 ]
+  # Two credentials, plus the check for the other Anthropic parameter.
+  [ "$(log_count '^aws ssm get-parameter ')" -eq 3 ]
+}
+
+# exists <NAME>: the stub reports /buzz/agents/NAME as present.
+exists() {
+  echo 0 > "$STUB_DIR/ssm-get-parameter.$1.rc"
+  : > "$STUB_DIR/ssm-get-parameter.$1.err"
+}
+
+scenario_note_when_api_key_already_stored() {
+  all_absent
+  exists ANTHROPIC_API_KEY
+  run_secrets "$1" claude CLAUDE_CODE_OAUTH_TOKEN="$OAUTH"
+  [ "$RC" -eq 0 ] || return 1
+  [ "$(grep -c '^note:' "$WORK/out")" -eq 1 ] || return 1
+  grep '^note:' "$WORK/out" | grep -qF 'ANTHROPIC_API_KEY also exists' || return 1
+  grep '^note:' "$WORK/out" | grep -qF 'OAuth token'
+}
+
+scenario_note_when_token_already_stored() {
+  all_absent
+  exists CLAUDE_CODE_OAUTH_TOKEN
+  run_secrets "$1" claude ANTHROPIC_API_KEY="$APIKEY"
+  [ "$RC" -eq 0 ] || return 1
+  [ "$(grep -c '^note:' "$WORK/out")" -eq 1 ] || return 1
+  grep '^note:' "$WORK/out" | grep -qF 'CLAUDE_CODE_OAUTH_TOKEN exists'
+}
+
+scenario_no_note_otherwise() {
+  all_absent
+  run_secrets "$1" claude CLAUDE_CODE_OAUTH_TOKEN="$OAUTH"
+  [ "$RC" -eq 0 ] && ! grep -q '^note:' "$WORK/out"
 }
 
 scenario_codex_needs_openai() {
@@ -160,6 +192,9 @@ expect_ok "OAuth token and API key set: only the token is stored" scenario_oauth
 expect_ok "API key only: one put to ANTHROPIC_API_KEY" scenario_api_key_only "$R"
 expect_ok "two claude agents store the credential once" scenario_two_claude_agents_store_once "$R"
 expect_ok "a second run makes no put" scenario_second_run_stores_nothing "$R"
+expect_ok "a stored API key next to a new OAuth token gets a note" scenario_note_when_api_key_already_stored "$R"
+expect_ok "a stored OAuth token next to a new API key gets a note" scenario_note_when_token_already_stored "$R"
+expect_ok "no note when the other Anthropic parameter is absent" scenario_no_note_otherwise "$R"
 expect_ok "codex agent without OPENAI_API_KEY exits 1" scenario_codex_needs_openai "$R"
 expect_ok "codex only stores just OPENAI_API_KEY" scenario_codex_only_stores_openai "$R"
 expect_ok "one runtime missing its credential stores nothing" scenario_missing_runtime_stores_nothing "$R"
@@ -173,6 +208,12 @@ expect_caught "API key preferred over OAuth token" scenario_oauth_wins_over_api_
   's/if \[ -n "\$\{CLAUDE_CODE_OAUTH_TOKEN:-\}" \]; then/if false; then/'
 expect_caught "both claude credentials stored" scenario_oauth_wins_over_api_key agents-secrets.sh \
   's/names\+=\(CLAUDE_CODE_OAUTH_TOKEN\)/names+=(CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY)/'
+expect_caught "note removed" scenario_note_when_api_key_already_stored agents-secrets.sh \
+  's/^        echo "note: \/buzz\/agents\/ANTHROPIC_API_KEY also exists.*$/        true/'
+expect_caught "note removed for the reverse case" scenario_note_when_token_already_stored agents-secrets.sh \
+  's/^        echo "note: \/buzz\/agents\/CLAUDE_CODE_OAUTH_TOKEN exists.*$/        true/'
+expect_caught "credential queued once per claude agent" scenario_two_claude_agents_store_once agents-secrets.sh \
+  's/claude\) has_claude=1 ;;/claude) has_claude=$((has_claude + 1)) ;;/; s/names\+=\(CLAUDE_CODE_OAUTH_TOKEN\)/for ((i = 0; i < has_claude; i++)); do names+=(CLAUDE_CODE_OAUTH_TOKEN); done/; s/\[ "\$has_claude" -eq 1 \]; then$/[ "$has_claude" -ge 1 ]; then/'
 expect_caught "existence check removed" scenario_second_run_stores_nothing agents-secrets.sh \
   's/if parameter_exists "\$param"; then/if false; then/'
 expect_caught "missing credential tolerated" scenario_claude_needs_a_credential agents-secrets.sh \

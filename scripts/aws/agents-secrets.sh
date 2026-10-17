@@ -81,4 +81,20 @@ for name in "${names[@]}"; do
   created=$((created + 1))
 done
 
+# The renderer prefers the OAuth token, so a stored token hides an API key.
+if [ "$has_claude" -eq 1 ]; then
+  case " ${names[*]} " in
+    *" CLAUDE_CODE_OAUTH_TOKEN "*)
+      if parameter_exists /buzz/agents/ANTHROPIC_API_KEY; then
+        echo "note: /buzz/agents/ANTHROPIC_API_KEY also exists. Agents use the OAuth token and ignore it."
+      fi
+      ;;
+    *" ANTHROPIC_API_KEY "*)
+      if parameter_exists /buzz/agents/CLAUDE_CODE_OAUTH_TOKEN; then
+        echo "note: /buzz/agents/CLAUDE_CODE_OAUTH_TOKEN exists, so agents keep using the OAuth token and ignore the API key. Delete the token parameter to switch."
+      fi
+      ;;
+  esac
+fi
+
 echo "agents-secrets: $created created, $kept kept"
