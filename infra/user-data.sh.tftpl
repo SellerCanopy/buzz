@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# First-boot setup for the Buzz relay server. Safe to run again.
+# Installs Docker and the Compose plugin, mounts the data volume at
+# /var/lib/docker before Docker starts, and creates /opt/buzz.
+# It starts no Compose stack: deploys copy the Compose files over SSM.
+set -euo pipefail
+
+exec > >(tee -a /var/log/buzz-first-boot.log) 2>&1
+echo "buzz first boot: start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+DATA_VOLUME_ID="${data_volume_id}"
+COMPOSE_VERSION="${compose_version}"
+COMPOSE_SHA256="${compose_sha256}"
+COMPOSE_PLUGIN=/usr/local/lib/docker/cli-plugins/docker-compose
+DOCKER_DIR=/var/lib/docker
+
+# The EBS volume shows up as an NVMe device. Its by-id link is stable and
+# embeds the volume id without the dash, unlike /dev/sdf or /dev/nvme1n1.
+VOLUME_ID_PLAIN="$(printf '%s' "$DATA_VOLUME_ID" | tr -d '-')"
+DEVICE="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$VOLUME_ID_PLAIN"
+
+dnf install -y docker
+
+if ! echo "$COMPOSE_SHA256  $COMPOSE_PLUGIN" | sha256sum -c --status 2>/dev/null; then
+  tmp="$(mktemp)"
+  curl -fsSL -o "$tmp" \
+    "https://github.com/docker/compose/releases/download/v$COMPOSE_VERSION/docker-compose-linux-aarch64"
+  echo "$COMPOSE_SHA256  $tmp" | sha256sum -c -
+  install -D -m 0755 "$tmp" "$COMPOSE_PLUGIN"
+  rm -f "$tmp"
+fi
+
+echo "waiting for data volume $DEVICE"
+attempts=0
+while [ ! -e "$DEVICE" ]; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 60 ]; then
+    echo "ERROR: data volume $DATA_VOLUME_ID did not appear at $DEVICE after 300 seconds" >&2
+    exit 1
+  fi
+  sleep 5
+done
+
+# Format only a disk with no filesystem. An existing filesystem is never touched.
+if ! blkid "$DEVICE" > /dev/null 2>&1; then
+  mkfs.ext4 -L buzz-data "$DEVICE"
+fi
+
+mkdir -p "$DOCKER_DIR"
+uuid="$(blkid -s UUID -o value "$DEVICE")"
+if ! grep -q "^UUID=$uuid " /etc/fstab; then
+  echo "UUID=$uuid $DOCKER_DIR ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+if ! mountpoint -q "$DOCKER_DIR"; then
+  mount "$DOCKER_DIR"
+fi
+
+# With nofail the boot continues without the disk. Refuse to start Docker then,
+# so image and volume data never land on the root disk by accident.
+install -d -m 0755 /etc/systemd/system/docker.service.d
+printf '[Unit]\nRequiresMountsFor=%s\n' "$DOCKER_DIR" \
+  > /etc/systemd/system/docker.service.d/10-data-volume.conf
+systemctl daemon-reload
+
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+install -d -m 0755 -o root -g root /opt/buzz
+
+echo "buzz first boot: done $(date -u +%Y-%m-%dT%H:%M:%SZ)"

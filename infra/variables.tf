@@ -19,3 +19,9 @@ variable "route53_zone" {
   description = "Name of the Route 53 hosted zone that contains the relay host name."
   type        = string
 }
+
+variable "data_volume_gb" {
+  description = "Size in GB of the data volume that holds /var/lib/docker (database, git data, media)."
+  type        = number
+  default     = 50
+}
