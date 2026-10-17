@@ -41,7 +41,7 @@ scripts/aws/
   backup.sh               Dumps Postgres to S3
   agents-secrets.sh       Stores agent API keys in SSM (phase 2)
   agents-register.sh      Creates and registers agent identities (phase 2)
-  render-agents-env.sh    Runs on the server. Builds agents.env from SSM (phase 2)
+  render-agents-env.sh    Runs on the server. Builds per-agent env files and stages per-agent MCP config (phase 2)
   user-data.sh.tftpl      First-boot setup (Docker, Compose, repo files)
 deploy/aws/
   Dockerfile.agents       Node 22 image with Buzz tools, Claude and Codex adapters (phase 2)
@@ -59,7 +59,7 @@ Required values, with no defaults for the first five:
 - `RELAY_OWNER_PUBKEY`: 64-character hex Nostr public key of the owner.
 - `AWS_REGION`: defaults to `us-east-1`.
 - `INSTANCE_TYPE`: defaults to `t4g.large` (8 GB). Agents run git checkouts and builds next to Postgres, Redis, and MinIO, so `t4g.medium` is too small.
-- `AGENTS`: comma-separated agent names, defaults to `claude,codex`. Valid names are `claude` and `codex`. Empty disables phase 2.
+- `AGENTS`: comma-separated agents, defaults to `claude,codex`. Each entry is `name` or `name:runtime`. The runtime is `claude` or `codex`. A bare entry must be a runtime name and means name equals runtime. Names are unique and match `^[a-z][a-z0-9-]{0,23}$`. For example `reviewer:claude,docs:claude,codex`. Empty disables phase 2.
 - `AGENT_RESPOND_TO`: who may talk to the agents. One of `owner-only` (default), `allowlist`, `anyone`, `nobody`.
 - `AGENT_RESPOND_TO_ALLOWLIST`: comma-separated 64-hex pubkeys. Required when `AGENT_RESPOND_TO=allowlist`.
 
@@ -163,7 +163,8 @@ An agent is a separate program, the agent runner `buzz-acp`, that connects to th
   - `@agentclientprotocol/claude-agent-acp`. Its Claude SDK dependency ships a prebuilt `linux-arm64` Claude Code binary, so no separate Claude Code install is needed.
   - `@agentclientprotocol/codex-acp`. It depends on `@openai/codex`, so no separate Codex install is needed.
 - **Buzz tools in the image:** The `sprig` binary comes from the existing `Dockerfile.sprig` build (`COPY --from=$SPRIG_IMAGE`). The image adds the same multicall links `Dockerfile.sprig` creates (`buzz-acp`, `buzz-agent`, `buzz-dev-mcp`, `rg`, `tree`, `buzz`, `git-credential-nostr`, `git-sign-nostr`) and reuses `scripts/sprig-entrypoint.sh`, which ends in `exec buzz-acp`. `Dockerfile.sprig` is not modified. `git` and `bash` are installed for agent work.
-- **Compose file** (`deploy/aws/compose.agents.yml`): a separate Compose project named `buzz-agents`, so `deploy/compose/` and `run.sh` stay untouched. One service per name in `AGENTS`. The services sit on their own network, so agents cannot reach Postgres, Redis, or MinIO.
+- **Compose file** (`deploy/aws/compose.agents.yml`): one service, started once per agent as its own Compose project `buzz-agent-<name>`, so `deploy/compose/` and `run.sh` stay untouched. Each project has its own network and volume, so agents cannot reach Postgres, Redis, MinIO, or each other.
+- **Per-agent MCP config:** An agent can have its own tool servers. The optional file `deploy/aws/agents/<name>/mcp.json` uses Claude Code's `.mcp.json` format. The deploy copies it to the server, and the container entrypoint installs it for that agent only. An agent without a file gets an empty config. The file is committed to git, so it holds no secrets. Which install location the Claude adapter honors is proven by a local test with two probe MCP servers (plan Task 7), not assumed. Codex agents ignore the file.
 - **Relay address:** Agents connect to `wss://$BUZZ_DOMAIN`. Each service sets `extra_hosts: ["$BUZZ_DOMAIN:host-gateway"]`, which sends that name to the host's port 443, where Caddy answers with the real certificate. The relay derives the community from the `Host` header, so agents must use the public name.
 
 ### Per-agent environment
@@ -175,7 +176,7 @@ An agent is a separate program, the agent runner `buzz-acp`, that connects to th
 | `BUZZ_ACP_AGENT_OWNER` | `RELAY_OWNER_PUBKEY` |
 | `BUZZ_ACP_AGENT_COMMAND` | `claude-agent-acp` or `codex-acp` |
 | `BUZZ_ACP_MCP_COMMAND` | `buzz-dev-mcp` |
-| `BUZZ_ACP_DISPLAY_NAME` | The agent name |
+| `BUZZ_ACP_DISPLAY_NAME` | The agent name (the part before the colon) |
 | `BUZZ_ACP_RESPOND_TO`, `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | From `AGENT_RESPOND_TO` and `AGENT_RESPOND_TO_ALLOWLIST` |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude agent only, from SSM `/buzz/agents/CLAUDE_CODE_OAUTH_TOKEN`. Preferred when set. |
 | `ANTHROPIC_API_KEY` | Claude agent only, from SSM `/buzz/agents/ANTHROPIC_API_KEY`. Used only when no OAuth token is stored. |
@@ -193,21 +194,21 @@ An agent is a separate program, the agent runner `buzz-acp`, that connects to th
 ### Identity and secrets
 
 - `make agents-secrets` reads `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`) and `OPENAI_API_KEY` from the shell environment (never from `.aws.env`) and stores them as SecureString parameters. It skips any that exist.
-- `make agents-register` creates one key per agent name, stores the key in SSM, and runs `buzz-admin add-member --pubkey <pubkey>` inside the relay container so the closed relay admits the agent. It skips agents whose key already exists. The key is generated by `buzz-admin generate-key` inside the relay container.
+- `make agents-register` creates one key per agent name (not per runtime), stores the key in SSM, and runs `buzz-admin add-member --pubkey <pubkey>` inside the relay container so the closed relay admits the agent. It skips agents whose key already exists. The key is generated by `buzz-admin generate-key` inside the relay container.
 
 ### Deploy flow additions
 
-- `make build` also builds the sprig image from `Dockerfile.sprig`, then builds `Dockerfile.agents` on top of it. Both are `linux/arm64`. The agents image is tagged `<short-sha>` in the `agents` ECR repository.
-- `remote-deploy.sh` renders `agents.env` from SSM, then runs `docker compose -p buzz-agents -f compose.agents.yml up -d`, only after the relay reports healthy.
+- `make build` also builds the sprig image from `Dockerfile.sprig`, then builds `Dockerfile.agents` on top of it. Both are `linux/arm64`. One agents image serves every agent and is tagged `<short-sha>` in the `agents` ECR repository.
+- `remote-deploy.sh` renders one env file and one staged MCP config per agent from SSM and the release, then runs `docker compose -p buzz-agent-<name> -f compose.agents.yml up -d` for each, only after the relay reports healthy. Projects for agents no longer in `AGENTS` are stopped (`down` without `-v`, so their volumes stay).
 - Deploys with `AGENTS` empty skip all of this. A rollback restores both image tags.
 
 ### Phase 2 make targets
 
 | Target | Behavior |
 |---|---|
-| `make agents-secrets` | Stores the two API keys in SSM. |
+| `make agents-secrets` | Stores the agent credentials (one per runtime in use) in SSM. |
 | `make agents-register` | Creates and registers one identity per agent. |
-| `make agents-status` | Shows the `buzz-agents` containers over SSM. |
+| `make agents-status` | Shows the `buzz-agent-*` containers over SSM. |
 | `make agents-logs AGENT=<name>` | Follows one agent's logs over SSM. |
 
 ### Trade-offs the owner accepts
@@ -230,7 +231,8 @@ An agent is a separate program, the agent runner `buzz-acp`, that connects to th
 - `shellcheck` on every script under `scripts/aws/`.
 - `sync-upstream.sh` is tested against two throwaway local git repositories: clean merge, conflict, dirty tree, and wrong remote URL.
 - Phase 2 image smoke test, run locally: build the agents image and check that `buzz-acp`, `claude-agent-acp`, and `codex-acp` are on `PATH` and the process runs as a non-root user.
-- Phase 2 Compose test: `docker compose -f deploy/aws/compose.agents.yml config` renders for `claude,codex`, `claude` alone, and `codex` alone.
+- Phase 2 Compose test: `docker compose -p buzz-agent-<name> -f deploy/aws/compose.agents.yml --env-file <name>.env config` renders for two differently named agents with different volumes and config mounts.
+- Phase 2 MCP proof, run locally with Docker and a dummy API key: two agents with different `mcp.json` files each start only their own probe MCP server, and an agent with no file starts none.
 - Phase 2 local connection check against a local relay, with a throwaway key: the agent container connects and publishes presence. No real API key is used.
 - A fresh `make apply`, `make secrets`, `make deploy`, and `curl https://<domain>/_liveness` against the real account is the end-to-end check. For phase 2, the owner then mentions an agent in a channel and gets a reply. The author runs it. Nothing in this project is run against production by an agent without the owner's go-ahead.
 
