@@ -48,6 +48,9 @@ Other install locations were not needed.
   environment (checked with a probe server). That environment holds only what the
   deploy renders into the agent's env file, so a variable set on your laptop or in
   `.aws.env` is not there.
+- **File modes matter.** The container user is uid 1001 and the mount is read-only,
+  so the staged config directory must be mode 0755 and `mcp.json` mode 0644. If the
+  file is unreadable, the container exits with a message naming the path.
 - **Commands must exist in the image.** The image has Node 22, `git`, and `bash`.
   A server that needs another program must install it at run time (for example
   with `npx`) or wait for an image change.

@@ -15,8 +15,11 @@ services:
     # public name, which resolves to the host's Caddy on port 443.
     extra_hosts:
       - "${BUZZ_DOMAIN:?BUZZ_DOMAIN is required}:host-gateway"
+    # No working_dir: the MCP config is found from the image WORKDIR, /home/agent.
     volumes:
       - home:/home/agent
+      # The container user is uid 1001 and the mount is read-only, so the staged
+      # directory must be mode 0755 and its mcp.json mode 0644.
       - ${AGENT_CONFIG_DIR:?AGENT_CONFIG_DIR is required}:/etc/buzz-agent:ro
 
 volumes:

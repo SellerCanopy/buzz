@@ -14,6 +14,10 @@ dst="$HOME/.mcp.json"
 tmp="$dst.tmp"
 
 if [ -f "$src" ]; then
+  if [ ! -r "$src" ]; then
+    echo "agent-entrypoint: cannot read $src (check that the staged file is mode 0644 and its directory 0755)" >&2
+    exit 1
+  fi
   node -e '
     const cfg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
     const s = cfg && cfg.mcpServers;

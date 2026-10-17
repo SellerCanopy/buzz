@@ -63,6 +63,8 @@ check_render() {
     <<< "$a" >/dev/null || return 1
   jq -e '.services.agent.volumes[] | select(.target == "/home/agent" and .type == "volume")' <<< "$a" >/dev/null || return 1
   ! grep -q 'docker.sock' <<< "$a" || return 1
+  # No working_dir: the MCP config is found from the image WORKDIR, /home/agent.
+  [ "$(jq -r '.services.agent.working_dir // "unset"' <<< "$a")" = "unset" ] || return 1
   [ "$(jq -r '.volumes.home.name' <<< "$a")" = "buzz-agent-reviewer_home" ] || return 1
   [ "$(jq -r '.networks.default.name' <<< "$a")" = "buzz-agent-reviewer_default" ] || return 1
 
@@ -95,6 +97,7 @@ mutant restart-always 's/restart: on-failure/restart: always/'
 mutant grace-period 's/stop_grace_period: 60s/stop_grace_period: 10s/'
 mutant no-extra-hosts 's/host-gateway/127.0.0.1/'
 mutant config-writable 's#:/etc/buzz-agent:ro#:/etc/buzz-agent#'
+mutant working-dir 's#^(    restart: on-failure)#\1\n    working_dir: /workspace#'
 mutant docker-socket 's#^(      - home:/home/agent)#      - /var/run/docker.sock:/var/run/docker.sock\n\1#'
 mutant shared-home-volume 's#- home:/home/agent#- shared:/home/agent#; s#^  home:#  shared:#'
 

@@ -16,6 +16,19 @@ const steps = opt("--steps", "init,new").split(",");
 const waitMs = Number(opt("--wait-ms", "120000"));
 const cmd = opt("--cmd", "claude-agent-acp");
 
+// buzz-acp always passes its own stdio MCP server in session/new
+// (crates/buzz-acp/src/lib.rs, build_mcp_servers). This stand-in has the same
+// shape. It writes nothing to /tmp/probe-started, so the test can still tell
+// which servers came from .mcp.json.
+const harnessServers = [
+  {
+    name: "buzz-dev-mcp",
+    command: "node",
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    env: [{ name: "BUZZ_RELAY_URL", value: "wss://buzz.example.com" }],
+  },
+];
+
 const child = spawn(cmd, [], { stdio: ["pipe", "pipe", "inherit"] });
 let nextId = 1;
 const pending = new Map();
@@ -65,7 +78,7 @@ const within = (p, ms) =>
   }
   if (steps.includes("new")) {
     const r = await within(
-      request("session/new", { cwd: process.cwd(), mcpServers: [] }),
+      request("session/new", { cwd: process.cwd(), mcpServers: harnessServers }),
       waitMs,
     );
     console.error("session/new:", JSON.stringify(r).slice(0, 300));
