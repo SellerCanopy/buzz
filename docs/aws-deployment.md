@@ -59,7 +59,7 @@ A healthy relay answers with a success status. The first HTTPS request may take 
 | `make rollback` | Redeploy an earlier image. See below. |
 | `make help` | List every target. |
 
-`make logs` ends after about 10 seconds, so it cannot hang. For a live follow, use `make shell` and run `cd /opt/buzz/deploy/compose && BUZZ_COMPOSE_TLS=true ./run.sh logs`.
+`make logs` ends after about 10 seconds, so it cannot hang. SSM caps the output it returns at about 24000 characters, so a long tail is cut. For a live follow, use `make shell` and run `cd /opt/buzz/deploy/compose && BUZZ_COMPOSE_TLS=true ./run.sh logs`.
 
 ## Rollback
 
@@ -78,6 +78,7 @@ A rollback skips the clean-tree check, the build, and the push. It checks that `
 - **Before every deploy.** `make deploy` runs the backup first. If the backup fails, the deploy stops before it changes anything.
 - **On demand.** `make backup` runs `pg_dump` inside the Postgres container on the server, compresses it, and uploads it to `s3://<backup bucket>/db/<UTC time>.sql.gz`, for example `db/20261016T031500Z.sql.gz`. A partial or empty dump is never uploaded.
 - **Retention.** The bucket deletes every object after 30 days. That covers the release files under `releases/` too, so a rollback can only reach tags deployed in the last 30 days.
+- **Staging space.** The dump is written to `/var/tmp` on the server's root disk before it is compressed and uploaded. A very large database can fill that disk.
 - **Disk snapshots.** AWS takes a daily snapshot of the data disk (Postgres, git, and media volumes) and keeps 7.
 - **Secrets.** The relay secrets live in SSM Parameter Store. The owner's private key is not stored by this project. Keep it safe yourself.
 

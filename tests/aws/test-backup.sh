@@ -12,6 +12,7 @@ BUCKET="buzz-backups-test"
 OUT="$WORK/out"
 ERR="$WORK/err"
 OPT="$WORK/opt"
+VARTMP="$WORK/vartmp"
 DUMP_TEXT="CREATE TABLE events (id int);"
 
 write_aws_env
@@ -38,12 +39,12 @@ run_backup() {
 sent_line() { grep -F 'aws ssm send-command' "$STUB_LOG" | head -n 1; }
 
 # decode_command <file>: writes the logged SSM command as a shell script, one
-# command per line, with /opt/buzz moved under the test sandbox.
+# command per line, with /opt/buzz and /var/tmp moved under the test sandbox.
 decode_command() {
   sent_line \
     | sed -e 's/^.*{"commands":\["//' -e 's/"\]}.*$//' -e 's/","/\
 /g' -e 's/\\"/"/g' -e 's/\\\\/\\/g' \
-    | sed "s#/opt/buzz#$OPT#g" > "$1"
+    | sed -e "s#/opt/buzz#$OPT#g" -e "s#/var/tmp#$VARTMP#g" > "$1"
 }
 
 # ---- local scenarios --------------------------------------------------------
@@ -133,8 +134,8 @@ scenario_bad_bucket_name() {
 # server_setup <with-env: 1|0>: sandbox for the decoded command and its stubs.
 server_setup() {
   stubs_ok
-  rm -rf "$OPT"
-  mkdir -p "$OPT/deploy/compose"
+  rm -rf "$OPT" "$VARTMP"
+  mkdir -p "$OPT/deploy/compose" "$VARTMP"
   [ "$1" -eq 0 ] || echo "POSTGRES_PASSWORD=x" > "$OPT/deploy/compose/.env"
   echo "abc123" > "$STUB_DIR/docker-compose-ps.out"
   printf '%s\n' "$DUMP_TEXT" > "$STUB_DIR/docker-compose-exec.out"
@@ -151,7 +152,7 @@ run_server() {
   bash "$WORK/server.sh" > "$WORK/srv.out" 2> "$WORK/srv.err" || RC=$?
 }
 
-leftover_dumps() { find /var/tmp -maxdepth 1 -name 'buzz-dump.*' 2>/dev/null | wc -l | tr -d ' '; }
+leftover_dumps() { find "$VARTMP" -maxdepth 1 -name 'buzz-dump.*' 2>/dev/null | wc -l | tr -d ' '; }
 
 scenario_server_uploads_dump() {
   server_setup 1
