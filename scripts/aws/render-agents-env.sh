@@ -10,8 +10,13 @@
 # are removed. Reads BUZZ_DOMAIN, RELAY_OWNER_PUBKEY, AGENTS, AGENT_RESPOND_TO,
 # and AGENT_RESPOND_TO_ALLOWLIST from the environment, and the agent keys and
 # credentials from SSM under /buzz/agents/.
-# Exits 1 before writing anything if a value is missing, empty, or unsafe, or if
-# a config file is not JSON with a top-level "mcpServers" object.
+# Each agent's optional <config-src>/<name>/agent.json sets its display_name,
+# model, who it answers, and the other runtime settings listed in agent_spec.py.
+# Who it answers falls back to AGENT_RESPOND_TO and AGENT_RESPOND_TO_ALLOWLIST. An
+# instructions_file is copied next to mcp.json.
+# Exits 1 before writing anything if a value is missing, empty, or unsafe, if an
+# agent.json is invalid, or if a config file is not JSON with a top-level
+# "mcpServers" object.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +33,9 @@ config_src="$3"
 [ -n "$image" ] || die "agents image is empty"
 : "${BUZZ_DOMAIN:?BUZZ_DOMAIN must be set}"
 : "${RELAY_OWNER_PUBKEY:?RELAY_OWNER_PUBKEY must be set}"
-respond_to="${AGENT_RESPOND_TO:-owner-only}"
-allowlist="${AGENT_RESPOND_TO_ALLOWLIST:-}"
-if [ "$respond_to" = "allowlist" ] && [ -z "$allowlist" ]; then
-  die "AGENT_RESPOND_TO_ALLOWLIST is required when AGENT_RESPOND_TO=allowlist"
-fi
+# Defaults for every agent. An agent's own agent.json overrides them.
+default_respond_to="${AGENT_RESPOND_TO:-owner-only}"
+default_allowlist="${AGENT_RESPOND_TO_ALLOWLIST:-}"
 require_tool aws
 require_tool python3
 umask 077
@@ -65,6 +68,7 @@ secret() {
 # or misshapen. Safe to run twice.
 agent_env() {
   local name="$1" runtime="$2" key cred_name cred command
+  local settings="$config_src/$name/agent.json"
   key="$(secret "$name/BUZZ_PRIVATE_KEY" '^[0-9a-f]{64}$' "64 lowercase hex characters")" \
     || { echo "error: agent $name has no usable key (run make agents-register)" >&2; return 1; }
   case "$runtime" in
@@ -94,11 +98,10 @@ agent_env() {
   echo "BUZZ_ACP_AGENT_OWNER=$RELAY_OWNER_PUBKEY"
   echo "BUZZ_ACP_AGENT_COMMAND=$command"
   echo "BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp"
-  echo "BUZZ_ACP_DISPLAY_NAME=$name"
-  echo "BUZZ_ACP_RESPOND_TO=$respond_to"
-  if [ "$respond_to" = "allowlist" ]; then
-    echo "BUZZ_ACP_RESPOND_TO_ALLOWLIST=$allowlist"
-  fi
+  # Settings from the agent's agent.json, with the global respond-to as the default.
+  python3 -I "$SCRIPT_DIR/agent_spec.py" env "$settings" --default "display_name=$name" \
+    --default "respond_to=$default_respond_to" --default "respond_to_allowlist=$default_allowlist" \
+    || return 1
   echo "$cred_name=$cred"
 }
 
@@ -151,6 +154,11 @@ while read -r name runtime; do
     printf '%s\n' '{"mcpServers": {}}' > "$config_dir/mcp.json"
   fi
   chmod 0644 "$config_dir/mcp.json"
+  instructions="$(agent_field "$config_src/$name/agent.json" instructions_file "")"
+  if [ -n "$instructions" ]; then
+    cp "$config_src/$name/$instructions" "$config_dir/$instructions"
+    chmod 0644 "$config_dir/$instructions"
+  fi
 
   {
     echo "AGENTS_IMAGE=$image"

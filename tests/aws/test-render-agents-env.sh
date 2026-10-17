@@ -323,6 +323,54 @@ scenario_secrets_not_on_stdout_or_stderr() {
   ! grep -qE "$OAUTH|$APIKEY|$OPENAI|$(key_of a)" "$WORK/err" "$WORK/stdout"
 }
 
+scenario_agent_json_sets_model_effort_and_name() {
+  setup a b
+  printf '{"display_name":"Alpha Coder","model":"claude-opus-4-1","effort":"high"}' > "$CFG/a/agent.json"
+  render "$1" a:claude,b:claude
+  [ "$RC" -eq 0 ] || return 1
+  has_line "$OUT/a.env" "BUZZ_ACP_DISPLAY_NAME=Alpha Coder" || return 1
+  has_line "$OUT/a.env" "BUZZ_ACP_MODEL=claude-opus-4-1" || return 1
+  has_line "$OUT/a.env" "BUZZ_ACP_EFFORT_LEVEL=high" || return 1
+  # b has no agent.json: its name is the agent name and it sets no model or effort.
+  has_line "$OUT/b.env" "BUZZ_ACP_DISPLAY_NAME=b" || return 1
+  ! grep -qE '^BUZZ_ACP_(MODEL|EFFORT_LEVEL)=' "$OUT/b.env"
+}
+
+scenario_bad_agent_json_exits_1_and_writes_nothing() {
+  setup a
+  local body
+  for body in '{"modle":"x"}' '{"model":"bad value"}' '{"effort":"hi;rm"}' '{"display_name":"it'"'"'s"}' '[]' '{"model":3}' '{bad'; do
+    rm -rf "$OUT"
+    printf '%s' "$body" > "$CFG/a/agent.json"
+    render "$1" a:claude
+    [ "$RC" -eq 1 ] || return 1
+    [ ! -e "$OUT/a.env" ] || return 1
+    grep -qF "agent.json" "$WORK/err" || return 1
+  done
+}
+
+scenario_agent_json_overrides_respond_to() {
+  setup a b
+  mkdir -p "$CFG/b"
+  printf '{"respond_to":"anyone"}' > "$CFG/a/agent.json"
+  printf '{"respond_to":"allowlist","respond_to_allowlist":["%s"]}' "${ALLOW//,/\",\"}" > "$CFG/b/agent.json"
+  render "$1" a:claude,b:claude AGENT_RESPOND_TO=nobody
+  [ "$RC" -eq 0 ] || return 1
+  has_line "$OUT/a.env" "BUZZ_ACP_RESPOND_TO=anyone" || return 1
+  ! grep -q RESPOND_TO_ALLOWLIST "$OUT/a.env" || return 1
+  has_line "$OUT/b.env" "BUZZ_ACP_RESPOND_TO=allowlist" || return 1
+  has_line "$OUT/b.env" "BUZZ_ACP_RESPOND_TO_ALLOWLIST=$ALLOW"
+}
+
+scenario_agent_allowlist_without_keys_exits_1() {
+  setup a
+  printf '{"respond_to":"allowlist"}' > "$CFG/a/agent.json"
+  render "$1" a:claude
+  [ "$RC" -eq 1 ] || return 1
+  grep -qF "respond_to_allowlist" "$WORK/err" || return 1
+  [ ! -e "$OUT/a.env" ]
+}
+
 scenario_ssm_call_shape() {
   setup a
   render "$1" a:claude
@@ -354,8 +402,18 @@ expect_ok "a removed agent's staged config directory is removed too" scenario_st
 expect_ok "a failed run leaves the previous files untouched" scenario_failed_run_keeps_old_files "$R"
 expect_ok "empty AGENTS clears all agent files" scenario_empty_agents_clears_everything "$R"
 expect_ok "secrets never reach stdout or stderr" scenario_secrets_not_on_stdout_or_stderr "$R"
+expect_ok "agent.json sets the display name, model, and effort in the env file" scenario_agent_json_sets_model_effort_and_name "$R"
+expect_ok "an invalid agent.json exits 1 and writes nothing" scenario_bad_agent_json_exits_1_and_writes_nothing "$R"
+expect_ok "an agent's respond_to overrides the global default" scenario_agent_json_overrides_respond_to "$R"
+expect_ok "an allowlist agent without keys exits 1" scenario_agent_allowlist_without_keys_exits_1 "$R"
 expect_ok "reads /buzz/agents/ recursively with decryption" scenario_ssm_call_shape "$R"
 
+expect_caught "runtime settings never written" scenario_agent_json_sets_model_effort_and_name agent_spec.py \
+  's/if field\.env is None or merged\.get\(field\.name, ""\) == "":/if True:/'
+expect_caught "agent.json errors ignored" scenario_bad_agent_json_exits_1_and_writes_nothing render-agents-env.sh \
+  's/^    \|\| return 1$/    || true/'
+expect_caught "per-agent respond_to ignored" scenario_agent_json_overrides_respond_to agent_spec.py \
+  's/merged\.update\(spec\)/merged.update({})/'
 expect_caught "API key preferred over OAuth token" scenario_oauth_wins_and_never_both render-agents-env.sh \
   's/if \[ -n "\$\{SSM_CLAUDE_CODE_OAUTH_TOKEN:-\}" \]; then/if false; then/'
 expect_caught "both Anthropic credentials written" scenario_oauth_wins_and_never_both render-agents-env.sh \

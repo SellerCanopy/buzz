@@ -22,6 +22,7 @@ new_repo() {
   mkdir -p "$REPO/deploy/compose" "$REPO/deploy/aws/agents/a" "$REPO/scripts/aws"
   echo "run" > "$REPO/deploy/compose/run.sh"
   echo "lib" > "$REPO/scripts/aws/lib.sh"
+  echo "spec" > "$REPO/scripts/aws/agent_spec.py"
   echo "render" > "$REPO/scripts/aws/render-env.sh"
   echo "remote" > "$REPO/scripts/aws/remote-deploy.sh"
   echo "render-agents" > "$REPO/scripts/aws/render-agents-env.sh"
@@ -206,6 +207,7 @@ scenario_full_deploy() {
   list="$(tar tzf "$STUB_DIR/s3-cp.upload")"
   printf '%s\n' "$list" | grep -qx 'deploy/compose/run.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/lib.sh' || return 1
+  printf '%s\n' "$list" | grep -qx 'scripts/aws/agent_spec.py' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/render-env.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'scripts/aws/remote-deploy.sh' || return 1
   printf '%s\n' "$list" | grep -qx 'deploy/compose/.env.example' || return 1

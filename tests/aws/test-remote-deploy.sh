@@ -18,7 +18,7 @@ new_home() {
   mkdir -p "$HOME_DIR/deploy/compose" "$HOME_DIR/scripts/aws"
   cp -R "$REPO_ROOT/deploy/aws" "$HOME_DIR/deploy/aws"
   cp "$REPO_ROOT/deploy/compose/.env.example" "$HOME_DIR/deploy/compose/.env.example"
-  cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/render-env.sh" \
+  cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/agent_spec.py" "$REPO_ROOT/scripts/aws/render-env.sh" \
     "$REPO_ROOT/scripts/aws/render-agents-env.sh" "$HOME_DIR/scripts/aws/"
   # RUN_RC makes the fake upgrade fail, like a relay that never turns healthy.
   cat > "$HOME_DIR/deploy/compose/run.sh" <<RUN

@@ -1,0 +1,6 @@
+{
+  "display_name": "Researcher",
+  "about": "Looks things up and keeps notes in memory between conversations.",
+  "model": "opus",
+  "effort": "medium"
+}

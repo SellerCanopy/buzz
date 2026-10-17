@@ -150,7 +150,7 @@ if [ "${ROLLBACK:-}" != "1" ]; then
   find "$stage/deploy/compose" -maxdepth 1 -name '.env*' ! -name '.env.example' -delete
   find "$stage/deploy/aws" -name '.env*' ! -name '.env.example' -delete
   find "$stage" -name '.DS_Store' -delete
-  cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/render-env.sh" \
+  cp "$REPO_ROOT/scripts/aws/lib.sh" "$REPO_ROOT/scripts/aws/agent_spec.py" "$REPO_ROOT/scripts/aws/render-env.sh" \
     "$REPO_ROOT/scripts/aws/render-agents-env.sh" "$REPO_ROOT/scripts/aws/remote-deploy.sh" \
     "$stage/scripts/aws/"
   COPYFILE_DISABLE=1 tar czf "$work/release.tgz" -C "$stage" deploy scripts

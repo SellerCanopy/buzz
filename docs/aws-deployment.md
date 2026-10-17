@@ -145,7 +145,8 @@ By default `AGENTS=claude,codex` runs one Claude agent and one Codex agent. Set 
    - Codex agents: `OPENAI_API_KEY`.
 3. `make agents-secrets` stores them in SSM under `/buzz/agents/`. It skips any that already exist.
 4. `make agents-register` creates one identity per agent and adds it to the relay. It is safe to run again.
-5. `make deploy` again. After the relay is healthy, it renders each agent's environment on the server and starts the agent containers. A failure in this agent phase leaves the relay running, fails the deploy, and records no last good image.
+5. `make agents-attest` makes the agents show up, with names, in the owner's Desktop agent list. Export the owner's secret key first (`export BUZZ_OWNER_KEY=<hex or nsec>`). The key stays on your machine. The command publishes an owner-signed record for each agent, then sets each agent's profile from inside its container with the owner's proof. It is safe to run again and needs `cargo`. Run it again after you add an agent. Each agent's whole spec (name, about text, model, effort, who it answers, limits, instructions) is `deploy/aws/agents/<name>/agent.json`, with the picture in `avatar.png`. Profile fields and the owner record apply here. Runtime fields apply on `make deploy`. See `deploy/aws/agents/README.md` for every field.
+6. `make deploy` again. After the relay is healthy, it renders each agent's environment on the server and starts the agent containers. A failure in this agent phase leaves the relay running, fails the deploy, and records no last good image.
 
 ### Defining several agents
 

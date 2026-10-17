@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake cargo for tests/aws. Logs "cargo <args>" to $STUB_LOG and builds nothing.
+set -u
+: "${STUB_LOG:?STUB_LOG must be set}"
+echo "cargo $*" >> "$STUB_LOG"

@@ -63,7 +63,7 @@ make_mutant() {
   local name="$1" file="$2" expr="$3" d="$WORK/mutant-$1"
   rm -rf "$d"
   mkdir -p "$d"
-  cp "$REPO_ROOT"/scripts/aws/*.sh "$d/"
+  cp "$REPO_ROOT"/scripts/aws/*.sh "$REPO_ROOT"/scripts/aws/*.py "$d/"
   sed -E "$expr" "$REPO_ROOT/scripts/aws/$file" > "$d/$file"
   if cmp -s "$REPO_ROOT/scripts/aws/$file" "$d/$file"; then
     return 1

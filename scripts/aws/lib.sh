@@ -44,6 +44,13 @@ check_list_shape() {
   done
 }
 
+# agent_field <file> <field> <default>: prints one setting from an agent's
+# agent.json, or the default when the file or the field is absent. Exits 1 with
+# a message on stderr when the file does not pass scripts/aws/agent_spec.py.
+agent_field() {
+  python3 -I "$(dirname "${BASH_SOURCE[0]}")/agent_spec.py" get "$1" "$2" --default "$3"
+}
+
 # agent_list: prints one "<name> <runtime>" line per entry of AGENTS, and nothing
 # when AGENTS is empty. A bare entry (claude or codex) means name equals runtime.
 # Call it after load_settings has validated AGENTS.
