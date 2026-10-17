@@ -44,6 +44,29 @@ check_list_shape() {
   done
 }
 
+# agent_list: prints one "<name> <runtime>" line per entry of AGENTS, and nothing
+# when AGENTS is empty. A bare entry (claude or codex) means name equals runtime.
+# Call it after load_settings has validated AGENTS.
+agent_list() {
+  local entry name runtime
+  local -a entries
+  [ -n "${AGENTS:-}" ] || return 0
+  IFS=',' read -r -a entries <<< "$AGENTS"
+  for entry in "${entries[@]}"; do
+    case "$entry" in
+      *:*)
+        name="${entry%%:*}"
+        runtime="${entry#*:}"
+        ;;
+      *)
+        name="$entry"
+        runtime="$entry"
+        ;;
+    esac
+    printf '%s %s\n' "$name" "$runtime"
+  done
+}
+
 # load_settings: sources the settings file, applies defaults, validates, and
 # exports every setting. Exported shell variables are overridden by values in
 # the settings file and fill in anything the file leaves out. Reads ${AWS_ENV_FILE:-$REPO_ROOT/.aws.env}. Exits 1
@@ -76,16 +99,35 @@ load_settings() {
   [[ "$RELAY_OWNER_PUBKEY" =~ ^[0-9a-f]{64}$ ]] \
     || die "RELAY_OWNER_PUBKEY must be 64 hex characters (lowercase), not an npub"
 
-  local agent
   if [ -n "$AGENTS" ]; then
     check_list_shape AGENTS "$AGENTS"
-    local -a agent_list
-    IFS=',' read -r -a agent_list <<< "$AGENTS"
-    for agent in "${agent_list[@]}"; do
-      case "$agent" in
-        claude | codex) ;;
-        *) die "AGENTS contains unknown agent '$agent' (allowed: claude, codex)" ;;
+    local entry name runtime
+    local -a entries seen_names=()
+    IFS=',' read -r -a entries <<< "$AGENTS"
+    for entry in "${entries[@]}"; do
+      case "$entry" in
+        *:*)
+          name="${entry%%:*}"
+          runtime="${entry#*:}"
+          [ -n "$name" ] || die "AGENTS entry '$entry' has an empty name (use name:runtime)"
+          [ -n "$runtime" ] || die "AGENTS entry '$entry' has an empty runtime (use name:runtime)"
+          case "$runtime" in
+            claude | codex) ;;
+            *) die "AGENTS entry '$entry' has unknown runtime '$runtime' (allowed: claude, codex)" ;;
+          esac
+          ;;
+        claude | codex)
+          name="$entry"
+          ;;
+        *) die "AGENTS contains unknown agent '$entry' (allowed: claude, codex, or name:runtime)" ;;
       esac
+      [[ "$name" =~ ^[a-z][a-z0-9-]{0,23}$ ]] \
+        || die "AGENTS has an invalid agent name '$name' (lowercase letter first, then lowercase letters, digits, or hyphens, at most 24 characters)"
+      local seen
+      for seen in "${seen_names[@]+"${seen_names[@]}"}"; do
+        [ "$seen" != "$name" ] || die "AGENTS has a duplicate agent name '$name'"
+      done
+      seen_names+=("$name")
     done
   fi
 

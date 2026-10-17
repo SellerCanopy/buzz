@@ -117,6 +117,85 @@ f="$WORK/agents-one.env"
 write_env "$f" "AGENTS=codex"
 expect_ok "single agent accepted" "$f" "AGENTS=codex "
 
+# Named agents: name or name:runtime.
+f="$WORK/agents-named.env"
+write_env "$f" "AGENTS=reviewer:claude,docs:claude,codex"
+expect_ok "named agents accepted" "$f" "AGENTS=reviewer:claude,docs:claude,codex "
+
+# run_agent_list <env-file>: prints agent_list output after load_settings.
+run_agent_list() {
+  (
+    clean_env
+    export AWS_ENV_FILE="$1"
+    # shellcheck source=/dev/null
+    . "$REPO_ROOT/scripts/aws/lib.sh"
+    load_settings
+    agent_list
+  ) 2>&1
+}
+out="$(run_agent_list "$f")"
+if [ "$out" = "$(printf 'reviewer claude\ndocs claude\ncodex codex')" ]; then
+  pass "agent_list prints name and runtime per entry"
+else
+  bad "agent_list prints name and runtime per entry (got: $out)"
+fi
+f="$WORK/agents-bare.env"
+write_env "$f" "AGENTS=claude"
+out="$(run_agent_list "$f")"
+if [ "$out" = "claude claude" ]; then
+  pass "agent_list: bare runtime name means name equals runtime"
+else
+  bad "agent_list: bare runtime name means name equals runtime (got: $out)"
+fi
+f="$WORK/agents-default.env"
+write_env "$f"
+out="$(run_agent_list "$f")"
+if [ "$out" = "$(printf 'claude claude\ncodex codex')" ]; then
+  pass "agent_list prints the default agents"
+else
+  bad "agent_list prints the default agents (got: $out)"
+fi
+f="$WORK/agents-none.env"
+write_env "$f" "AGENTS="
+out="$(run_agent_list "$f")"; rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
+  pass "agent_list prints nothing when AGENTS is empty"
+else
+  bad "agent_list prints nothing when AGENTS is empty (rc=$rc, got: $out)"
+fi
+
+f="$WORK/agents-runtime.env"
+write_env "$f" "AGENTS=a:gemini"
+expect_fail "a:gemini names the unknown runtime" "$f" "unknown runtime 'gemini'"
+f="$WORK/agents-badname.env"
+write_env "$f" "AGENTS=Bad_Name:claude"
+expect_fail "Bad_Name:claude names the invalid name" "$f" "invalid agent name 'Bad_Name'"
+f="$WORK/agents-dupname.env"
+write_env "$f" "AGENTS=x:claude,x:codex"
+expect_fail "duplicate agent name rejected" "$f" "duplicate agent name 'x'"
+f="$WORK/agents-barename.env"
+write_env "$f" "AGENTS=reviewer"
+expect_fail "bare name that is not a runtime rejected" "$f" "unknown agent 'reviewer'"
+f="$WORK/agents-noruntime.env"
+write_env "$f" "AGENTS=reviewer:"
+expect_fail "reviewer: (empty runtime) rejected" "$f" "empty runtime"
+f="$WORK/agents-noname.env"
+write_env "$f" "AGENTS=:claude"
+expect_fail ":claude (empty name) rejected" "$f" "empty name"
+f="$WORK/agents-dupbare.env"
+write_env "$f" "AGENTS=claude,claude:claude"
+expect_fail "bare and explicit entry with the same name rejected" "$f" "duplicate agent name 'claude'"
+long="a$(printf 'b%.0s' $(seq 1 24))"
+f="$WORK/agents-long.env"
+write_env "$f" "AGENTS=$long:claude"
+expect_fail "25-character agent name rejected" "$f" "invalid agent name"
+f="$WORK/agents-24.env"
+write_env "$f" "AGENTS=${long%b}:codex"
+expect_ok "24-character agent name accepted" "$f" "AGENTS=${long%b}:codex "
+f="$WORK/agents-three.env"
+write_env "$f" "AGENTS=a:b:claude"
+expect_fail "extra colon rejected" "$f" "unknown runtime"
+
 # List shape.
 for a in "claude," ",claude" "claude,,codex"; do
   f="$WORK/agents-shape.env"
