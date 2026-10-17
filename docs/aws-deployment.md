@@ -2,7 +2,7 @@
 
 This runbook covers one Buzz relay on one AWS server, managed from your laptop with `make`. The design is in `docs/superpowers/specs/2026-10-16-aws-deployment-design.md`.
 
-The first full run (`make apply`, `make secrets`, `make deploy`) against a real AWS account is done by the owner. The scripts were tested against stand-ins for AWS only.
+The scripts were tested against stand-ins for AWS. `make init`, `make plan`, `make apply`, and the server's first boot have been run against a real account. The steps marked verified in `.claude/skills/buzz-setup/SKILL.md` show what has run for real.
 
 ## Before you start
 
@@ -28,7 +28,7 @@ You also need two things in AWS that no `make` target creates:
    - `BUZZ_DOMAIN`: the relay host name, such as `buzz.example.com`. No scheme, no slash.
    - `RELAY_OWNER_PUBKEY`: the owner's public key as 64 lowercase hex characters, not an `npub`.
 
-   `AWS_REGION` (default `us-east-1`) and `INSTANCE_TYPE` (default `t4g.large`) are optional.
+   `AWS_REGION` (default `us-east-1`) and `INSTANCE_TYPE` (default `t4g.large`) are optional. `AWS_REGION` must be the region of the state bucket, or `make init` fails with a `301` error.
 2. `make init` checks the Terraform version and connects to the state bucket.
 3. `make plan` shows what Terraform will create. This step changes nothing.
 4. `make apply` shows the plan again and waits. Type `yes` to create the server, data disk, network, IAM role, image repository, backup bucket, and DNS record.
