@@ -8,15 +8,23 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::domain::run::{Run, RunState};
-use crate::domain::workflow::{Stage, KIND_PROMPT};
+use crate::domain::workflow::{Stage, KIND_PROMPT, RESULT_PASSED};
 use crate::ports::store::Pubkey;
 use crate::workflow::load::Package;
 
-/// What can happen to a run. Phase 7 adds the stage results, Phase 11 the timeouts and
-/// retries. `step` matches exhaustively, so a variant added without an arm fails to compile.
+/// What can happen to a run. Phase 11 adds the timeouts and retries. `step` matches
+/// exhaustively, so a variant added without an arm fails to compile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
-    Start { requester: Option<Pubkey> },
+    Start {
+        requester: Option<Pubkey>,
+    },
+    /// The agent of `stage` reported `result`. `summary` is what it said about it, possibly empty.
+    StageDone {
+        stage: String,
+        result: String,
+        summary: String,
+    },
 }
 
 /// What the orchestrator does after a step.
@@ -94,7 +102,48 @@ pub fn entry_stage(wf: &Package) -> Result<(&Stage, &str), String> {
 pub fn step(run: &Run, wf: &Package, input: Input) -> Step {
     match input {
         Input::Start { requester } => start(run, wf, requester),
+        Input::StageDone {
+            stage,
+            result,
+            summary,
+        } => stage_done(run, wf, &stage, &result, &summary),
     }
+}
+
+/// Records the result. Routing between stages arrives in Phase 8, so for now only a
+/// `passed` from the last stage moves the run: it ends. Any other result is recorded and the
+/// run stays where it is.
+fn stage_done(run: &Run, wf: &Package, stage: &str, result: &str, summary: &str) -> Step {
+    let current = run.state == RunState::Running && run.current_stage.as_deref() == Some(stage);
+    if !current {
+        return Step {
+            run: run.clone(),
+            effects: Vec::new(),
+        };
+    }
+    let mut next = run.clone();
+    let mut effects = vec![Effect::Emit {
+        kind: "result.reported",
+        payload: json!({
+            "stage": stage,
+            "visit": run.visit,
+            "result": result,
+            "summary": summary,
+        }),
+    }];
+    let last = wf.workflow.stages.last().is_some_and(|s| s.id == stage);
+    if last && result == RESULT_PASSED {
+        next.state = RunState::Ended;
+        effects.push(Effect::Emit {
+            kind: "run.ended",
+            payload: json!({
+                "outcome": RESULT_PASSED,
+                "stage": stage,
+                "visit": run.visit,
+            }),
+        });
+    }
+    Step { run: next, effects }
 }
 
 fn start(run: &Run, wf: &Package, requester: Option<Pubkey>) -> Step {

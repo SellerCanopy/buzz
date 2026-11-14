@@ -117,12 +117,12 @@ spec's title and are confirmed when that phase starts.
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
 | `files` | pending | 9 |
-| `filters` | pending (filters narrow by run state and search; a run now starts, but a card leaves Running only when a stage ends, Phase 7) | 7 |
+| `filters` | pending (filters narrow by run state and search; a card now reaches Done, but the Stopped and Failed states the spec filters on arrive with StopRun and routing, Phase 11) | 11 |
 | `guide` | pending (the Go spec drives the workflow builder) | 19 |
 | `home` | pending | 3 |
 | `importexport` | pending | 19 |
 | `kilntask` | dropped (Carrier task kind, no Buzz stage) | 1 |
-| `list` | pending (the Go spec lists the board's cards with their run state; a card finishes only in Phase 7) | 7 |
+| `list` | pending (the Go spec drives a List layout of the board; no phase in the plan builds one, so it needs an owner) | unassigned |
 | `login` | dropped (team login and cookie session) | 1 |
 | `merge` | pending | 18 |
 | `needs-you` | pending | 12 |
@@ -226,3 +226,28 @@ spec's title and are confirmed when that phase starts.
   count the listing calls) and the Go tests for optional output YAML encoding (nothing
   stores the YAML form here; the hash is over the files).
 
+
+## Phase 7 deliverables
+
+- Served: `StageDone` (new rpc, `StageDoneRequest { card_id, result, summary }`, returns
+  the `Run`), at Run. The caller must be the agent the stage's task was addressed to,
+  read from the queued task post; any other caller gets `permission_denied`. The result
+  must be one `reportable_results` lists, else `invalid_argument` names the allowed ones.
+- Reducer: `Input::StageDone` records `result.reported`. Only a `passed` from the last
+  stage ends the run (`run.ended`) and the card goes to `done` (`card.state`). Any other
+  result is recorded and the run stays Running until routing exists (Phase 8), so a
+  one-stage workflow whose agent reports `failed` waits there.
+- `Run.result` and `Run.outcome` stay empty: no migration holds them, so the result is
+  read from the `result.reported` and `run.ended` events.
+- Event kinds registered: `result.reported`, `run.ended`.
+- `OutboxRepo::by_key` reads one outbox row by its idempotency key, in `MemStore` and
+  `PgStore`.
+- The stage task now ends with the card id and the tool name, because the agent has no
+  other way to learn the card id: "call the Beehive tool `stage_done` with card_id ...".
+- One table, `buzz-hive-api/src/tools.rs`, lists the tools. Routes take their level from
+  it, `buzz-hive-mcp` lists tools from it, and `tests/tools_parity.rs` fails when a route
+  has neither a tool nor a `NOT_TOOLS` reason. `StartStage` is the tool `start_run` and
+  `GetStatus` is `get_hive_health`; the plan's `StartRun` route does not exist.
+- `buzz-hive-mcp` (new crate): a hand-written rmcp `ServerHandler`, so no `build.rs` is
+  needed for runtime tools (TDD spike 5). It signs a NIP-98 event with the agent's key,
+  caches the token and renews it 60 seconds early.

@@ -70,14 +70,14 @@ pub async fn list_runs(
     })
 }
 
-fn parse_id(value: &str, field: &str) -> Result<Uuid, HiveError> {
+pub(super) fn parse_id(value: &str, field: &str) -> Result<Uuid, HiveError> {
     if value.is_empty() {
         return Err(HiveError::InvalidArgument(format!("{field} is required")));
     }
     Uuid::parse_str(value).map_err(|_| HiveError::InvalidArgument(format!("{field} is not an id")))
 }
 
-fn to_proto(run: DomainRun) -> Run {
+pub(super) fn to_proto(run: DomainRun) -> Run {
     Run {
         id: run.id.to_string(),
         card_id: run.card_id.to_string(),

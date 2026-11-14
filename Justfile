@@ -488,6 +488,7 @@ test-unit:
         cargo nextest run -p buzz-hive-api
         cargo nextest run -p buzz-hive-store
         cargo nextest run -p buzz-hive
+        cargo nextest run -p buzz-hive-mcp
         # Kubernetes backend provider: the decision layers (state machine, GC
         # planner, env precedence, naming, wire) are pure functions with a fake
         # substrate, so they belong in the unit job. Enumerated explicitly

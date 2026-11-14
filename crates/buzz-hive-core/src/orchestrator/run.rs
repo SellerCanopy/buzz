@@ -1,5 +1,6 @@
 //! Starting a run. Every later input to a run goes through the same row lock.
 
+use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -9,9 +10,13 @@ use super::{Ctx, Env, OpError};
 use crate::config::{self, Layer, Layers};
 use crate::domain::card::CardState;
 use crate::domain::events::Event;
-use crate::domain::run::Run;
+use crate::domain::run::{Run, RunState};
 use crate::ports::store::{Posting, Tx};
-use crate::rules::run::{entry_stage, step, Effect, Input};
+use crate::rules::run::{entry_stage, step, task_key, Effect, Input};
+use crate::workflow::routes::reportable_results;
+
+/// The longest summary a stage may send with its result.
+pub const MAX_SUMMARY_CHARS: usize = 10_000;
 
 /// Starts a run of the card's workflow at its first stage.
 ///
@@ -79,6 +84,7 @@ pub async fn start_run(
         package,
         stage,
         &CardText {
+            id: card.id,
             title: &card.title,
             description: &card.description,
         },
@@ -136,6 +142,120 @@ pub async fn start_run(
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
         }
+    }
+    let events = tx.commit().await?;
+    Ok((run, events))
+}
+
+/// The stage's agent reports its result. Only the agent the stage task mentioned may
+/// report, whatever level others hold.
+///
+/// The card and the run are held, so a report and a start or another report queue. A result
+/// that ends the run also moves the card to `done`. A stale call, for a card whose run has
+/// ended, is refused with a sentence rather than applied twice.
+pub async fn stage_done(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    card_id: Uuid,
+    result: &str,
+    summary: &str,
+) -> Result<(Run, Vec<Event>), OpError> {
+    if summary.chars().count() > MAX_SUMMARY_CHARS {
+        return Err(OpError::InvalidArgument(format!(
+            "the summary is over {MAX_SUMMARY_CHARS} characters"
+        )));
+    }
+    let mut tx = env.store.begin(ctx.community).await?;
+    let mut card = tx
+        .cards()
+        .get_for_update(card_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
+    let active = tx
+        .runs()
+        .active_for_card(card_id)
+        .await?
+        .ok_or_else(|| OpError::FailedPrecondition("the card has no run in progress".into()))?;
+    let run = tx
+        .runs()
+        .get_for_update(active.id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("run {} does not exist", active.id)))?;
+    let stage_id = match (run.state, run.current_stage.clone()) {
+        (RunState::Running, Some(stage)) => stage,
+        (state, _) => {
+            return Err(OpError::FailedPrecondition(format!(
+                "the run is {}, so no stage is waiting for a result",
+                state.as_str()
+            )))
+        }
+    };
+    let package = env.catalog.get(&run.workflow).ok_or_else(|| {
+        OpError::FailedPrecondition(format!("workflow {} does not exist", run.workflow))
+    })?;
+    let (stage, _) = package.stage(&stage_id).ok_or_else(|| {
+        OpError::FailedPrecondition(format!("workflow {} has no stage {stage_id}", run.workflow))
+    })?;
+
+    // The agent is the one the task was addressed to, read from the queued post, so it is
+    // known before the post reaches the relay and cannot change with the directory.
+    let queued = tx
+        .outbox()
+        .by_key(&task_key(card_id, &stage_id, run.visit))
+        .await?;
+    let Some(Posting::StageTask {
+        agent, agent_name, ..
+    }) = queued.map(|row| row.posting)
+    else {
+        return Err(OpError::FailedPrecondition(format!(
+            "stage {stage_id} has no task waiting for a result"
+        )));
+    };
+    if ctx.actor.pubkey != agent {
+        return Err(OpError::PermissionDenied(format!(
+            "only the agent {agent_name} may report a result for stage {stage_id}"
+        )));
+    }
+    let allowed = reportable_results(stage);
+    if !allowed.iter().any(|r| r == result) {
+        return Err(OpError::InvalidArgument(format!(
+            "{result:?} is not a result of stage {stage_id}; use one of: {}",
+            allowed.join(", ")
+        )));
+    }
+
+    let stepped = step(
+        &run,
+        package,
+        Input::StageDone {
+            stage: stage_id,
+            result: result.to_owned(),
+            summary: summary.to_owned(),
+        },
+    );
+    let mut run = stepped.run;
+    if run.state == RunState::Ended {
+        run.ended_at = Some(Utc::now().trunc_subsecs(6));
+    }
+    tx.runs().update(&run).await?;
+    for effect in stepped.effects {
+        match effect {
+            Effect::Emit { kind, payload } => append(&mut *tx, ctx, kind, &run, payload).await?,
+            // A result that routes to another stage queues posts. Routing is Phase 8, and the
+            // reducer returns no post until then.
+            Effect::PostStatus { .. } | Effect::PostStageTask { .. } => {
+                return Err(OpError::FailedPrecondition(
+                    "this result needs a post that is not supported yet".into(),
+                ))
+            }
+        }
+    }
+    if run.state == RunState::Ended {
+        let before = card.state;
+        card.state = CardState::Done;
+        tx.cards().update(&card).await?;
+        let payload = json!({ "state": card.state.as_str(), "from": before.as_str() });
+        append(&mut *tx, ctx, "card.state", &run, payload).await?;
     }
     let events = tx.commit().await?;
     Ok((run, events))

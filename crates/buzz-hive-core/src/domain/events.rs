@@ -64,6 +64,10 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     ("run.started", 6),
     // A stage task reached the relay and opened its thread.
     ("stage.posted", 6),
+    // The stage's agent reported a result through `stage_done`.
+    ("result.reported", 7),
+    // The run ended. Its payload names the outcome.
+    ("run.ended", 7),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

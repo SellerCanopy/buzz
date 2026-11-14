@@ -5,6 +5,7 @@
 
 mod common;
 
+use buzz_hive_core::access::ActorKind;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::EVENT_KINDS;
 use buzz_hive_core::orchestrator::cards::{
@@ -12,12 +13,12 @@ use buzz_hive_core::orchestrator::cards::{
     NewCard,
 };
 use buzz_hive_core::orchestrator::outbox::drain_outbox;
-use buzz_hive_core::orchestrator::run::start_run;
+use buzz_hive_core::orchestrator::run::{stage_done, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::testing::MemStore;
-use common::{person, Fixture, CHANNEL, COMMUNITY};
+use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 
-const CURRENT_PHASE: u8 = 6;
+const CURRENT_PHASE: u8 = 7;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -86,12 +87,46 @@ async fn run_scenarios(f: &Fixture) {
     drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
 }
 
+/// Phase 7: the agent reports a result, and a passed last stage ends the run.
+async fn report_scenarios(f: &Fixture) {
+    let ctx = person();
+    set_setting(
+        &f.env(),
+        &ctx,
+        &Scope::User,
+        "update_channel",
+        Some(serde_json::json!(CHANNEL.to_string())),
+    )
+    .await
+    .unwrap();
+    let (card, _) = create_card(
+        &f.store,
+        &ctx,
+        NewCard {
+            title: "report".into(),
+            workflow: "solo".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    start_run(&f.env(), &ctx, card.id).await.unwrap();
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    stage_done(&f.env(), &agent, card.id, "failed", "no luck")
+        .await
+        .unwrap();
+    stage_done(&f.env(), &agent, card.id, "passed", "done")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let f = Fixture::new();
     let store = &f.store;
     card_scenarios(store).await;
     run_scenarios(&f).await;
+    report_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

@@ -42,7 +42,22 @@ BUZZ_ACP_SESSION_POLICY=thread
 
 The Beehive account's pubkey is logged at startup as `account`.
 
+## Ending a stage
+
+The stage task names the card and the results the stage accepts. The agent ends the stage
+with the `stage_done` tool of `buzz-hive-mcp`, a stdio MCP server in `crates/buzz-hive-mcp`.
+Only the agent the task mentioned may report. A `passed` from the workflow's last stage ends
+the run and moves the card to Done. Any other result is recorded on the card's activity and
+the run stays where it is until workflow routing exists.
+
+Add the server to the agent's MCP servers, with the command `buzz-hive-mcp`. It reads
+`BUZZ_PRIVATE_KEY` and `BUZZ_RELAY_URL`, which the agent runtime already sets, signs in as
+the agent, and finds Beehive on the relay's host. Set `BUZZ_HIVE_URL` where Beehive is on
+another address, such as `http://localhost:3100` for a local service. The agent's Beehive
+level (set by an admin, never above its owner's) decides which tools it may call.
+
 ## Checking against a local relay
 
-`tests/e2e_start.rs` starts a run against a running relay and reads the two posts back. See
-the top of that file for the command.
+`tests/e2e_start.rs` starts a run against a running relay and reads the two posts back.
+`tests/e2e_one_stage.rs` has a scripted agent create, start and finish a card through the
+real `buzz-hive-mcp` binary. See the top of each file for the command.

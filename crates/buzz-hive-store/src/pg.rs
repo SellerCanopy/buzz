@@ -891,4 +891,15 @@ impl OutboxRepo for PgTx {
                 .map_err(unavailable)?;
         rows.into_iter().map(decode_outbox).collect()
     }
+
+    async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
+        let row: Option<OutboxDbRow> =
+            sqlx::query_as(select_outbox!("WHERE community_id = $1 AND key = $2"))
+                .bind(self.community)
+                .bind(key)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+        row.map(decode_outbox).transpose()
+    }
 }

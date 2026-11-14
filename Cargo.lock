@@ -1350,6 +1350,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-hive-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "buzz-hive-api",
+ "nostr 0.44.7",
+ "reqwest 0.13.4",
+ "rmcp 3.9.0",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "buzz-hive-store"
 version = "0.1.0"
 dependencies = [

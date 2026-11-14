@@ -46,6 +46,12 @@ service EngineService {
   // StartStage starts a stage on a card. It fails with FailedPrecondition,
   // naming the active run, when the card's issue already has one.
   rpc StartStage(StartStageRequest) returns (Run);
+  // StageDone reports the result of the card's running stage. Beehive: new
+  // rpc. Only the Buzz agent the stage's task mentioned may call it, whatever
+  // level others hold. The result must be one the stage offers, else
+  // InvalidArgument lists them. A passed result from the last stage ends the
+  // run and moves the card to done.
+  rpc StageDone(StageDoneRequest) returns (Run);
   // StopRun stops a run: its turn is cancelled and its agent session
   // closed, it ends with outcome stopped, its open items are resolved, and
   // its card is stopped. It fails with FailedPrecondition for a run that has
@@ -793,6 +799,15 @@ message StartStageRequest {
   // are the new run's own settings (params.<name>). An undeclared name or a
   // value its type refuses is INVALID_ARGUMENT.
   map<string, string> parameters = 3;
+}
+
+message StageDoneRequest {
+  // The card's UUID, which the stage task names.
+  string card_id = 1;
+  // One of the results the stage task lists, such as passed or failed.
+  string result = 2;
+  // What the agent says about the result, up to 10,000 characters. Optional.
+  string summary = 3;
 }
 
 message StopRunRequest {

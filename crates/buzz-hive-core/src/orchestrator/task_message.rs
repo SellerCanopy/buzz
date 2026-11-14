@@ -13,6 +13,8 @@ use crate::workflow::template::{find_vars, known_variable, param_variable, varia
 
 /// What the message says about the card.
 pub struct CardText<'a> {
+    /// The card's id, which the agent passes back to `stage_done`.
+    pub id: uuid::Uuid,
     pub title: &'a str,
     pub description: &'a str,
 }
@@ -68,7 +70,8 @@ pub fn render_task(
         parts.push(card_block);
     }
     parts.push(format!(
-        "When you are done, call the Beehive tool `stage_done` with one of: {}.",
+        "When you are done, call the Beehive tool `stage_done` with card_id `{}` and result one of: {}.",
+        card.id,
         results.join(", ")
     ));
     Ok(parts
@@ -164,8 +167,11 @@ mod tests {
         }
     }
 
+    const CARD: uuid::Uuid = uuid::Uuid::from_u128(0x2a);
+
     fn card() -> CardText<'static> {
         CardText {
+            id: CARD,
             title: "the bug",
             description: "It breaks.",
         }
@@ -186,7 +192,7 @@ mod tests {
         // `needs_work` has no route here, so the agent is not offered it.
         let want = "the bug\n\nIt breaks.\n\n\
             Fix the bug.\nIt breaks.\nPick passed, failed, needs_input, blocked.\n\n\
-            When you are done, call the Beehive tool `stage_done` with one of: passed, failed, needs_input, blocked.";
+            When you are done, call the Beehive tool `stage_done` with card_id `00000000-0000-0000-0000-00000000002a` and result one of: passed, failed, needs_input, blocked.";
         assert_eq!(got, want);
     }
 
@@ -226,7 +232,9 @@ mod tests {
             got.starts_with("/demo:review title the bug\n\nthe bug\n\nIt breaks.\n\n"),
             "rendered task:\n{got}"
         );
-        assert!(got.ends_with("`stage_done` with one of: passed, failed, needs_input."));
+        assert!(got.ends_with(
+            "`stage_done` with card_id `00000000-0000-0000-0000-00000000002a` and result one of: passed, failed, needs_input."
+        ));
     }
 
     #[test]
@@ -270,6 +278,7 @@ mod tests {
     #[test]
     fn an_empty_card_adds_nothing_before_the_prompt() {
         let none = CardText {
+            id: CARD,
             title: "",
             description: "",
         };

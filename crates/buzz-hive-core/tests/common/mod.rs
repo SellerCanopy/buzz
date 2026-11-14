@@ -45,6 +45,11 @@ pub fn catalog() -> Catalog {
             "demo/workflow.yaml",
             "version: 2\nstages:\n  - id: research\n    name: Research\n    kind: prompt\n    agent: builder\n    prompt: \"Research {{issue.title}} at depth {{params.depth}}\"\n  - id: build\n    kind: prompt\n    agent: builder\n    prompt: Build\n",
         )
+        .with("solo/kiln-package.yaml", "name: solo\nversion: 1.0.0\n")
+        .with(
+            "solo/workflow.yaml",
+            "version: 2\nstages:\n  - id: only\n    kind: prompt\n    agent: builder\n    prompt: Do {{issue.title}}\n",
+        )
         .with(
             "noagent/kiln-package.yaml",
             "name: noagent\nversion: 1.0.0\n",

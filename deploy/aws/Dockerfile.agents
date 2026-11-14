@@ -4,7 +4,24 @@
 # Build from the repo root with the sprig image already built:
 #   docker build -f deploy/aws/Dockerfile.agents --build-arg SPRIG_IMAGE=<sprig image> .
 ARG SPRIG_IMAGE
+ARG RUST_VERSION=1.98
+ARG DEBIAN_VERSION=bookworm
 FROM ${SPRIG_IMAGE} AS sprig
+
+# buzz-hive-mcp is its own binary, not a sprig personality: it carries the Beehive tool
+# table from buzz-hive-api. It is built on Debian bookworm, as is the node image below.
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS hive-mcp
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -p buzz-hive-mcp --bin buzz-hive-mcp \
+    && install -D -m 0755 target/release/buzz-hive-mcp /out/buzz-hive-mcp \
+    && strip /out/buzz-hive-mcp
 
 FROM node:22-bookworm-slim
 
@@ -30,6 +47,7 @@ RUN apt-get update \
     && install -d -o agent -g agent /workspace /home/agent
 
 COPY --from=sprig --chmod=0755 /usr/local/bin/sprig /usr/local/bin/sprig
+COPY --from=hive-mcp --chmod=0755 /out/buzz-hive-mcp /usr/local/bin/buzz-hive-mcp
 COPY --chmod=0755 scripts/sprig-entrypoint.sh /usr/local/bin/sprig-entrypoint
 COPY --chmod=0755 deploy/aws/agent-entrypoint.sh /usr/local/bin/agent-entrypoint
 RUN for name in \

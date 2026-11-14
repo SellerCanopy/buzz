@@ -196,6 +196,23 @@ async fn the_outbox_keeps_one_row_per_key_and_drains_in_order() {
 
     let mut tx = store.begin(community).await.unwrap();
     assert_eq!(tx.outbox().next(&[]).await.unwrap().unwrap().key, "k2");
+
+    // A row is found by its key whether or not it is done, and only in its community.
+    let done = tx.outbox().by_key("k1").await.unwrap().unwrap();
+    assert!(done.done_at.is_some());
+    assert_eq!(done.posting, status("first"));
+    assert!(tx
+        .outbox()
+        .by_key("k2")
+        .await
+        .unwrap()
+        .unwrap()
+        .done_at
+        .is_none());
+    assert!(tx.outbox().by_key("missing").await.unwrap().is_none());
+    drop(tx);
+    let mut other = store.begin(CommunityId::from_u128(2)).await.unwrap();
+    assert!(other.outbox().by_key("k1").await.unwrap().is_none());
 }
 
 #[tokio::test]

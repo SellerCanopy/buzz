@@ -40,6 +40,9 @@ pub enum OpError {
     NotFound(String),
     #[error("{0}")]
     FailedPrecondition(String),
+    /// The caller is known but may not do this, whatever its access level.
+    #[error("{0}")]
+    PermissionDenied(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }

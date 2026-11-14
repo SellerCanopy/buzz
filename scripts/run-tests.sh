@@ -202,6 +202,8 @@ run_unit_tests() {
     cargo test -p buzz-hive-store -- --nocapture
   run_test_step "buzz-hive tests" \
     cargo test -p buzz-hive -- --nocapture
+  run_test_step "buzz-hive-mcp tests" \
+    cargo test -p buzz-hive-mcp -- --nocapture
 
   # Kubernetes backend provider: pure decision layers driven by a fake
   # substrate, no cluster. Mirrors the nextest path in `just test-unit` —

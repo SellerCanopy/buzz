@@ -1,0 +1,357 @@
+//! The tools a Buzz agent has, one row each. The routes and `buzz-hive-mcp` both read this
+//! table, so they cannot disagree about a tool's name, its level or what it calls.
+//!
+//! A tool's arguments are the route's request body in protobuf JSON, so the schema names
+//! the fields as the route reads them (camelCase). `tests/tools_parity.rs` fails when a
+//! route has neither a row here nor an entry in [`NOT_TOOLS`] with its reason.
+
+use buzz_hive_core::access::Level;
+use serde_json::{json, Value};
+
+pub struct Tool {
+    pub name: &'static str,
+    /// The EngineService method the tool calls.
+    pub route: &'static str,
+    /// The least level that may call it. An agent acts at the lower of its own level and the
+    /// level of the person it acts for.
+    pub needs: Level,
+    pub description: &'static str,
+    /// JSON Schema of the arguments.
+    pub schema: fn() -> Value,
+}
+
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        name: "create_card",
+        route: "CreateCard",
+        needs: Level::Run,
+        description: "Create a card on the Beehive board. Give a workflow to put it in To do, or none to put it in Backlog.",
+        schema: create_card,
+    },
+    Tool {
+        name: "start_run",
+        route: "StartStage",
+        needs: Level::Run,
+        description: "Start a run of the card's workflow at its first stage. The stage's agent is mentioned in the update channel.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "stage_done",
+        route: "StageDone",
+        needs: Level::Run,
+        description: "Report the result of the stage you were asked to do. Only the agent the stage task mentioned may call it. Pass the card_id from the task and one of the results it lists.",
+        schema: stage_done,
+    },
+    Tool {
+        name: "get_card",
+        route: "GetCard",
+        needs: Level::Read,
+        description: "Read one card, with its description.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "list_cards",
+        route: "ListCards",
+        needs: Level::Read,
+        description: "List the cards on the board, or in the archive.",
+        schema: list_cards,
+    },
+    Tool {
+        name: "list_runs",
+        route: "ListRuns",
+        needs: Level::Read,
+        description: "List runs, newest first. Give a card id to list that card's runs.",
+        schema: list_runs,
+    },
+    Tool {
+        name: "get_run",
+        route: "GetRun",
+        needs: Level::Read,
+        description: "Read one run: its state and the stage it is at.",
+        schema: get_run,
+    },
+    Tool {
+        name: "add_note",
+        route: "AddNote",
+        needs: Level::Run,
+        description: "Add a note to a card's activity.",
+        schema: add_note,
+    },
+    Tool {
+        name: "archive_cards",
+        route: "ArchiveCards",
+        needs: Level::Run,
+        description: "Set cards aside in the archive. A card that is running or waiting cannot be archived.",
+        schema: archive_cards,
+    },
+    Tool {
+        name: "restore_card",
+        route: "RestoreCard",
+        needs: Level::Run,
+        description: "Bring a card back from the archive.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "remove_card",
+        route: "RemoveCard",
+        needs: Level::Run,
+        description: "Delete a card. A card that is running or waiting cannot be removed.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "list_workflows",
+        route: "ListWorkflows",
+        needs: Level::Read,
+        description: "List the workflows a card can use, with their stages.",
+        schema: no_arguments,
+    },
+    Tool {
+        name: "check_workflow",
+        route: "CheckWorkflow",
+        needs: Level::Read,
+        description: "Check a workflow and list its findings. Leave the name empty to check every workflow.",
+        schema: check_workflow,
+    },
+    Tool {
+        name: "list_agents",
+        route: "ListAgents",
+        needs: Level::Read,
+        description: "List the Buzz agents a workflow stage can name.",
+        schema: no_arguments,
+    },
+    Tool {
+        name: "get_settings",
+        route: "GetSettings",
+        needs: Level::Read,
+        description: "Read the settings of one scope: user, workflow or card.",
+        schema: get_settings,
+    },
+    Tool {
+        name: "set_setting",
+        route: "SetSetting",
+        needs: Level::Run,
+        description: "Set one setting, or remove it with an empty value. Changing a community setting needs the Admin level.",
+        schema: set_setting,
+    },
+    Tool {
+        name: "get_hive_health",
+        route: "GetStatus",
+        needs: Level::Read,
+        description: "Read Beehive's version, the newest event number and the running card count.",
+        schema: no_arguments,
+    },
+];
+
+/// Routes that are deliberately not tools, each with the reason.
+pub const NOT_TOOLS: &[(&str, &str)] = &[
+    (
+        "PollEvents",
+        "the board's live feed for a client; an agent reads get_card and list_runs",
+    ),
+    (
+        "WhoAmI",
+        "a client asks who it is; an agent acts as its own key and its level shows in the refusal",
+    ),
+    (
+        "CreateTask",
+        "create_card makes the same card; CreateTask keeps the Go engine's one-sentence form for the app",
+    ),
+    (
+        "ListTemplateVariables",
+        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+    ),
+    (
+        "ListStageTemplates",
+        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+    ),
+];
+
+fn string(description: &str) -> Value {
+    json!({ "type": "string", "description": description })
+}
+
+fn object(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
+    let properties: serde_json::Map<String, Value> = properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_owned(), schema))
+        .collect();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+fn no_arguments() -> Value {
+    object(Vec::new(), &[])
+}
+
+fn card_id_only() -> Value {
+    object(vec![("cardId", string("The card's id."))], &["cardId"])
+}
+
+fn create_card() -> Value {
+    object(
+        vec![
+            ("title", string("The card's title, 1 to 200 characters.")),
+            (
+                "description",
+                string("What the card is about, up to 65536 characters."),
+            ),
+            (
+                "workflow",
+                string("The workflow's name. Empty puts the card in Backlog."),
+            ),
+        ],
+        &["title"],
+    )
+}
+
+fn stage_done() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            (
+                "result",
+                string("One of the results the stage task lists, such as passed or failed."),
+            ),
+            (
+                "summary",
+                string("What you did or found, up to 10000 characters. Optional."),
+            ),
+        ],
+        &["cardId", "result"],
+    )
+}
+
+fn list_cards() -> Value {
+    object(
+        vec![(
+            "archived",
+            json!({ "type": "boolean", "description": "List the archive instead of the board." }),
+        )],
+        &[],
+    )
+}
+
+fn list_runs() -> Value {
+    object(
+        vec![("cardId", string("The card's id. Empty lists every run."))],
+        &[],
+    )
+}
+
+fn get_run() -> Value {
+    object(vec![("runId", string("The run's id."))], &["runId"])
+}
+
+fn add_note() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            ("summary", string("One line, 1 to 200 characters.")),
+            (
+                "detail",
+                string("More text, up to 10000 characters. Optional."),
+            ),
+        ],
+        &["cardId", "summary"],
+    )
+}
+
+fn archive_cards() -> Value {
+    object(
+        vec![(
+            "cardIds",
+            json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The ids of the cards to archive.",
+            }),
+        )],
+        &["cardIds"],
+    )
+}
+
+fn check_workflow() -> Value {
+    object(
+        vec![(
+            "name",
+            string("The workflow's name. Empty checks every workflow."),
+        )],
+        &[],
+    )
+}
+
+fn get_settings() -> Value {
+    object(
+        vec![
+            ("scope", string("user, workflow or card.")),
+            (
+                "scopeId",
+                string("The card's id for scope card. Empty otherwise."),
+            ),
+            (
+                "workflow",
+                string("The workflow's name for scope workflow."),
+            ),
+        ],
+        &["scope"],
+    )
+}
+
+fn set_setting() -> Value {
+    object(
+        vec![
+            ("scope", string("user, workflow or card.")),
+            (
+                "scopeId",
+                string("The card's id for scope card. Empty otherwise."),
+            ),
+            ("key", string("The setting's key, such as update_channel.")),
+            (
+                "valueJson",
+                string("The value as JSON text. Empty removes the setting."),
+            ),
+            (
+                "workflow",
+                string("The workflow's name for scope workflow."),
+            ),
+        ],
+        &["scope", "key"],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_names_and_routes_are_unique() {
+        let mut names: Vec<_> = TOOLS.iter().map(|t| t.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), TOOLS.len(), "a tool name repeats");
+        let mut routes: Vec<_> = TOOLS.iter().map(|t| t.route).collect();
+        routes.sort_unstable();
+        routes.dedup();
+        assert_eq!(routes.len(), TOOLS.len(), "two tools call one route");
+    }
+
+    #[test]
+    fn every_schema_is_an_object_that_names_only_fields_it_declares() {
+        for tool in TOOLS {
+            let schema = (tool.schema)();
+            assert_eq!(schema["type"], "object", "{}", tool.name);
+            let declared = schema["properties"].as_object().unwrap();
+            for required in schema["required"].as_array().unwrap() {
+                assert!(
+                    declared.contains_key(required.as_str().unwrap()),
+                    "{} requires {required}, which it does not declare",
+                    tool.name
+                );
+            }
+        }
+    }
+}

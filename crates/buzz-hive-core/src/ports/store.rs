@@ -241,6 +241,8 @@ pub trait OutboxRepo: Send {
     async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError>;
     /// Every post, done or not, oldest first.
     async fn all(&mut self) -> Result<Vec<OutboxRow>, StoreError>;
+    /// The post queued under `key`, done or not.
+    async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError>;
 }
 
 /// A package the store holds versions of.

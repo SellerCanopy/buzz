@@ -9,6 +9,7 @@ mod cards;
 pub mod poll;
 mod runs;
 mod settings;
+mod stages;
 mod status;
 mod workflows;
 
@@ -16,6 +17,7 @@ use axum::Router;
 use buzz_hive_core::access::Level;
 
 use crate::app::App;
+use crate::tools::TOOLS;
 use crate::unary::unary;
 
 /// Every procedure served now, with the level it needs.
@@ -36,6 +38,7 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListTemplateVariables", Level::Read),
     ("ListStageTemplates", Level::Read),
     ("StartStage", Level::Run),
+    ("StageDone", Level::Run),
     ("GetRun", Level::Read),
     ("ListRuns", Level::Read),
     ("GetSettings", Level::Read),
@@ -76,7 +79,13 @@ pub fn path(method: &str) -> String {
     format!("/kiln.engine.v1.EngineService/{method}")
 }
 
+/// The level a route needs. A route with a tool takes it from the tool's row, so the level
+/// is written in one place for the route and the tool; `tests/tools_parity.rs` checks that
+/// [`ROUTES`] agrees.
 fn needs(method: &str) -> Level {
+    if let Some(tool) = TOOLS.iter().find(|tool| tool.route == method) {
+        return tool.needs;
+    }
     ROUTES
         .iter()
         .find(|(name, _)| *name == method)
@@ -166,6 +175,10 @@ pub fn router(app: &App) -> Router<App> {
         .route(
             &path("StartStage"),
             unary(app.clone(), needs("StartStage"), runs::start_stage),
+        )
+        .route(
+            &path("StageDone"),
+            unary(app.clone(), needs("StageDone"), stages::stage_done),
         )
         .route(
             &path("GetRun"),

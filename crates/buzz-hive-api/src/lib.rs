@@ -8,6 +8,7 @@ pub mod proto;
 pub mod replay;
 pub mod routes;
 pub mod token;
+pub mod tools;
 pub mod unary;
 
 pub use app::{ApiConfig, App};

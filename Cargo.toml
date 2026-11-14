@@ -38,6 +38,7 @@ members = [
     "crates/buzz-hive-store",
     "crates/buzz-hive-api",
     "crates/buzz-hive",
+    "crates/buzz-hive-mcp",
     "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]

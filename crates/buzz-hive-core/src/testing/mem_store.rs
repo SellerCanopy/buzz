@@ -431,6 +431,15 @@ impl OutboxRepo for MemTx {
             .map(|(_, row)| row.clone())
             .collect())
     }
+
+    async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
+        Ok(self
+            .work
+            .outbox
+            .iter()
+            .find(|(c, row)| *c == self.community && row.key == key)
+            .map(|(_, row)| row.clone()))
+    }
 }
 
 #[async_trait::async_trait]

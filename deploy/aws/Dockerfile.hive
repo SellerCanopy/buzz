@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Beehive service image. Build from the repo root:
 #   docker build -f deploy/aws/Dockerfile.hive -t buzz-hive:local .
-# buzz-hive-mcp joins the build in the phase that adds it.
+# The image also carries buzz-hive-mcp, the stdio tool server an agent runs.
 ARG RUST_VERSION=1.98
 ARG DEBIAN_VERSION=bookworm
 
@@ -17,8 +17,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p buzz-hive --bin buzz-hive \
+    && cargo build --release --locked -p buzz-hive-mcp --bin buzz-hive-mcp \
     && install -D -m 0755 target/release/buzz-hive /out/buzz-hive \
-    && strip /out/buzz-hive
+    && install -D -m 0755 target/release/buzz-hive-mcp /out/buzz-hive-mcp \
+    && strip /out/buzz-hive /out/buzz-hive-mcp
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 LABEL org.opencontainers.image.title="Buzz Hive" \
@@ -31,6 +33,7 @@ RUN apt-get update \
     && groupadd --system --gid 1000 buzz \
     && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz --create-home --shell /usr/sbin/nologin buzz
 COPY --from=builder /out/buzz-hive /usr/local/bin/buzz-hive
+COPY --from=builder /out/buzz-hive-mcp /usr/local/bin/buzz-hive-mcp
 EXPOSE 3100
 USER buzz:buzz
 WORKDIR /var/lib/buzz

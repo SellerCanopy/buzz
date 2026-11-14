@@ -76,6 +76,7 @@ impl From<OpError> for HiveError {
             OpError::InvalidArgument(message) => Self::InvalidArgument(message),
             OpError::NotFound(message) => Self::NotFound(message),
             OpError::FailedPrecondition(message) => Self::FailedPrecondition(message),
+            OpError::PermissionDenied(message) => Self::PermissionDenied(message),
             OpError::Store(error) => error.into(),
         }
     }
