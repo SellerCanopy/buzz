@@ -42,9 +42,40 @@ impl RelayAdapter {
         mentions: &[&str],
         delivery: &Delivery,
     ) -> Result<Event, RelayError> {
+        self.sign(channel, text, None, mentions, delivery)
+    }
+
+    /// The event for a reply in the thread `root` opened. The reply's parent is the root, so
+    /// the thread stays flat.
+    pub fn build_reply(
+        &self,
+        channel: ChannelId,
+        root: &EventId,
+        text: &str,
+        mentions: &[&str],
+        delivery: &Delivery,
+    ) -> Result<Event, RelayError> {
+        let root = nostr::EventId::from_hex(root).map_err(|e| {
+            RelayError::Rejected(format!("thread root {root} is not an event id: {e}"))
+        })?;
+        let thread = buzz_sdk::ThreadRef {
+            root_event_id: root,
+            parent_event_id: root,
+        };
+        self.sign(channel, text, Some(&thread), mentions, delivery)
+    }
+
+    fn sign(
+        &self,
+        channel: ChannelId,
+        text: &str,
+        thread: Option<&buzz_sdk::ThreadRef>,
+        mentions: &[&str],
+        delivery: &Delivery,
+    ) -> Result<Event, RelayError> {
         let text = fit(text);
         let at = u64::try_from(delivery.at.timestamp()).unwrap_or_default();
-        buzz_sdk::builders::build_message(channel, &text, None, mentions, false, &[], &[])
+        buzz_sdk::builders::build_message(channel, &text, thread, mentions, false, &[], &[])
             .map_err(|e| RelayError::Rejected(e.to_string()))?
             .custom_created_at(Timestamp::from_secs(at))
             .sign_with_keys(&self.keys)
@@ -92,6 +123,18 @@ impl Relay for RelayAdapter {
         delivery: &Delivery,
     ) -> Result<EventId, RelayError> {
         self.publish(self.build(channel, text, &[agent.as_str()], delivery)?)
+            .await
+    }
+
+    async fn post_reply(
+        &self,
+        channel: ChannelId,
+        root: &EventId,
+        agent: &Pubkey,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError> {
+        self.publish(self.build_reply(channel, root, text, &[agent.as_str()], delivery)?)
             .await
     }
 }
@@ -171,6 +214,51 @@ mod tests {
         assert!(tags.contains(&vec!["h".into(), channel().to_string()]));
         assert!(tags.contains(&vec!["p".into(), agent]));
         assert!(event.verify().is_ok());
+    }
+
+    #[test]
+    fn a_reply_points_at_its_root_and_mentions_the_agent() {
+        let adapter = adapter();
+        let agent = Keys::generate().public_key().to_hex();
+        let root = adapter
+            .build(channel(), "stage task", &[&agent], &delivery(1_700_000_000))
+            .unwrap();
+        let reply = adapter
+            .build_reply(
+                channel(),
+                &root.id.to_hex(),
+                "round 2",
+                &[&agent],
+                &delivery(1_700_000_001),
+            )
+            .unwrap();
+        let tags: Vec<Vec<String>> = reply.tags.iter().map(|t| t.clone().to_vec()).collect();
+        let root_id = root.id.to_hex();
+        assert!(
+            tags.iter()
+                .any(|t| t[0] == "e" && t[1] == root_id && t.get(3).is_some_and(|m| m == "reply")),
+            "{tags:?}"
+        );
+        assert!(tags.contains(&vec!["p".into(), agent.clone()]));
+        assert!(reply.verify().is_ok());
+        let again = adapter
+            .build_reply(
+                channel(),
+                &root.id.to_hex(),
+                "round 2",
+                &[&agent],
+                &delivery(1_700_000_001),
+            )
+            .unwrap();
+        assert_eq!(reply.id, again.id, "a retry builds the same reply");
+    }
+
+    #[test]
+    fn a_reply_to_a_root_that_is_not_an_event_id_is_refused() {
+        let error = adapter()
+            .build_reply(channel(), &"nope".to_owned(), "x", &[], &delivery(1))
+            .unwrap_err();
+        assert!(matches!(error, RelayError::Rejected(_)), "{error}");
     }
 
     #[test]

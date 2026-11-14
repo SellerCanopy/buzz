@@ -68,6 +68,21 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     ("result.reported", 7),
     // The run ended. Its payload names the outcome.
     ("run.ended", 7),
+    // The run left a stage for another, or for the end. The payload has the result and
+    // whether the route went backward.
+    ("stage.routed", 8),
+    // The run waits for a person: a route that asks, a loop limit, a stage this build cannot
+    // run, or a repeat that stalled. The payload has the reason.
+    ("run.waiting", 8),
+    // The run is held before a stage, or a person paused it.
+    ("run.paused", 8),
+    ("run.resumed", 8),
+    // A stage never ran: its conditions were not met, or a person skipped it.
+    ("card.skipped", 8),
+    ("condition.unmet", 8),
+    // A round of a repeat stage began, and ended with the plan's progress.
+    ("round.started", 8),
+    ("round.ended", 8),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

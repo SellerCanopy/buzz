@@ -46,6 +46,11 @@ pub const ROUTES: &[(&str, Level)] = &[
     // the community's own.
     ("SetSetting", Level::Run),
     ("ListAgents", Level::Read),
+    ("SkipStage", Level::Run),
+    ("PauseCard", Level::Run),
+    ("ResumeCard", Level::Run),
+    ("SetCardWorkflow", Level::Run),
+    ("MoveCard", Level::Run),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -199,5 +204,29 @@ pub fn router(app: &App) -> Router<App> {
         .route(
             &path("ListAgents"),
             unary(app.clone(), needs("ListAgents"), agents::list_agents),
+        )
+        .route(
+            &path("SkipStage"),
+            unary(app.clone(), needs("SkipStage"), stages::skip_stage),
+        )
+        .route(
+            &path("PauseCard"),
+            unary(app.clone(), needs("PauseCard"), stages::pause_card),
+        )
+        .route(
+            &path("ResumeCard"),
+            unary(app.clone(), needs("ResumeCard"), stages::resume_card),
+        )
+        .route(
+            &path("SetCardWorkflow"),
+            unary(
+                app.clone(),
+                needs("SetCardWorkflow"),
+                cards::set_card_workflow,
+            ),
+        )
+        .route(
+            &path("MoveCard"),
+            unary(app.clone(), needs("MoveCard"), stages::move_card),
         )
 }

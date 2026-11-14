@@ -320,19 +320,29 @@ impl RunsRepo for MemTx {
             .map(|(_, r)| r.clone()))
     }
 
-    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError> {
-        Ok(self
+    async fn visit_counts(
+        &mut self,
+        card: uuid::Uuid,
+    ) -> Result<std::collections::BTreeMap<String, u32>, StoreError> {
+        let mut counts = std::collections::BTreeMap::<String, u32>::new();
+        let mut note = |stage: &str, visit: u32| {
+            let seen = counts.entry(stage.to_owned()).or_default();
+            *seen = (*seen).max(visit);
+        };
+        for (_, run) in self
             .work
             .runs
             .iter()
-            .filter(|(c, r)| {
-                *c == self.community
-                    && r.card_id == card
-                    && r.current_stage.as_deref() == Some(stage)
-            })
-            .map(|(_, r)| r.visit)
-            .max()
-            .unwrap_or(0))
+            .filter(|(c, r)| *c == self.community && r.card_id == card)
+        {
+            if let Some(stage) = &run.current_stage {
+                note(stage, run.visit);
+            }
+            for step in &run.steps {
+                note(&step.stage, step.visit);
+            }
+        }
+        Ok(counts)
     }
 
     async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError> {

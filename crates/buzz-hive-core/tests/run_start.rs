@@ -10,7 +10,7 @@ use buzz_hive_core::orchestrator::run::start_run;
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::OpError;
 use buzz_hive_core::ports::store::{Posting, Store};
-use buzz_hive_core::rules::run::{entry_stage, step, task_key, Effect, Input};
+use buzz_hive_core::rules::run::{entry_stage, step, task_key, Effect, Facts, Input};
 use buzz_hive_core::testing::{FakeDirectory, FakeRelay};
 use common::{catalog, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
 use serde_json::json;
@@ -66,8 +66,11 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
     let started = step(
         &run,
         wf,
+        &Facts::default(),
         Input::Start {
             requester: Some("aa".into()),
+            stage: None,
+            held: false,
         },
     );
     assert_eq!(started.run.state, RunState::Running);
@@ -83,6 +86,7 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
             Effect::Emit { kind, .. } => *kind,
             Effect::PostStatus { .. } => "status",
             Effect::PostStageTask { .. } => "task",
+            Effect::PostReply { .. } => "reply",
         })
         .collect();
     assert_eq!(kinds, ["run.started", "status", "task"]);
@@ -101,14 +105,21 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
     }
 
     // A run that has started is unchanged, so a repeated Start posts nothing twice.
-    let again = step(&started.run, wf, Input::Start { requester: None });
+    let start = || Input::Start {
+        requester: None,
+        stage: None,
+        held: false,
+    };
+    let again = step(&started.run, wf, &Facts::default(), start());
     assert_eq!(again.run, started.run);
     assert!(again.effects.is_empty());
 
     // A visit counts the stage's earlier visits.
-    let mut revisit = run.clone();
-    revisit.visit = 2;
-    let third = step(&revisit, wf, Input::Start { requester: None });
+    let earlier = Facts {
+        visits: [("research".to_owned(), 2)].into(),
+        ..Facts::default()
+    };
+    let third = step(&run, wf, &earlier, start());
     assert_eq!(third.run.visit, 3);
 }
 
@@ -116,10 +127,17 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
 fn the_entry_stage_needs_a_prompt_stage_with_an_agent() {
     let catalog = catalog();
     assert_eq!(
-        entry_stage(catalog.get("demo").unwrap()).unwrap().1,
+        entry_stage(catalog.get("demo").unwrap(), None).unwrap().1,
         "builder"
     );
-    let message = entry_stage(catalog.get("noagent").unwrap()).unwrap_err();
+    let message = entry_stage(catalog.get("noagent").unwrap(), None).unwrap_err();
+    assert!(message.contains("names no agent"), "{message}");
+    // A stage the person names is the entry, wherever it sits in the file.
+    let build = entry_stage(catalog.get("demo").unwrap(), Some("build")).unwrap();
+    assert_eq!(build.0.id, "build");
+    let message = entry_stage(catalog.get("demo").unwrap(), Some("nope")).unwrap_err();
+    assert!(message.contains("has no stage nope"), "{message}");
+    let message = entry_stage(catalog.get("noagent").unwrap(), None).unwrap_err();
     assert!(message.contains("names no agent"), "{message}");
 }
 

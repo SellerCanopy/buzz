@@ -44,7 +44,9 @@ service EngineService {
   // watching from that seq misses no later change.
   rpc ListCards(ListCardsRequest) returns (ListCardsResponse);
   // StartStage starts a stage on a card. It fails with FailedPrecondition,
-  // naming the active run, when the card's issue already has one.
+  // naming the active run, when the card's issue already has one. Beehive:
+  // the run starts at stage_id, or at the workflow's first stage, and
+  // its agent is mentioned in a new top-level post in the update channel.
   rpc StartStage(StartStageRequest) returns (Run);
   // StageDone reports the result of the card's running stage. Beehive: new
   // rpc. Only the Buzz agent the stage's task mentioned may call it, whatever
@@ -326,16 +328,23 @@ service EngineService {
   // SkipStage moves the card on as if its current stage had reported
   // passed, with no run, and records card.skipped. A card with an
   // unfinished run fails with FailedPrecondition "Stop the current stage
-  // first"; a card with no stage is InvalidArgument.
+  // first"; a card with no stage is InvalidArgument. Beehive: the card's
+  // run must be waiting or paused, and the stage is marked skipped. A card
+  // with no run, or whose run is running, is FailedPrecondition.
   rpc SkipStage(SkipStageRequest) returns (Card);
   // PauseCard holds the card so nothing starts it, across restarts too. Its
   // live run is halted and paused, the way quitting pauses it. Pausing a
-  // held card changes nothing.
+  // held card changes nothing. Beehive: only a running run can be paused.
+  // The stage's agent is told nothing, and its report is refused until the
+  // card is resumed. A card with no run, or whose run is not running, is
+  // FailedPrecondition.
   rpc PauseCard(PauseCardRequest) returns (Card);
   // ResumeCard clears the hold and reruns what it stopped: a paused run
   // gets its stage's next attempt, and an idle card owed a start
   // starts. With nothing to run the Run is empty, with id 0. A card that is
-  // not held fails with FailedPrecondition.
+  // not held fails with FailedPrecondition. Beehive: a paused run goes back
+  // to running, and a stage held before it started posts its task. The Run
+  // is the run that was resumed.
   rpc ResumeCard(ResumeCardRequest) returns (Run);
   // PauseAll pauses every live run that holds an agent session, the way
   // quitting does, while the engine keeps running. Each paused run gets an
@@ -361,7 +370,14 @@ service EngineService {
   // that has run, is not idle, is archived or is a test card is refused, and
   // an unknown workflow is NotFound. An empty workflow sends a card back to
   // Backlog. It publishes card.workflow_changed for each card that changed.
+  // Beehive: it publishes card.moved, and a card that has a run is refused.
   rpc SetCardWorkflow(SetCardWorkflowRequest) returns (SetCardWorkflowResponse);
+  // MoveCard is the stage's agent moving its own card to another stage, in
+  // place of the route its result would give. Beehive: new rpc. Only the
+  // Buzz agent the stage task mentioned may call it, and only when the
+  // workflow sets side_effects.agent_moves_cards. An unknown stage is
+  // InvalidArgument.
+  rpc MoveCard(MoveCardRequest) returns (Run);
   // ArchiveCards sets cards aside, all or nothing. A card with an unfinished
   // run is FailedPrecondition until the run is stopped, and a test card is
   // NotFound. An archived card leaves the board, keeps its runs and costs,
@@ -677,6 +693,34 @@ message Run {
   int32 visit = 17;
   // The model of the run's newest stage session. Empty before one opens.
   string model = 18;
+  // Beehive: the stages the run has entered, oldest first. A stage entered
+  // again is a new entry. The rounds of a repeating stage share one entry.
+  repeated RunStep steps = 19;
+}
+
+// RunStep is one stage a run entered.
+message RunStep {
+  string stage = 1;
+  // The thread the stage's task was posted under, from 1.
+  int32 visit = 2;
+  // The round of a repeating stage, from 1.
+  int32 round = 3;
+  // The last result the stage's agent reported. Empty while none has.
+  string result = 4;
+  string summary = 5;
+  // Where the stage sent the card: a stage id, done or stop. Empty while the
+  // card is still in the stage.
+  string routed_to = 6;
+  // True when routed_to is this stage or an earlier one.
+  bool backward = 7;
+  // True when the workflow holds the card before this stage until it is
+  // resumed.
+  bool held = 8;
+  // True when the stage never ran: its conditions were not met or a person
+  // skipped it.
+  bool skipped = 9;
+  // Times the card was resumed while the stage was running.
+  int32 resumes = 10;
 }
 
 // RunHolder is the engine process that holds a run.
@@ -792,8 +836,8 @@ message StartStageRequest {
   // Beehive: the card's UUID.
   string card_id = 1;
   // Empty starts the card's current stage, or the first stage when the card
-  // has none. Beehive: only empty is accepted until Phase 8, and the run
-  // starts at the workflow's first stage.
+  // has none. Beehive: empty starts at the workflow's first stage, and a
+  // stage the workflow does not have is INVALID_ARGUMENT.
   string stage_id = 2;
   // Parameter values by the name the workflow's package declares. They
   // are the new run's own settings (params.<name>). An undeclared name or a
@@ -854,11 +898,13 @@ message Approval {
 }
 
 message SkipStageRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
 }
 
 message PauseCardRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
 }
 
 message PauseAllRequest {}
@@ -869,7 +915,8 @@ message PauseAllResponse {
 }
 
 message ResumeCardRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
 }
 
 message ResetCardRequest {
@@ -885,7 +932,8 @@ message RemoveCardResponse {}
 // CardWorkflow is one card's new workflow. An empty workflow sends the card
 // back to Backlog.
 message CardWorkflow {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   string workflow = 2;
 }
 
@@ -896,6 +944,13 @@ message SetCardWorkflowRequest {
 // SetCardWorkflowResponse holds the cards after the move, in request order.
 message SetCardWorkflowResponse {
   repeated Card cards = 1;
+}
+
+message MoveCardRequest {
+  // The card's UUID, which the stage task names.
+  string card_id = 1;
+  // The stage to move the card to.
+  string stage_id = 2;
 }
 
 message ArchiveCardsRequest {

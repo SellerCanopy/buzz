@@ -51,4 +51,15 @@ pub trait Relay: Send + Sync {
         text: &str,
         delivery: &Delivery,
     ) -> Result<EventId, RelayError>;
+
+    /// A reply in the thread `root` opened, in `channel`, that mentions `agent`. Returns the
+    /// reply's event id.
+    async fn post_reply(
+        &self,
+        channel: ChannelId,
+        root: &EventId,
+        agent: &Pubkey,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError>;
 }

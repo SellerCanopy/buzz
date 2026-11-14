@@ -36,7 +36,7 @@ pub const CHANNEL: uuid::Uuid = uuid::Uuid::from_u128(77);
 
 /// A package whose first stage names the agent `builder` and takes the parameter `depth`.
 pub fn catalog() -> Catalog {
-    let files = MemSource::new()
+    let mut files = MemSource::new()
         .with(
             "demo/kiln-package.yaml",
             "name: demo\nversion: 1.0.0\nparameters:\n  - name: depth\n    type: choice\n    choices: [normal, deep]\n    default: normal\n",
@@ -58,6 +58,72 @@ pub fn catalog() -> Catalog {
             "noagent/workflow.yaml",
             "version: 2\nstages:\n  - id: a\n    kind: prompt\n    prompt: Do it\n",
         );
+    // Workflows that route a card. Each stage is a prompt stage worked by `builder`.
+    let stage = |id: &str, extra: &str| {
+        format!("  - id: {id}\n    kind: prompt\n    agent: builder\n    prompt: Do {id}\n{extra}")
+    };
+    let routed = [
+        (
+            "three",
+            [stage("a", ""), stage("b", ""), stage("c", "")].concat(),
+        ),
+        // A repeat stage whose rounds each open a new thread.
+        (
+            "fresh",
+            stage(
+                "work",
+                "    repeat:\n      until: agent_done\n      fresh_session: true\n",
+            ),
+        ),
+        // A repeat stage whose rounds reply in its one thread.
+        (
+            "plain",
+            stage(
+                "work",
+                "    repeat:\n      until: agent_done\n      max_rounds: 3\n",
+            ),
+        ),
+        // The card waits before b until a person resumes it.
+        (
+            "held",
+            [stage("a", ""), stage("b", "    pause: true\n")].concat(),
+        ),
+        // b needs a label the card does not have, and goes to c without it.
+        (
+            "cond",
+            [
+                stage("a", ""),
+                stage(
+                    "b",
+                    "    conditions:\n      labels: [frontend]\n      else: c\n",
+                ),
+                stage("c", ""),
+            ]
+            .concat(),
+        ),
+        // b sends a failure back to a, once.
+        (
+            "loop",
+            [
+                stage("a", ""),
+                stage("b", "    on:\n      failed: a\n    loop_limit: 1\n"),
+            ]
+            .concat(),
+        ),
+        // Where a finished card can be handed on to.
+        ("second", stage("s1", "")),
+    ];
+    for (name, stages) in routed {
+        files = files
+            .with(
+                &format!("{name}/kiln-package.yaml"),
+                format!("name: {name}\nversion: 1.0.0\n"),
+            )
+            .with(
+                &format!("{name}/workflow.yaml"),
+                format!("version: 2\nstages:\n{stages}"),
+            );
+    }
     load(&[Source::new("test", false, files)])
 }
 

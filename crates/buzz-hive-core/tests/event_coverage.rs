@@ -13,12 +13,12 @@ use buzz_hive_core::orchestrator::cards::{
     NewCard,
 };
 use buzz_hive_core::orchestrator::outbox::drain_outbox;
-use buzz_hive_core::orchestrator::run::{stage_done, start_run};
+use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, stage_done, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::testing::MemStore;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 
-const CURRENT_PHASE: u8 = 7;
+const CURRENT_PHASE: u8 = 8;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -112,12 +112,62 @@ async fn report_scenarios(f: &Fixture) {
     .unwrap();
     start_run(&f.env(), &ctx, card.id).await.unwrap();
     let agent = ctx_for(BUILDER, ActorKind::Agent);
-    stage_done(&f.env(), &agent, card.id, "failed", "no luck")
-        .await
-        .unwrap();
     stage_done(&f.env(), &agent, card.id, "passed", "done")
         .await
         .unwrap();
+}
+
+/// A card on `workflow` whose run has started and whose posts have reached the relay.
+async fn begun(f: &Fixture, workflow: &str) -> uuid::Uuid {
+    let ctx = person();
+    let (card, _) = create_card(
+        &f.store,
+        &ctx,
+        NewCard {
+            title: workflow.into(),
+            workflow: workflow.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    start_run(&f.env(), &ctx, card.id).await.unwrap();
+    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    card.id
+}
+
+/// Phase 8: results route a card, a result with no route waits, a person skips and resumes,
+/// a repeat stage runs rounds, and a stage whose conditions fail is skipped.
+async fn routing_scenarios(f: &Fixture) {
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let report = |card: uuid::Uuid, result: &'static str| {
+        let agent = agent.clone();
+        async move {
+            stage_done(&f.env(), &agent, card, result, "")
+                .await
+                .unwrap();
+            drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+        }
+    };
+
+    // A result with no route waits, and a person skips the stage.
+    let card = begun(f, "three").await;
+    report(card, "passed").await;
+    report(card, "failed").await;
+    skip_stage(&f.env(), &person(), card).await.unwrap();
+
+    // A held stage waits for a person.
+    let card = begun(f, "held").await;
+    report(card, "passed").await;
+    resume_card(&f.env(), &person(), card).await.unwrap();
+
+    // Rounds of a repeat stage.
+    let card = begun(f, "plain").await;
+    report(card, "needs_work").await;
+
+    // Conditions the card does not meet.
+    let card = begun(f, "cond").await;
+    report(card, "passed").await;
 }
 
 #[tokio::test]
@@ -127,6 +177,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     card_scenarios(store).await;
     run_scenarios(&f).await;
     report_scenarios(&f).await;
+    routing_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

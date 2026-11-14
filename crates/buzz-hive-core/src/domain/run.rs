@@ -1,6 +1,9 @@
 //! A run: one pass of a card through its workflow.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, SubsecRound, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Where a run is. The stored text is the lowercase name.
@@ -40,6 +43,54 @@ impl RunState {
     }
 }
 
+/// One entry of a card into a stage during a run. It stays in [`Run::steps`] after the run
+/// leaves the stage, so the Steps tab, the loop limit and the visit count read from it.
+///
+/// A repeat stage keeps one step for all its rounds: `round` counts them and `visit` is the
+/// thread of the latest one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStep {
+    pub stage: String,
+    /// The stage's thread counter at the latest round: the visit its task was posted under.
+    pub visit: u32,
+    /// The round the stage is in, from 1. Only a repeat stage goes past 1.
+    #[serde(default)]
+    pub round: u32,
+    /// Plan items checked after the latest round, for a stage that repeats until its plan
+    /// is complete.
+    #[serde(default)]
+    pub checked: u32,
+    /// Rounds in a row that left `checked` as it was.
+    #[serde(default)]
+    pub unchanged: u32,
+    /// Times the card was resumed while the stage was running.
+    #[serde(default)]
+    pub resumes: u32,
+    /// The last result the stage's agent reported, empty while none has.
+    #[serde(default)]
+    pub result: String,
+    #[serde(default)]
+    pub summary: String,
+    /// Where the stage sent the card: a stage id, `done` or `stop`. `None` while the card is
+    /// still in the stage, and when the route was refused or went to `ask`.
+    #[serde(default)]
+    pub routed_to: Option<String>,
+    /// Whether that route went to this stage or an earlier one.
+    #[serde(default)]
+    pub backward: bool,
+    /// The workflow holds the card before this stage, so its task is not posted until a
+    /// person resumes the card.
+    #[serde(default)]
+    pub held: bool,
+    /// The stage never ran: its conditions were not met, or a person skipped it.
+    #[serde(default)]
+    pub skipped: bool,
+    /// The stage that called this one with a `then`: where the card goes once this stage
+    /// passes. Empty when it follows the stage's own route.
+    #[serde(default)]
+    pub then: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub id: Uuid,
@@ -57,6 +108,10 @@ pub struct Run {
     pub visit: u32,
     /// Pubkey of whoever started the run.
     pub requester: Option<String>,
+    /// Every stage the run has entered, oldest first. The last one is the current stage.
+    pub steps: Vec<RunStep>,
+    /// The run's own parameter values by name, which override the card's and the workflow's.
+    pub parameters: BTreeMap<String, String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
 }
@@ -73,10 +128,17 @@ impl Run {
             current_stage: None,
             visit: 0,
             requester: None,
+            steps: Vec::new(),
+            parameters: BTreeMap::new(),
             // Microseconds, the precision the store keeps, so a stored run equals the one made.
             started_at: Utc::now().trunc_subsecs(6),
             ended_at: None,
         }
+    }
+
+    /// The step the run is in, if it has entered a stage.
+    pub fn current_step(&self) -> Option<&RunStep> {
+        self.steps.last()
     }
 
     /// Whether the run still holds its card.

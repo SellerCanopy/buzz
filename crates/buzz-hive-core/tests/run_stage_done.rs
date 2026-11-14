@@ -11,7 +11,7 @@ use buzz_hive_core::orchestrator::run::{stage_done, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::OpError;
 use buzz_hive_core::ports::store::Store;
-use buzz_hive_core::rules::run::{step, Effect, Input};
+use buzz_hive_core::rules::run::{step, Effect, Ended, Facts, Input};
 use common::{catalog, ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
 use serde_json::json;
 use uuid::Uuid;
@@ -52,11 +52,22 @@ fn kinds(events: &[buzz_hive_core::domain::events::Event]) -> Vec<&str> {
 }
 
 #[test]
-fn the_reducer_records_a_result_and_ends_only_on_a_passed_last_stage() {
+fn the_reducer_routes_a_result_and_ends_only_on_a_passed_last_stage() {
     let catalog = catalog();
     let wf = catalog.get("demo").unwrap();
+    let facts = Facts::default();
     let mut run = Run::new(Uuid::from_u128(5), "demo", &wf.hash());
-    run = step(&run, wf, Input::Start { requester: None }).run;
+    run = step(
+        &run,
+        wf,
+        &facts,
+        Input::Start {
+            requester: None,
+            stage: None,
+            held: false,
+        },
+    )
+    .run;
     assert_eq!(run.current_stage.as_deref(), Some("research"));
 
     let done = |stage: &str, result: &str| Input::StageDone {
@@ -66,30 +77,36 @@ fn the_reducer_records_a_result_and_ends_only_on_a_passed_last_stage() {
     };
 
     // A result from a stage that is not the current one changes nothing.
-    let stale = step(&run, wf, done("build", "passed"));
+    let stale = step(&run, wf, &facts, done("build", "passed"));
     assert_eq!(stale.run, run);
     assert!(stale.effects.is_empty());
 
-    // Passed from a stage that is not the last is recorded and the run stays where it is.
-    let first = step(&run, wf, done("research", "passed"));
-    assert_eq!(first.run, run);
+    // Passed from a stage that is not the last enters the next one, in a new thread.
+    let first = step(&run, wf, &facts, done("research", "passed"));
+    assert_eq!(first.run.current_stage.as_deref(), Some("build"));
+    assert_eq!(first.run.state, RunState::Running);
     let emitted: Vec<&str> = first
         .effects
         .iter()
         .map(|e| match e {
             Effect::Emit { kind, .. } => *kind,
+            Effect::PostStageTask { stage, .. } => {
+                assert_eq!(stage, "build");
+                "task"
+            }
             other => panic!("{other:?}"),
         })
         .collect();
-    assert_eq!(emitted, ["result.reported"]);
+    assert_eq!(emitted, ["result.reported", "stage.routed", "task"]);
 
-    // The last stage ends the run only when it passed.
-    let mut last = run.clone();
-    last.current_stage = Some("build".into());
-    let failed = step(&last, wf, done("build", "failed"));
-    assert_eq!(failed.run.state, RunState::Running);
-    let passed = step(&last, wf, done("build", "passed"));
+    // The last stage ends the run only when it passed. Anything else waits for a person.
+    let last = first.run;
+    let failed = step(&last, wf, &facts, done("build", "failed"));
+    assert_eq!(failed.run.state, RunState::Waiting);
+    assert!(failed.reason.unwrap().contains("reported failed"));
+    let passed = step(&last, wf, &facts, done("build", "passed"));
     assert_eq!(passed.run.state, RunState::Ended);
+    assert_eq!(passed.ended, Some(Ended::Done));
     let emitted: Vec<(&str, serde_json::Value)> = passed
         .effects
         .iter()
@@ -103,7 +120,7 @@ fn the_reducer_records_a_result_and_ends_only_on_a_passed_last_stage() {
     assert_eq!(emitted[1].1["outcome"], "passed");
 
     // An ended run takes no further result.
-    let again = step(&passed.run, wf, done("build", "passed"));
+    let again = step(&passed.run, wf, &facts, done("build", "passed"));
     assert!(again.effects.is_empty());
 }
 
@@ -143,28 +160,63 @@ async fn the_report_works_after_the_task_has_reached_the_relay() {
 }
 
 #[tokio::test]
-async fn a_result_that_does_not_end_the_run_is_recorded_and_the_run_stays_running() {
+async fn a_result_with_no_route_waits_for_a_person_and_the_card_waits() {
     let (f, card_id) = started("solo").await;
     let (run, events) = stage_done(&f.env(), &builder(), card_id, "failed", "no luck")
         .await
         .unwrap();
-    assert_eq!(run.state, RunState::Running);
-    assert_eq!(kinds(&events), ["result.reported"]);
+    assert_eq!(run.state, RunState::Waiting);
+    assert_eq!(
+        kinds(&events),
+        ["result.reported", "run.waiting", "card.state"]
+    );
+    assert_eq!(events[2].payload["state"], "waiting");
+    assert!(events[2].payload["reason"]
+        .as_str()
+        .unwrap()
+        .contains("reported failed"));
     let mut tx = f.store.begin(COMMUNITY).await.unwrap();
     assert_eq!(
         tx.cards().get(card_id).await.unwrap().unwrap().state,
-        CardState::Running
+        CardState::Waiting
+    );
+    drop(tx);
+    // The agent has reported, so a second report is refused until a person moves the card.
+    let error = stage_done(&f.env(), &builder(), card_id, "passed", "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, OpError::FailedPrecondition(m) if m.contains("run is waiting")),
+        "{error:?}"
     );
 }
 
 #[tokio::test]
-async fn a_stage_that_is_not_the_last_stays_running_on_passed() {
+async fn a_passed_stage_that_is_not_the_last_enters_the_next_in_a_new_thread() {
     let (f, card_id) = started("demo").await;
     let (run, events) = stage_done(&f.env(), &builder(), card_id, "passed", "")
         .await
         .unwrap();
     assert_eq!(run.state, RunState::Running);
-    assert_eq!(kinds(&events), ["result.reported"]);
+    assert_eq!(run.current_stage.as_deref(), Some("build"));
+    assert_eq!(kinds(&events), ["result.reported", "stage.routed"]);
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let keys: Vec<String> = tx
+        .outbox()
+        .all()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            format!("kiln:{card_id}:research:1:status"),
+            format!("kiln:{card_id}:research:1"),
+            format!("kiln:{card_id}:build:1"),
+        ]
+    );
 }
 
 #[tokio::test]

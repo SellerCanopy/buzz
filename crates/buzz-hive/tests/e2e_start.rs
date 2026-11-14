@@ -286,6 +286,7 @@ async fn a_started_run_posts_the_status_and_the_task_and_the_relay_returns_both(
                     text,
                     ..
                 } => adapter.post_stage_task(*channel, agent, text, &delivery).await,
+                other => panic!("a one-stage run queues no {other:?}"),
             }
             .expect("a repeat of an accepted post is accepted");
             assert!(events.iter().any(|e| e.id.to_hex() == again));

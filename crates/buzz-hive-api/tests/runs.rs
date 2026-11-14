@@ -260,18 +260,43 @@ async fn an_empty_value_removes_a_setting() {
 }
 
 #[tokio::test]
-async fn stage_choice_and_run_parameters_are_refused_until_a_later_phase() {
+async fn a_stage_that_is_not_there_and_a_parameter_that_is_not_declared_are_refused() {
     let app = with_directory(ready()).await;
     let card = make_card(&app).await;
+    let (status, body) = set_channel(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     for request in [
-        json!({"cardId": card, "stageId": "research"}),
-        json!({"cardId": card, "parameters": {"depth": "deep"}}),
+        json!({"cardId": card, "stageId": "nowhere"}),
+        json!({"cardId": card, "parameters": {"unknown": "x"}}),
+        json!({"cardId": card, "parameters": {"depth": "bogus"}}),
         json!({"cardId": "not-an-id"}),
         json!({}),
     ] {
         let (status, body) = call(&app, "StartStage", OWNER, request.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
     }
+    // Each refusal left the card idle, so a good start still works.
+    let (_, card_now) = call(&app, "GetCard", MEMBER, json!({"cardId": card})).await;
+    assert_eq!(card_now["state"], "idle");
+}
+
+#[tokio::test]
+async fn a_run_starts_at_the_named_stage_with_its_parameters() {
+    let app = with_directory(ready()).await;
+    let card = make_card(&app).await;
+    let (status, body) = set_channel(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, run) = call(
+        &app,
+        "StartStage",
+        OWNER,
+        json!({"cardId": card, "stageId": "research", "parameters": {"depth": "deep"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["stageId"], "research");
+    assert_eq!(run["steps"][0]["stage"], "research");
+    assert_eq!(run["steps"][0]["visit"], 1);
 }
 
 #[tokio::test]

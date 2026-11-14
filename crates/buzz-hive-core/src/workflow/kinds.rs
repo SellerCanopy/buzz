@@ -9,8 +9,8 @@ use crate::domain::workflow::{
 use crate::workflow::actions::check_action;
 use crate::workflow::names::{artifact_name, ARTIFACT_NAME_RULE};
 
-const REPEAT_UNTIL_PLAN_COMPLETE: &str = "plan_complete";
-const REPEAT_UNTIL_AGENT_DONE: &str = "agent_done";
+pub const REPEAT_UNTIL_PLAN_COMPLETE: &str = "plan_complete";
+pub const REPEAT_UNTIL_AGENT_DONE: &str = "agent_done";
 
 /// The findings for the fields the stage's kind owns. A kind that is missing or unknown
 /// has none: the stage check reports it.

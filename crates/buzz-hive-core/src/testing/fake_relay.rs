@@ -12,6 +12,8 @@ pub struct Posted {
     pub mention: Option<Pubkey>,
     pub text: String,
     pub event_id: EventId,
+    /// The thread root of a reply, `None` for a top-level post.
+    pub root: Option<EventId>,
 }
 
 #[derive(Default)]
@@ -62,6 +64,7 @@ impl FakeRelay {
         &self,
         channel: ChannelId,
         mention: Option<&Pubkey>,
+        root: Option<&EventId>,
         text: &str,
         delivery: &Delivery,
     ) -> Result<EventId, RelayError> {
@@ -78,13 +81,14 @@ impl FakeRelay {
             return Ok(known.event_id.clone());
         }
         // The id depends only on what the adapter signs, as a real event id does.
-        let event_id = event_id(channel, mention, text, delivery);
+        let event_id = event_id(channel, mention, root, text, delivery);
         inner.posts.push(Posted {
             key: delivery.key.clone(),
             channel,
             mention: mention.cloned(),
             text: text.to_owned(),
             event_id: event_id.clone(),
+            root: root.cloned(),
         });
         Ok(event_id)
     }
@@ -93,6 +97,7 @@ impl FakeRelay {
 fn event_id(
     channel: ChannelId,
     mention: Option<&Pubkey>,
+    root: Option<&EventId>,
     text: &str,
     delivery: &Delivery,
 ) -> EventId {
@@ -100,6 +105,7 @@ fn event_id(
     let mut hash = Sha256::new();
     hash.update(channel.as_bytes());
     hash.update(mention.map_or("", |m| m.as_str()));
+    hash.update(root.map_or("", |r| r.as_str()));
     hash.update(text);
     hash.update(delivery.at.timestamp().to_le_bytes());
     hex::encode(hash.finalize())
@@ -113,7 +119,7 @@ impl Relay for FakeRelay {
         text: &str,
         delivery: &Delivery,
     ) -> Result<EventId, RelayError> {
-        self.post(channel, None, text, delivery)
+        self.post(channel, None, None, text, delivery)
     }
 
     async fn post_stage_task(
@@ -123,6 +129,17 @@ impl Relay for FakeRelay {
         text: &str,
         delivery: &Delivery,
     ) -> Result<EventId, RelayError> {
-        self.post(channel, Some(agent), text, delivery)
+        self.post(channel, Some(agent), None, text, delivery)
+    }
+
+    async fn post_reply(
+        &self,
+        channel: ChannelId,
+        root: &EventId,
+        agent: &Pubkey,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError> {
+        self.post(channel, Some(agent), Some(root), text, delivery)
     }
 }

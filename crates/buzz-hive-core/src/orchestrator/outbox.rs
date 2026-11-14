@@ -44,7 +44,17 @@ pub async fn drain_outbox(
         let Some(row) = tx.outbox().next(&blocked).await? else {
             return Ok(drained);
         };
-        match send(relay, &row).await {
+        // A reply goes in the thread its stage's task opened. The task was queued first, and a
+        // card's posts go in order, so the thread is there unless the task failed.
+        let root = match &row.posting {
+            Posting::StageReply { stage, visit, .. } => tx
+                .runs()
+                .thread(row.card_id, stage, *visit)
+                .await?
+                .map(|thread| thread.root_event_id),
+            _ => None,
+        };
+        match send(relay, &row, root).await {
             Ok(root) => {
                 tx.outbox().mark_done(row.id).await?;
                 if let Posting::StageTask {
@@ -90,7 +100,11 @@ pub async fn drain_outbox(
     }
 }
 
-async fn send(relay: &dyn Relay, row: &OutboxRow) -> Result<String, RelayError> {
+async fn send(
+    relay: &dyn Relay,
+    row: &OutboxRow,
+    root: Option<String>,
+) -> Result<String, RelayError> {
     let delivery = Delivery {
         key: row.key.clone(),
         at: row.created_at,
@@ -105,6 +119,19 @@ async fn send(relay: &dyn Relay, row: &OutboxRow) -> Result<String, RelayError> 
         } => {
             relay
                 .post_stage_task(*channel, agent, text, &delivery)
+                .await
+        }
+        Posting::StageReply {
+            channel,
+            agent,
+            text,
+            ..
+        } => {
+            let root = root.ok_or_else(|| {
+                RelayError::Unavailable("the thread this reply goes in is not open yet".into())
+            })?;
+            relay
+                .post_reply(*channel, &root, agent, text, &delivery)
                 .await
         }
     }

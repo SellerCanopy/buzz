@@ -4,7 +4,7 @@
 mod support;
 
 use buzz_hive_core::domain::card::{Card, CardState};
-use buzz_hive_core::domain::run::{Run, RunState};
+use buzz_hive_core::domain::run::{Run, RunState, RunStep};
 use buzz_hive_core::ports::store::{CommunityId, Posting, StageThread, Store, StoreError};
 use buzz_hive_store::pg::PgStore;
 use uuid::Uuid;
@@ -70,8 +70,47 @@ async fn a_run_round_trips_and_a_card_has_one_active_run() {
     run.visit = 1;
     run.requester = Some("bb".into());
     tx.runs().update(&run).await.unwrap();
-    assert_eq!(tx.runs().visits(run.card_id, "build").await.unwrap(), 1);
-    assert_eq!(tx.runs().visits(run.card_id, "other").await.unwrap(), 0);
+    let counts = tx.runs().visit_counts(run.card_id).await.unwrap();
+    assert_eq!(
+        counts,
+        [("build".to_owned(), 1)].into(),
+        "a run with no steps counts its stage"
+    );
+    assert!(tx
+        .runs()
+        .visit_counts(Uuid::from_u128(9))
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The steps and parameters of a run come back as written, and every step's visit counts.
+    run.steps = vec![
+        RunStep {
+            stage: "research".into(),
+            visit: 2,
+            round: 3,
+            result: "passed".into(),
+            routed_to: Some("build".into()),
+            ..RunStep::default()
+        },
+        RunStep {
+            stage: "build".into(),
+            visit: 1,
+            round: 1,
+            held: true,
+            ..RunStep::default()
+        },
+    ];
+    run.parameters = [("depth".to_owned(), "deep".to_owned())].into();
+    tx.runs().update(&run).await.unwrap();
+    let stored = tx.runs().get(run.id).await.unwrap().unwrap();
+    assert_eq!(stored.steps, run.steps);
+    assert_eq!(stored.parameters, run.parameters);
+    let counts = tx.runs().visit_counts(run.card_id).await.unwrap();
+    assert_eq!(
+        counts,
+        [("build".to_owned(), 1), ("research".to_owned(), 2)].into()
+    );
 
     // Once the run ends the card can start another.
     run.state = RunState::Ended;
@@ -210,6 +249,25 @@ async fn the_outbox_keeps_one_row_per_key_and_drains_in_order() {
         .done_at
         .is_none());
     assert!(tx.outbox().by_key("missing").await.unwrap().is_none());
+    drop(tx);
+
+    // A reply in a stage's thread is stored and read back whole.
+    let reply = Posting::StageReply {
+        channel: Uuid::from_u128(77),
+        stage: "build".into(),
+        visit: 2,
+        agent_name: "builder".into(),
+        agent: "b1".into(),
+        text: "This is round 2.".into(),
+    };
+    let mut tx = store.begin(community).await.unwrap();
+    assert!(tx.outbox().enqueue("k3", one, &reply).await.unwrap());
+    tx.commit().await.unwrap();
+    let mut tx = store.begin(community).await.unwrap();
+    assert_eq!(
+        tx.outbox().by_key("k3").await.unwrap().unwrap().posting,
+        reply
+    );
     drop(tx);
     let mut other = store.begin(CommunityId::from_u128(2)).await.unwrap();
     assert!(other.outbox().by_key("k1").await.unwrap().is_none());

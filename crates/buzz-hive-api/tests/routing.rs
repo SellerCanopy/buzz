@@ -1,0 +1,243 @@
+//! A card through two stages over HTTP: results route it, a person holds, resumes and skips
+//! it, and a batch of cards is sorted onto a workflow.
+
+mod common;
+
+use std::sync::Arc;
+
+use axum::http::StatusCode;
+use buzz_hive_api::App;
+use buzz_hive_core::access::{ActorKind, Level, RelayRole};
+use buzz_hive_core::testing::{FakeDirectory, MemStore};
+use buzz_hive_core::workflow::source::{MemSource, Source, Sources};
+use common::{app, call, community, AGENT, HIVE, MEMBER, OWNER};
+use serde_json::{json, Value};
+
+const BUILDER: &str = "b1";
+const REVIEWER: &str = "b2";
+const CHANNEL: &str = "00000000-0000-0000-0000-00000000004d";
+
+fn two() -> Arc<Sources> {
+    let files = MemSource::new()
+        .with("two/kiln-package.yaml", "name: two\nversion: 1.0.0\n")
+        .with(
+            "two/workflow.yaml",
+            "version: 2\nstages:\n  - id: build\n    kind: prompt\n    agent: builder\n    prompt: \"Build {{issue.title}}\"\n  - id: review\n    kind: prompt\n    agent: reviewer\n    prompt: \"Review {{issue.title}}\"\n",
+        )
+        .with("one/kiln-package.yaml", "name: one\nversion: 1.0.0\n")
+        .with(
+            "one/workflow.yaml",
+            "version: 2\nstages:\n  - id: only\n    kind: prompt\n    agent: builder\n    prompt: \"Do {{issue.title}}\"\n",
+        );
+    Arc::new(Sources(vec![Source::new("test", false, files)]))
+}
+
+async fn ready() -> App {
+    let channel = uuid::Uuid::parse_str(CHANNEL).unwrap();
+    let directory = FakeDirectory::new()
+        .with_role(OWNER, RelayRole::Owner)
+        .with_role(MEMBER, RelayRole::Member)
+        .with_agent(AGENT, OWNER)
+        .with_named_agent("builder", BUILDER, OWNER)
+        .with_named_agent("reviewer", REVIEWER, OWNER)
+        .with_channel(channel, &[HIVE, BUILDER, REVIEWER]);
+    let base = app(MemStore::new()).await;
+    let app = App {
+        directory: Arc::new(directory),
+        catalog: two(),
+        ..base
+    };
+    let mut tx = app.store.begin(community()).await.unwrap();
+    for agent in [BUILDER, REVIEWER] {
+        tx.access()
+            .set_level(agent, Level::Run, ActorKind::Agent, OWNER)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let (status, saved) = call(
+        &app,
+        "SetSetting",
+        OWNER,
+        json!({"scope": "user", "key": "update_channel", "valueJson": format!("\"{CHANNEL}\"")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    app
+}
+
+async fn card(app: &App, workflow: &str) -> String {
+    let (status, card) = call(
+        app,
+        "CreateCard",
+        OWNER,
+        json!({"title": "Fix the build", "workflow": workflow}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card}");
+    card["id"].as_str().unwrap().to_owned()
+}
+
+/// Whether the outbox has been woken since it was last asked, consuming the wake.
+async fn woken(app: &App) -> Option<()> {
+    tokio::time::timeout(std::time::Duration::from_millis(50), app.outbox.notified())
+        .await
+        .ok()
+}
+
+async fn state(app: &App, card: &str) -> Value {
+    let (_, got) = call(app, "GetCard", MEMBER, json!({"cardId": card})).await;
+    got["state"].clone()
+}
+
+#[tokio::test]
+async fn a_passed_result_moves_the_card_to_the_next_stage() {
+    let app = ready().await;
+    let card = card(&app, "two").await;
+    let (_, run) = call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+    assert_eq!(run["stageId"], "build");
+    // The start left a wake for the drain. Take it, so the next one is the report's.
+    woken(&app).await.expect("a start wakes the outbox");
+    assert!(woken(&app).await.is_none());
+
+    let (status, run) = call(
+        &app,
+        "StageDone",
+        BUILDER,
+        json!({"cardId": card, "result": "passed", "summary": "built"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["state"], "running");
+    assert_eq!(run["stageId"], "review");
+    assert_eq!(run["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(run["steps"][0]["routedTo"], "review");
+    // The review task waits in the outbox, so the report wakes the drain to send it.
+    woken(&app)
+        .await
+        .expect("a report that queues a task wakes the outbox");
+    assert_eq!(run["steps"][0]["summary"], "built");
+
+    // The reviewer's stage is now the one that may report; the builder's is over.
+    let (status, _) = call(
+        &app,
+        "StageDone",
+        BUILDER,
+        json!({"cardId": card, "result": "passed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, run) = call(
+        &app,
+        "StageDone",
+        REVIEWER,
+        json!({"cardId": card, "result": "passed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["state"], "ended");
+    assert_eq!(state(&app, &card).await, "done");
+}
+
+#[tokio::test]
+async fn a_person_holds_resumes_and_skips() {
+    let app = ready().await;
+    let card = card(&app, "two").await;
+    call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+
+    let (status, held) = call(&app, "PauseCard", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["state"], "waiting");
+    let (status, _) = call(
+        &app,
+        "StageDone",
+        BUILDER,
+        json!({"cardId": card, "result": "passed"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "a held card takes no report");
+
+    let (status, run) = call(&app, "ResumeCard", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["state"], "running");
+    assert_eq!(state(&app, &card).await, "running");
+
+    // A running card cannot be skipped or resumed; a held one can be skipped.
+    let (status, _) = call(&app, "SkipStage", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(&app, "ResumeCard", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    call(&app, "PauseCard", OWNER, json!({"cardId": card})).await;
+    let (status, skipped) = call(&app, "SkipStage", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{skipped}");
+    let (_, run) = call(
+        &app,
+        "GetRun",
+        MEMBER,
+        json!({"runId": held_run(&app, &card).await}),
+    )
+    .await;
+    assert_eq!(run["stageId"], "review");
+    assert_eq!(run["steps"][0]["skipped"], true);
+}
+
+async fn held_run(app: &App, card: &str) -> String {
+    let (_, listed) = call(app, "ListRuns", MEMBER, json!({"cardId": card})).await;
+    listed["runs"][0]["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn sorting_cards_is_all_or_nothing() {
+    let app = ready().await;
+    let a = card(&app, "").await;
+    let b = card(&app, "").await;
+
+    let (status, body) = call(
+        &app,
+        "SetCardWorkflow",
+        OWNER,
+        json!({"moves": [{"cardId": a, "workflow": "one"}, {"cardId": b, "workflow": "nowhere"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (_, got) = call(&app, "GetCard", MEMBER, json!({"cardId": a})).await;
+    assert_eq!(
+        got["workflow"].as_str().unwrap_or_default(),
+        "",
+        "the refused batch moved nothing"
+    );
+
+    let (status, body) = call(
+        &app,
+        "SetCardWorkflow",
+        OWNER,
+        json!({"moves": [{"cardId": b, "workflow": "two"}, {"cardId": a, "workflow": "one"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cards"][0]["id"], b);
+    assert_eq!(body["cards"][0]["workflow"], "two");
+    assert_eq!(body["cards"][1]["workflow"], "one");
+
+    let (status, _) = call(&app, "SetCardWorkflow", OWNER, json!({"moves": []})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_agent_may_not_move_a_card_unless_the_workflow_allows_it() {
+    let app = ready().await;
+    let card = card(&app, "two").await;
+    call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+    let (status, body) = call(
+        &app,
+        "MoveCard",
+        BUILDER,
+        json!({"cardId": card, "stageId": "review"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("agent_moves_cards"));
+}

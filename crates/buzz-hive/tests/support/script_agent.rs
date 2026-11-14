@@ -2,6 +2,7 @@
 //! for a message that mentions it, and plays a list of tool calls through the real
 //! `buzz-hive-mcp` binary over stdio.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -45,6 +46,21 @@ pub struct ScriptAgent {
     relay: NostrWsConnection,
     next_id: u64,
     card: Option<String>,
+    /// What each thread has told the agent, by the id of the thread's root event. A real
+    /// agent opens one session per thread, so this is the history that session would hold.
+    sessions: BTreeMap<String, Vec<String>>,
+}
+
+/// The id of the thread `event` belongs to: the root it replies in, or its own id when it
+/// opens a thread.
+pub fn thread_of(event: &nostr::Event) -> String {
+    event
+        .tags
+        .iter()
+        .map(|t| t.clone().to_vec())
+        .find(|t| t[0] == "e")
+        .map(|t| t[1].clone())
+        .unwrap_or_else(|| event.id.to_hex())
 }
 
 /// The built `buzz-hive-mcp`, built now if it is not there. `CARGO_BIN_EXE_*` only covers
@@ -110,6 +126,7 @@ impl ScriptAgent {
             relay,
             next_id: 0,
             card: None,
+            sessions: BTreeMap::new(),
         };
         let init = agent
             .request(
@@ -216,6 +233,10 @@ impl ScriptAgent {
                         .map(|t| t.clone().to_vec())
                         .any(|t| t[0] == "p" && t.get(1) == Some(&me));
                     if mentions_me {
+                        self.sessions
+                            .entry(thread_of(&event))
+                            .or_default()
+                            .push(event.content.clone());
                         return *event;
                     }
                 }
@@ -223,6 +244,16 @@ impl ScriptAgent {
                 Err(e) => panic!("no message mentioned the agent: {e}"),
             }
         }
+    }
+
+    /// The messages the session of the thread rooted at `root` has been told, oldest first.
+    pub fn session(&self, root: &str) -> &[String] {
+        self.sessions.get(root).map_or(&[], Vec::as_slice)
+    }
+
+    /// How many sessions the agent has opened.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Plays the steps in order and returns the reply of each call. A mention is not a reply,

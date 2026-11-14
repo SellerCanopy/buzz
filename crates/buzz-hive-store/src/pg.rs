@@ -574,6 +574,8 @@ type RunRow = (
     Option<String>,
     i32,
     Option<String>,
+    serde_json::Value,
+    serde_json::Value,
     chrono::DateTime<chrono::Utc>,
     Option<chrono::DateTime<chrono::Utc>>,
 );
@@ -583,7 +585,7 @@ macro_rules! select_run {
     ($tail:literal) => {
         concat!(
             "SELECT id, card_id, workflow, workflow_hash, state, current_stage, visit, requester, \
-             started_at, ended_at FROM hive.runs ",
+             steps, parameters, started_at, ended_at FROM hive.runs ",
             $tail
         )
     };
@@ -599,6 +601,8 @@ fn decode_run(row: RunRow) -> Result<Run, StoreError> {
         current_stage,
         visit,
         requester,
+        steps,
+        parameters,
         started_at,
         ended_at,
     ) = row;
@@ -614,19 +618,35 @@ fn decode_run(row: RunRow) -> Result<Run, StoreError> {
         visit: u32::try_from(visit)
             .map_err(|_| StoreError::Conflict(format!("stored visit {visit} for run {id}")))?,
         requester,
+        steps: serde_json::from_value(steps)
+            .map_err(|e| StoreError::Conflict(format!("stored steps of run {id}: {e}")))?,
+        parameters: serde_json::from_value(parameters)
+            .map_err(|e| StoreError::Conflict(format!("stored parameters of run {id}: {e}")))?,
         started_at,
         ended_at,
     })
 }
 
+/// A run's steps and parameters as the JSON the columns hold.
+fn encode_run(run: &Run) -> Result<(serde_json::Value, serde_json::Value), StoreError> {
+    let to_json = |value: Result<serde_json::Value, serde_json::Error>| {
+        value.map_err(|e| StoreError::Conflict(format!("run {} cannot be stored: {e}", run.id)))
+    };
+    Ok((
+        to_json(serde_json::to_value(&run.steps))?,
+        to_json(serde_json::to_value(&run.parameters))?,
+    ))
+}
+
 #[async_trait::async_trait]
 impl RunsRepo for PgTx {
     async fn insert(&mut self, run: &Run) -> Result<(), StoreError> {
+        let (steps, parameters) = encode_run(run)?;
         let inserted = sqlx::query(
             "INSERT INTO hive.runs \
              (community_id, id, card_id, workflow, workflow_hash, state, current_stage, visit, \
-              requester, started_at, ended_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+              requester, steps, parameters, started_at, ended_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
              ON CONFLICT DO NOTHING",
         )
         .bind(self.community)
@@ -638,6 +658,8 @@ impl RunsRepo for PgTx {
         .bind(&run.current_stage)
         .bind(run.visit as i32)
         .bind(&run.requester)
+        .bind(steps)
+        .bind(parameters)
         .bind(run.started_at)
         .bind(run.ended_at)
         .execute(&mut *self.tx)
@@ -678,9 +700,10 @@ impl RunsRepo for PgTx {
     }
 
     async fn update(&mut self, run: &Run) -> Result<(), StoreError> {
+        let (steps, parameters) = encode_run(run)?;
         let updated = sqlx::query(
             "UPDATE hive.runs SET state = $3, current_stage = $4, visit = $5, requester = $6, \
-             ended_at = $7 WHERE community_id = $1 AND id = $2",
+             steps = $7, parameters = $8, ended_at = $9 WHERE community_id = $1 AND id = $2",
         )
         .bind(self.community)
         .bind(run.id)
@@ -688,6 +711,8 @@ impl RunsRepo for PgTx {
         .bind(&run.current_stage)
         .bind(run.visit as i32)
         .bind(&run.requester)
+        .bind(steps)
+        .bind(parameters)
         .bind(run.ended_at)
         .execute(&mut *self.tx)
         .await
@@ -723,18 +748,30 @@ impl RunsRepo for PgTx {
         row.map(decode_run).transpose()
     }
 
-    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError> {
-        let visits: i32 = sqlx::query_scalar(
-            "SELECT COALESCE(max(visit), 0) FROM hive.runs \
-             WHERE community_id = $1 AND card_id = $2 AND current_stage = $3",
+    async fn visit_counts(
+        &mut self,
+        card: uuid::Uuid,
+    ) -> Result<std::collections::BTreeMap<String, u32>, StoreError> {
+        // A run's own `visit` covers a run made before steps were kept.
+        let rows: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT stage, max(visit) FROM ( \
+                 SELECT current_stage AS stage, visit FROM hive.runs \
+                 WHERE community_id = $1 AND card_id = $2 AND current_stage IS NOT NULL \
+                 UNION ALL \
+                 SELECT step ->> 'stage', (step ->> 'visit')::int \
+                 FROM hive.runs, jsonb_array_elements(steps) AS step \
+                 WHERE community_id = $1 AND card_id = $2 \
+             ) AS visits GROUP BY stage",
         )
         .bind(self.community)
         .bind(card)
-        .bind(stage)
-        .fetch_one(&mut *self.tx)
+        .fetch_all(&mut *self.tx)
         .await
         .map_err(unavailable)?;
-        Ok(visits.max(0) as u32)
+        Ok(rows
+            .into_iter()
+            .map(|(stage, visit)| (stage, visit.max(0) as u32))
+            .collect())
     }
 
     async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError> {

@@ -160,14 +160,19 @@ pub trait RunsRepo: Send {
     async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError>;
     /// Like `get`, and holds the run until the transaction ends, so two inputs to one run queue.
     async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError>;
-    /// Writes the run's state, stage, visit, requester and end time. `NotFound` when it does not exist.
+    /// Writes the run's state, stage, visit, requester, steps, parameters and end time.
+    /// `NotFound` when it does not exist.
     async fn update(&mut self, run: &Run) -> Result<(), StoreError>;
     /// A card's runs, or every run, newest first.
     async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError>;
     /// The card's run that has not ended, if any.
     async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError>;
-    /// The highest visit any of the card's runs has made to `stage`, 0 when none has.
-    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError>;
+    /// The highest visit the card's runs have made to each stage that any has entered. A stage
+    /// no run has entered is absent.
+    async fn visit_counts(
+        &mut self,
+        card: uuid::Uuid,
+    ) -> Result<std::collections::BTreeMap<String, u32>, StoreError>;
     /// Records the thread a stage task opened. Recording one already stored changes nothing.
     async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError>;
     async fn thread(
@@ -204,6 +209,16 @@ pub enum Posting {
         /// The name the workflow gives the agent.
         agent_name: String,
         /// The agent's pubkey when the post was queued.
+        agent: Pubkey,
+        text: String,
+    },
+    /// A reply in the thread `visit` of `stage` opened, which mentions the stage's agent. It
+    /// carries a repeat stage's next round, or tells a resumed stage's agent to carry on.
+    StageReply {
+        channel: uuid::Uuid,
+        stage: String,
+        visit: u32,
+        agent_name: String,
         agent: Pubkey,
         text: String,
     },

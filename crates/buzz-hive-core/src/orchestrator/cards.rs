@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{Ctx, OpError};
+use super::{Ctx, Env, OpError};
 use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
 use crate::ports::store::{Store, StoreError, Tx};
@@ -126,6 +126,78 @@ pub async fn update_card(
     }
     let events = tx.commit().await?;
     Ok((card, events))
+}
+
+/// One card's new workflow for [`set_card_workflow`].
+#[derive(Debug, Clone)]
+pub struct CardMove {
+    pub card: Uuid,
+    /// Empty sends the card back to Backlog.
+    pub workflow: String,
+}
+
+/// Sorts cards onto workflows, as a person does by dragging or from the Move menu. All or
+/// nothing: one refused card refuses the batch. A card that has run, is not idle or is archived
+/// is refused, and a workflow that is not loaded is `NotFound`. A card already on its workflow
+/// appends nothing. The cards come back in the order asked.
+pub async fn set_card_workflow(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    moves: &[CardMove],
+) -> Result<(Vec<Card>, Vec<Event>), OpError> {
+    if moves.is_empty() {
+        return Err(OpError::InvalidArgument("moves is empty".into()));
+    }
+    let ids: BTreeSet<Uuid> = moves.iter().map(|m| m.card).collect();
+    if ids.len() != moves.len() {
+        return Err(OpError::InvalidArgument(
+            "a card appears more than once in moves".into(),
+        ));
+    }
+    let mut tx = env.store.begin(ctx.community).await?;
+    // Lock every card first, in id order, before the first append takes the event-log lock.
+    let mut locked = std::collections::BTreeMap::new();
+    for id in &ids {
+        locked.insert(*id, lock(&mut *tx, *id).await?);
+    }
+    let mut moved = Vec::with_capacity(moves.len());
+    for m in moves {
+        let workflow = m.workflow.trim();
+        let mut card = locked[&m.card].clone();
+        if card.archived {
+            return Err(OpError::FailedPrecondition(format!(
+                "card {} is archived; restore it first",
+                card.id
+            )));
+        }
+        if card.state != CardState::Idle {
+            return Err(OpError::FailedPrecondition(format!(
+                "card {} is {}; only an idle card can be sorted",
+                card.id,
+                card.state.as_str()
+            )));
+        }
+        if !tx.runs().list(Some(card.id)).await?.is_empty() {
+            return Err(OpError::FailedPrecondition(format!(
+                "card {} has run; it cannot be sorted again",
+                card.id
+            )));
+        }
+        if !workflow.is_empty() && env.catalog.get(workflow).is_none() {
+            return Err(OpError::NotFound(format!(
+                "workflow {workflow} does not exist"
+            )));
+        }
+        let from = std::mem::replace(&mut card.workflow, workflow.to_owned());
+        if card.workflow != from {
+            tx.cards().update(&card).await?;
+            let payload = json!({ "workflow": card.workflow, "from": from });
+            append(&mut *tx, ctx, "card.moved", card.id, payload).await?;
+        }
+        moved.push(card);
+    }
+    let events = tx.commit().await?;
+    Ok((moved, events))
 }
 
 /// Sets cards aside, all or nothing. A card already archived is left alone and appends

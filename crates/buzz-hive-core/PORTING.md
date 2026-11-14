@@ -112,7 +112,7 @@ spec's title and are confirmed when that phase starts.
 | `browse` | pending (the Go spec browses GitHub issues, which needs intake) | 16 |
 | `builder-run` | pending | 19 |
 | `builder` | pending | 19 |
-| `calls` | pending | 12 |
+| `calls` | pending (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents, so it waits for Phase 9; the spec's inbox and screens are Phase 12) | 12 |
 | `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
@@ -127,8 +127,8 @@ spec's title and are confirmed when that phase starts.
 | `merge` | pending | 18 |
 | `needs-you` | pending | 12 |
 | `newtask` | pending | 16 |
-| `parameters` | pending (`StartStage` refuses `parameters` until the run keeps them, Phase 8) | 8 |
-| `paused-turn` | pending | 12 |
+| `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is Phase 16) | 16 |
+| `paused-turn` | pending (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; the reply that finishes it is the Needs you item, Phase 12) | 12 |
 | `permissions` | pending | 14 |
 | `pick-repo` | pending | 21 |
 | `plugin-command` | dropped (plugins) | 1 |
@@ -251,3 +251,41 @@ spec's title and are confirmed when that phase starts.
 - `buzz-hive-mcp` (new crate): a hand-written rmcp `ServerHandler`, so no `build.rs` is
   needed for runtime tools (TDD spike 5). It signs a NIP-98 event with the agent's key,
   caches the token and renews it 60 seconds early.
+
+
+## Phase 8 deliverables
+
+- Reducer: `rules::step(run, wf, &Facts, Input)` takes `Facts` (the card's labels and the
+  visit counts per stage). `Input::Start` carries the stage to start at and whether it is
+  held. `rules/decide.rs` holds `next_route`, `resolve_route(route, result, then)`,
+  `routes_backward`, `loop_count`, `over_loop_limit` and `retry_decision`;
+  `rules/repeat.rs` holds the repeat rule; `rules/conditions.rs` holds `labels` and `else`.
+- A run holds several steps. A stage entered again is a new step with the next `visit`.
+  The rounds of a repeating stage share one step. Outbox keys are
+  `kiln:{card}:{stage}:{visit}` (task), `...:status`, `...:round:{n}` and `...:resume:{k}`.
+- One thread per stage visit. Entering a stage posts a new top-level mention and the drain
+  records a `stage_threads` row. A repeat round with `fresh_session` bumps the visit and
+  opens a new root. A plain repeat round replies in the stage's root thread through
+  `Relay::post_reply` (`Posting::StageReply`). The reply has `root == parent`, so it
+  carries one `e` tag with the marker `reply`.
+- Migration `0006_run_routing.sql`. Later migrations shift by one (artifacts 0007, timers 0008).
+  `RunsRepo::visits` became `visit_counts`.
+- Served: `SkipStage`, `PauseCard`, `ResumeCard`, `SetCardWorkflow` and `MoveCard` (new rpc,
+  `MoveCardRequest { card_id, stage_id }`), all at Run. `card_id` is a string in the four
+  existing requests. `Run.steps` (new `RunStep`) lists stage, visit, round, result, summary,
+  routed_to, backward, held, skipped and resumes. `StartStage` honors `stage_id` and
+  `parameters`. Skip, pause and resume act on the card's run and return `FailedPrecondition`
+  when there is none. `SetCardWorkflow` refuses a card that has a run.
+- Tool `move_card` works for an agent only when the workflow sets
+  `side_effects.agent_moves_cards` (default false). `skip_stage`, `pause_card`,
+  `resume_card` and `set_card_workflow` are tools too.
+- A failed or `ask` result, a `needs_input` result and a missing result set the card waiting.
+- `calls`: `then` is honored after a `passed` call. `give` waits for Phase 9.
+- A hand-off to a next workflow may leave the card done with an `activity.added` note.
+  A run that ends in its start step does not hand off.
+- Loop count is per run. The Go `card.loop_limit` auto mode does not apply.
+- The card has no labels field yet, so `Facts.labels` is empty until Phase 16 and every
+  stage that needs a label follows `else`. The plan score is (0, 0) until Phase 9.
+- Dropped: `DecidePermission` and `LevelAsks`. Buzz owns who may do what.
+- Tests: `tests/rules_decide.rs`, `tests/routes.rs` (flat, not `tests/scenarios/routes.rs`),
+  `buzz-hive-api/tests/routing.rs` and `buzz-hive/tests/e2e_fresh_session.rs`.

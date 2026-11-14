@@ -2,7 +2,8 @@
 
 use buzz_hive_core::domain::card::Card as DomainCard;
 use buzz_hive_core::domain::events::Event;
-use buzz_hive_core::orchestrator::cards::{self, NewCard};
+use buzz_hive_core::orchestrator::cards::{self, CardMove, NewCard};
+use buzz_hive_core::orchestrator::Env;
 use uuid::Uuid;
 
 use crate::app::App;
@@ -11,6 +12,7 @@ use crate::proto::{
     ActivityAuthor, ActivityEntry, AddNoteRequest, AddNoteResponse, ArchiveCardsRequest,
     ArchiveCardsResponse, Card, CreateCardRequest, CreateTaskRequest, GetCardRequest,
     ListCardsRequest, ListCardsResponse, RemoveCardRequest, RemoveCardResponse, RestoreCardRequest,
+    SetCardWorkflowRequest, SetCardWorkflowResponse,
 };
 use crate::unary::Ctx;
 
@@ -122,6 +124,36 @@ pub async fn remove_card(
     Ok(RemoveCardResponse {})
 }
 
+/// Sorts cards onto workflows, all or nothing.
+pub async fn set_card_workflow(
+    app: App,
+    ctx: Ctx,
+    req: SetCardWorkflowRequest,
+) -> Result<SetCardWorkflowResponse, HiveError> {
+    let moves = req
+        .moves
+        .iter()
+        .map(|m| {
+            Ok(CardMove {
+                card: parse_id(&m.card_id, "card_id")?,
+                workflow: m.workflow.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, HiveError>>()?;
+    let catalog = app.catalog.load();
+    let env = Env {
+        store: app.store.as_ref(),
+        directory: app.directory.as_ref(),
+        catalog: &catalog,
+        hive: &app.hive_pubkey,
+    };
+    let (cards, events) = cards::set_card_workflow(&env, &ctx.op(), &moves).await?;
+    app.bus.publish(&events);
+    Ok(SetCardWorkflowResponse {
+        cards: cards.into_iter().map(|c| to_proto(c, false)).collect(),
+    })
+}
+
 pub async fn add_note(
     app: App,
     ctx: Ctx,
@@ -144,7 +176,7 @@ fn parse_id(value: &str, field: &str) -> Result<Uuid, HiveError> {
         .map_err(|_| HiveError::InvalidArgument(format!("{field} is not a card id")))
 }
 
-fn to_proto(card: DomainCard, with_body: bool) -> Card {
+pub(super) fn to_proto(card: DomainCard, with_body: bool) -> Card {
     Card {
         id: card.id.to_string(),
         title: card.title,
@@ -158,6 +190,15 @@ fn to_proto(card: DomainCard, with_body: bool) -> Card {
         },
         ..Default::default()
     }
+}
+
+/// The card as it is now, for a procedure that returns the card it changed.
+pub(super) async fn card_of(app: &App, ctx: &Ctx, id: Uuid) -> Result<DomainCard, HiveError> {
+    let mut tx = app.store.begin(ctx.community).await?;
+    tx.cards()
+        .get(id)
+        .await?
+        .ok_or_else(|| HiveError::NotFound(format!("card {id} does not exist")))
 }
 
 fn to_activity(event: Event) -> ActivityEntry {

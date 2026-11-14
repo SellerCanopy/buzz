@@ -32,8 +32,8 @@ pub const TOOLS: &[Tool] = &[
         name: "start_run",
         route: "StartStage",
         needs: Level::Run,
-        description: "Start a run of the card's workflow at its first stage. The stage's agent is mentioned in the update channel.",
-        schema: card_id_only,
+        description: "Start a run of the card's workflow at its first stage, or at the stage you name. The stage's agent is mentioned in a new post in the update channel.",
+        schema: start_run,
     },
     Tool {
         name: "stage_done",
@@ -41,6 +41,41 @@ pub const TOOLS: &[Tool] = &[
         needs: Level::Run,
         description: "Report the result of the stage you were asked to do. Only the agent the stage task mentioned may call it. Pass the card_id from the task and one of the results it lists.",
         schema: stage_done,
+    },
+    Tool {
+        name: "move_card",
+        route: "MoveCard",
+        needs: Level::Run,
+        description: "Move the card you are working on to another stage, in place of the route your result would give. Only the agent the stage task mentioned may call it, and only when the workflow allows agents to move cards.",
+        schema: move_card,
+    },
+    Tool {
+        name: "skip_stage",
+        route: "SkipStage",
+        needs: Level::Run,
+        description: "Move a card that is waiting or held on, as if its stage had passed. The stage is marked skipped.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "pause_card",
+        route: "PauseCard",
+        needs: Level::Run,
+        description: "Hold a running card. Its agent's report is refused until the card is resumed.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "resume_card",
+        route: "ResumeCard",
+        needs: Level::Run,
+        description: "Let a held card carry on: a stage held before it started posts its task, and a paused stage runs again.",
+        schema: card_id_only,
+    },
+    Tool {
+        name: "set_card_workflow",
+        route: "SetCardWorkflow",
+        needs: Level::Run,
+        description: "Sort cards onto workflows, all or nothing. A card that is running, waiting, archived or has run is refused. An empty workflow sends a card to Backlog.",
+        schema: set_card_workflow,
     },
     Tool {
         name: "get_card",
@@ -205,6 +240,60 @@ fn create_card() -> Value {
             ),
         ],
         &["title"],
+    )
+}
+
+fn start_run() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            (
+                "stageId",
+                string("The stage to start at. Empty starts at the workflow's first stage."),
+            ),
+            (
+                "parameters",
+                json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Values for the parameters the workflow's package declares, by name.",
+                }),
+            ),
+        ],
+        &["cardId"],
+    )
+}
+
+fn move_card() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            ("stageId", string("The stage to move the card to.")),
+        ],
+        &["cardId", "stageId"],
+    )
+}
+
+fn set_card_workflow() -> Value {
+    object(
+        vec![(
+            "moves",
+            json!({
+                "type": "array",
+                "items": object(
+                    vec![
+                        ("cardId", string("The card's id.")),
+                        (
+                            "workflow",
+                            string("The workflow's name. Empty sends the card to Backlog."),
+                        ),
+                    ],
+                    &["cardId"],
+                ),
+                "description": "The cards to move.",
+            }),
+        )],
+        &["moves"],
     )
 }
 
