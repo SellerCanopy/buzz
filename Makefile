@@ -6,7 +6,7 @@ BUILD_TAG = $(or $(TAG),$(shell git rev-parse --short HEAD))
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test-aws hive-dev sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-env agents-register agents-attest agents-status agents-logs
+.PHONY: help test-aws hive-dev hive-env sync-upstream init plan apply destroy secrets build push deploy rollback backup status logs shell agents-secrets agents-env agents-register agents-attest agents-status agents-logs
 help: ## List available targets
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*## "} {printf "  %-20s %s\n", $$1, $$2}'
@@ -20,6 +20,9 @@ hive-dev: ## Run buzz-hive against the local Postgres (set BUZZ_HIVE_DATABASE_UR
 	BUZZ_HIVE_TOKEN_SECRET=dev-only-secret-dev-only-secret-0123 \
 	BUZZ_HIVE_COMMUNITY_HOST=localhost \
 	cargo run -p buzz-hive
+
+hive-env: ## Create the Beehive secrets in SSM when absent and write .env.hive for deploy/aws/compose.hive.yml
+	@bash $(SCRIPTS)/hive-env.sh
 
 sync-upstream: ## Merge upstream/main into the current branch (never pushes)
 	@bash $(SCRIPTS)/sync-upstream.sh

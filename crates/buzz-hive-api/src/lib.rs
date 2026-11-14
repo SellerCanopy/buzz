@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod cors;
 pub mod error;
 pub mod replay;
 pub mod token;
@@ -24,9 +25,11 @@ pub fn routes() -> Router<App> {
         .route("/auth/token", post(auth::token))
 }
 
-/// Cap request bodies and bind the app state.
+/// Cap request bodies, add the CORS layer for the configured origins and bind the app state.
 pub fn finish(routes: Router<App>, app: App) -> Router {
+    let cors = cors::layer(&app.config.allowed_origins);
     routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(cors)
         .with_state(app)
 }

@@ -1,0 +1,68 @@
+# Adds Beehive to the production stack. Use it after the two upstream files:
+#   docker compose -f deploy/compose/compose.yml -f deploy/compose/compose.caddy.yml \
+#     -f deploy/aws/compose.hive.yml up -d
+# Compose resolves every relative path here against deploy/compose, the folder of the
+# first file. .env.hive (written by `make hive-env`) holds BUZZ_HIVE_DATABASE_URL,
+# BUZZ_HIVE_TOKEN_SECRET, BUZZ_HIVE_PUBLIC_URL, BUZZ_HIVE_COMMUNITY_HOST and
+# BUZZ_HIVE_ALLOWED_ORIGINS, plus BUZZ_HIVE_DB_PASSWORD for the role setup.
+services:
+  relay:
+    environment:
+      # Beehive serves one community, and the relay must not create more. With this
+      # false only the RELAY_URL host is served and no new community can be made.
+      # RELAY_OPERATOR_PUBKEYS stays empty, which also closes provisioning.
+      BUZZ_MULTI_COMMUNITY_RELAY: "false"
+
+  hive-db-init:
+    image: postgres:17-alpine
+    restart: "no"
+    # The relay creates the tables hive-roles.sql grants on, so wait for its migrations.
+    depends_on:
+      relay:
+        condition: service_healthy
+    env_file:
+      - ../../.env.hive
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      PGUSER: ${POSTGRES_USER:-buzz}
+      PGDATABASE: ${POSTGRES_DB:-buzz}
+    volumes:
+      - ../aws/hive-roles.sql:/hive-roles.sql:ro
+    entrypoint:
+      - sh
+      - -c
+      - psql -h postgres -v ON_ERROR_STOP=1 -v hive_password="$$BUZZ_HIVE_DB_PASSWORD" -f /hive-roles.sql
+    networks:
+      - buzz-net
+
+  hive:
+    build:
+      context: ../..
+      dockerfile: deploy/aws/Dockerfile.hive
+    image: ${BUZZ_HIVE_IMAGE:-buzz-hive:local}
+    restart: unless-stopped
+    depends_on:
+      hive-db-init:
+        condition: service_completed_successfully
+    env_file:
+      - ../../.env.hive
+    environment:
+      BUZZ_HIVE_LISTEN: 0.0.0.0:3100
+    # The runtime image has bash but no curl, so probe /healthz over /dev/tcp.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/3100; printf \"GET /healthz HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    networks:
+      - buzz-net
+
+  # Caddy does not wait for hive, so a hive failure never takes the relay offline.
+  caddy:
+    volumes:
+      - ../aws/Caddyfile.hive:/etc/caddy/Caddyfile:ro

@@ -1,13 +1,17 @@
 //! Print a `Nostr <base64>` Authorization value for a NIP-98 POST.
 //!
 //! `BUZZ_TEST_NSEC` holds a hex secret key (a bech32 nsec also works). The URL is
-//! the first argument, default `http://localhost:3100/auth/token`.
+//! the first argument, default `http://localhost:3100/auth/token`. An optional second
+//! argument is the request body, and the event then carries its SHA-256 `payload` tag,
+//! as the relay's operator endpoints require.
 //!
 //! ```text
 //! BUZZ_TEST_NSEC=<hex> cargo run -p buzz-hive --example sign_nip98 -- http://localhost:3100/auth/token
 //! ```
 
 use base64::Engine as _;
+use nostr::hashes::sha256;
+use nostr::hashes::Hash as _;
 use nostr::nips::nip98::{HttpData, HttpMethod};
 use nostr::{EventBuilder, JsonUtil, Keys, Url};
 
@@ -18,7 +22,11 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "http://localhost:3100/auth/token".into());
     let url = Url::parse(&url).expect("the URL is not valid");
-    let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
+    let mut data = HttpData::new(url, HttpMethod::POST);
+    if let Some(body) = std::env::args().nth(2) {
+        data = data.payload(sha256::Hash::hash(body.as_bytes()));
+    }
+    let event = EventBuilder::http_auth(data)
         .sign_with_keys(&keys)
         .expect("sign the event");
     let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());

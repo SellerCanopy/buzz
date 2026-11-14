@@ -52,6 +52,7 @@ async fn run() -> Result<(), String> {
     let app = App {
         config: Arc::new(ApiConfig {
             public_url: config.public_url.clone(),
+            allowed_origins: config.allowed_origins.clone(),
         }),
         store: Arc::new(PgStore::new(pool)),
         directory: Arc::new(relay),

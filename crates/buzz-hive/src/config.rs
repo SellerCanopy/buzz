@@ -11,6 +11,8 @@ pub struct Config {
     pub token_secret: String,
     /// `BUZZ_HIVE_COMMUNITY_HOST`, one community per instance
     pub community_host: String,
+    /// `BUZZ_HIVE_ALLOWED_ORIGINS`, comma separated browser origins. Empty means none.
+    pub allowed_origins: Vec<String>,
 }
 
 impl Config {
@@ -34,6 +36,7 @@ impl Config {
         if token_secret.len() < 32 {
             return Err("BUZZ_HIVE_TOKEN_SECRET must be at least 32 bytes".into());
         }
+        let allowed_origins = parse_origins(get("BUZZ_HIVE_ALLOWED_ORIGINS").as_deref())?;
         Ok(Self {
             database_url: required("BUZZ_HIVE_DATABASE_URL")?,
             listen,
@@ -42,8 +45,30 @@ impl Config {
                 .to_owned(),
             token_secret,
             community_host: required("BUZZ_HIVE_COMMUNITY_HOST")?,
+            allowed_origins,
         })
     }
+}
+
+/// Split a comma separated origin list. An entry must look like `scheme://host[:port]`,
+/// because a typo here would silently turn browser access off.
+fn parse_origins(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    for entry in raw.unwrap_or_default().split(',').map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let valid = entry.split_once("://").is_some_and(|(scheme, host)| {
+            !scheme.is_empty() && !host.is_empty() && !host.contains('/')
+        }) && entry.parse::<axum::http::HeaderValue>().is_ok();
+        if !valid {
+            return Err(format!(
+                "BUZZ_HIVE_ALLOWED_ORIGINS entry {entry:?} is not an origin like https://app.example.org"
+            ));
+        }
+        origins.push(entry.to_owned());
+    }
+    Ok(origins)
 }
 
 #[cfg(test)]
@@ -88,6 +113,40 @@ mod tests {
         let mut pairs = FULL.to_vec();
         pairs[2].1 = "short";
         assert!(Config::from_lookup(env(&pairs)).is_err());
+    }
+
+    #[test]
+    fn origins_default_to_none_and_split_on_commas() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert!(config.allowed_origins.is_empty());
+        let mut pairs = FULL.to_vec();
+        pairs.push((
+            "BUZZ_HIVE_ALLOWED_ORIGINS",
+            " https://app.example.org, http://localhost:1420 ,",
+        ));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(
+            config.allowed_origins,
+            ["https://app.example.org", "http://localhost:1420"]
+        );
+    }
+
+    #[test]
+    fn a_malformed_origin_is_refused() {
+        for bad in [
+            "*",
+            "app.example.org",
+            "https://app.example.org/path",
+            "https://",
+        ] {
+            let mut pairs = FULL.to_vec();
+            pairs.push(("BUZZ_HIVE_ALLOWED_ORIGINS", bad));
+            let error = Config::from_lookup(env(&pairs)).err().unwrap();
+            assert!(
+                error.contains("BUZZ_HIVE_ALLOWED_ORIGINS"),
+                "{bad}: {error}"
+            );
+        }
     }
 
     #[test]

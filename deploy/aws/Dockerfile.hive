@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+# Beehive service image. Build from the repo root:
+#   docker build -f deploy/aws/Dockerfile.hive -t buzz-hive:local .
+# buzz-hive-mcp joins the build in the phase that adds it.
+ARG RUST_VERSION=1.98
+ARG DEBIAN_VERSION=bookworm
+
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential cmake pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+# The cache mounts keep downloaded crates and compiled dependencies between builds,
+# so the binary is copied out of the mounted target directory in the same step.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -p buzz-hive --bin buzz-hive \
+    && install -D -m 0755 target/release/buzz-hive /out/buzz-hive \
+    && strip /out/buzz-hive
+
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+LABEL org.opencontainers.image.title="Buzz Hive" \
+      org.opencontainers.image.description="Beehive workflow engine service for Buzz" \
+      org.opencontainers.image.source="https://github.com/block/buzz" \
+      org.opencontainers.image.licenses="Apache-2.0"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1000 buzz \
+    && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz --create-home --shell /usr/sbin/nologin buzz
+COPY --from=builder /out/buzz-hive /usr/local/bin/buzz-hive
+EXPOSE 3100
+USER buzz:buzz
+WORKDIR /var/lib/buzz
+ENTRYPOINT ["/usr/local/bin/buzz-hive"]

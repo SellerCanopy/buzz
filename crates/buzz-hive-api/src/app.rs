@@ -12,6 +12,8 @@ use crate::token::TokenMinter;
 pub struct ApiConfig {
     /// The origin clients reach, with no trailing slash. NIP-98 events must name it.
     pub public_url: String,
+    /// Origins allowed to call from a browser. Empty means no cross-origin access.
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Clone)]

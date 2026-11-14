@@ -26,6 +26,7 @@ fn app(directory: FakeDirectory, store: MemStore) -> App {
     App {
         config: Arc::new(ApiConfig {
             public_url: PUBLIC_URL.into(),
+            allowed_origins: Vec::new(),
         }),
         store: Arc::new(store),
         directory: Arc::new(directory),
@@ -92,6 +93,7 @@ async fn a_trailing_slash_on_the_public_url_is_ignored() {
     let mut app = app(member(&keys), MemStore::new());
     app.config = Arc::new(ApiConfig {
         public_url: "http://hive.test/".into(),
+        allowed_origins: Vec::new(),
     });
     let (status, _) = send(
         &router(app),
@@ -382,4 +384,37 @@ async fn healthz_answers_without_auth() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_finished_router_answers_a_preflight_only_for_a_configured_origin() {
+    let mut app = app(FakeDirectory::new(), MemStore::new());
+    app.config = Arc::new(ApiConfig {
+        public_url: PUBLIC_URL.into(),
+        allowed_origins: vec!["https://app.example.org".into()],
+    });
+    let router = router(app);
+    let preflight = |origin: &str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/auth/token")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let allowed = router
+        .clone()
+        .oneshot(preflight("https://app.example.org"))
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed.headers()["access-control-allow-origin"],
+        "https://app.example.org"
+    );
+    let other = router
+        .oneshot(preflight("https://other.example.org"))
+        .await
+        .unwrap();
+    assert!(other.headers().get("access-control-allow-origin").is_none());
 }
