@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use buzz_hive_core::bus::Bus;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::resolve::{resolve_actor, Actor};
 
@@ -23,6 +24,8 @@ pub struct App {
     pub directory: Arc<dyn Directory>,
     pub minter: Arc<TokenMinter>,
     pub replay: Arc<ReplayGuard>,
+    /// Wakes parked `PollEvents` calls after a commit.
+    pub bus: Bus,
     pub community: CommunityId,
 }
 

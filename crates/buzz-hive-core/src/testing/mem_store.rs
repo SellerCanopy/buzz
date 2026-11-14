@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::card::Card;
+use crate::domain::events::{check_new, Event};
 use crate::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, Directory, Pubkey, SettingsRepo, Store,
-    StoreError, Tx,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, Directory, EventsRepo, Pubkey, SettingsRepo,
+    Store, StoreError, Tx,
 };
 
 #[derive(Default, Clone)]
@@ -16,11 +17,22 @@ struct State {
     cards: Vec<(CommunityId, Card)>,
 }
 
+/// The committed event log, shared by every transaction. It sits outside `State` so
+/// that a commit adds to it instead of overwriting events another commit added.
+#[derive(Default)]
+struct Log {
+    /// In seq order.
+    events: Vec<(CommunityId, Event)>,
+    /// Every kind ever committed, for the coverage test.
+    kinds: std::collections::BTreeSet<String>,
+}
+
 /// A `Store` held in memory. `begin` copies the state and `commit` swaps the
 /// copy back in, so a dropped `Tx` rolls back.
 #[derive(Default, Clone)]
 pub struct MemStore {
     state: Arc<Mutex<State>>,
+    log: Arc<Mutex<Log>>,
 }
 
 impl MemStore {
@@ -32,6 +44,11 @@ impl MemStore {
     pub fn seed_card(&self, community: CommunityId, card: Card) {
         self.state.lock().unwrap().cards.push((community, card));
     }
+
+    /// Every event kind committed so far, across all communities.
+    pub fn committed_kinds(&self) -> std::collections::BTreeSet<String> {
+        self.log.lock().unwrap().kinds.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -41,7 +58,9 @@ impl Store for MemStore {
         Ok(Box::new(MemTx {
             community,
             work,
+            pending: Vec::new(),
             shared: self.state.clone(),
+            log: self.log.clone(),
         }))
     }
 }
@@ -49,7 +68,10 @@ impl Store for MemStore {
 struct MemTx {
     community: CommunityId,
     work: State,
+    /// Appended in this transaction, with no seq yet.
+    pending: Vec<Event>,
     shared: Arc<Mutex<State>>,
+    log: Arc<Mutex<Log>>,
 }
 
 #[async_trait::async_trait]
@@ -63,9 +85,57 @@ impl Tx for MemTx {
     fn cards(&mut self) -> &mut dyn CardsRepo {
         self
     }
-    async fn commit(self: Box<Self>) -> Result<(), StoreError> {
-        *self.shared.lock().unwrap() = self.work;
+    fn events(&mut self) -> &mut dyn EventsRepo {
+        self
+    }
+    async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
+        let MemTx {
+            community,
+            work,
+            pending,
+            shared,
+            log,
+        } = *self;
+        *shared.lock().unwrap() = work;
+        let mut log = log.lock().unwrap();
+        let mut committed = Vec::with_capacity(pending.len());
+        for mut event in pending {
+            event.seq = log.events.last().map_or(0, |(_, e)| e.seq) + 1;
+            log.kinds.insert(event.kind.clone());
+            log.events.push((community, event.clone()));
+            committed.push(event);
+        }
+        Ok(committed)
+    }
+}
+
+#[async_trait::async_trait]
+impl EventsRepo for MemTx {
+    async fn append(&mut self, event: Event) -> Result<(), StoreError> {
+        check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
+        self.pending.push(event);
         Ok(())
+    }
+
+    async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError> {
+        let log = self.log.lock().unwrap();
+        Ok(log
+            .events
+            .iter()
+            .filter(|(community, event)| *community == self.community && event.seq > seq)
+            .take(limit.max(0) as usize)
+            .map(|(_, event)| event.clone())
+            .collect())
+    }
+
+    async fn latest_seq(&mut self) -> Result<i64, StoreError> {
+        let log = self.log.lock().unwrap();
+        Ok(log
+            .events
+            .iter()
+            .rev()
+            .find(|(community, _)| *community == self.community)
+            .map_or(0, |(_, event)| event.seq))
     }
 }
 
@@ -164,12 +234,64 @@ impl CardsRepo for MemTx {
     }
 
     async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError> {
-        Ok(self
-            .work
+        Ok(self.find(id).map(|(_, card)| card.clone()))
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError> {
+        Ok(self.find(id).map(|(_, card)| card.clone()))
+    }
+
+    async fn insert(&mut self, card: &Card) -> Result<(), StoreError> {
+        if self.find(card.id).is_some() {
+            return Err(StoreError::Conflict(format!("card {} exists", card.id)));
+        }
+        self.work.cards.push((self.community, card.clone()));
+        Ok(())
+    }
+
+    async fn update(&mut self, card: &Card) -> Result<(), StoreError> {
+        let found = self.find_mut(card.id)?;
+        found.title = card.title.clone();
+        found.description = card.description.clone();
+        found.state = card.state;
+        found.workflow = card.workflow.clone();
+        Ok(())
+    }
+
+    async fn set_archived(&mut self, id: uuid::Uuid, archived: bool) -> Result<(), StoreError> {
+        self.find_mut(id)?.archived = archived;
+        Ok(())
+    }
+
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<(), StoreError> {
+        let before = self.work.cards.len();
+        let community = self.community;
+        self.work
+            .cards
+            .retain(|(c, card)| !(*c == community && card.id == id));
+        if self.work.cards.len() == before {
+            return Err(StoreError::NotFound(format!("card {id}")));
+        }
+        Ok(())
+    }
+}
+
+impl MemTx {
+    fn find(&self, id: uuid::Uuid) -> Option<&(CommunityId, Card)> {
+        self.work
             .cards
             .iter()
             .find(|(community, card)| *community == self.community && card.id == id)
-            .map(|(_, card)| card.clone()))
+    }
+
+    fn find_mut(&mut self, id: uuid::Uuid) -> Result<&mut Card, StoreError> {
+        let community = self.community;
+        self.work
+            .cards
+            .iter_mut()
+            .find(|(c, card)| *c == community && card.id == id)
+            .map(|(_, card)| card)
+            .ok_or_else(|| StoreError::NotFound(format!("card {id}")))
     }
 }
 

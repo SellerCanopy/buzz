@@ -22,6 +22,11 @@ service EngineService {
   // live events as they commit, with no gap and no repeat. card_id and
   // types narrow the stream to matching events.
   rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+  // PollEvents returns events with seq greater than after_seq, up to 500, in
+  // order. When there are none it waits up to wait_seconds (at most 25) for
+  // one to commit, then returns an empty list with next_seq unchanged.
+  // Beehive: this replaces WatchEvents.
+  rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
   // CreateCard puts an issue on the board. With a workflow the card sits
   // idle on the workflow's first stage, in To do. With none it goes to
   // Backlog. An issue that already has a card on the same workflow returns
@@ -467,6 +472,19 @@ message WhoAmIResponse {
   string owner = 7;
 }
 
+message PollEventsRequest {
+  // Return events with seq greater than this; 0 starts from the beginning.
+  int64 after_seq = 1;
+  // How long to wait for an event when none is ready. Clamped to 0 to 25.
+  int32 wait_seconds = 2;
+}
+
+message PollEventsResponse {
+  repeated Event events = 1;
+  // The seq to pass as after_seq on the next call.
+  int64 next_seq = 2;
+}
+
 message WatchEventsRequest {
   // Stream events with seq greater than this; 0 streams from the start.
   int64 after_seq = 1;
@@ -486,13 +504,17 @@ message Event {
   int64 seq = 1;
   // One of the event types the engine registers, such as "engine.started".
   string type = 2;
-  // 0 when the event belongs to no run.
-  int64 run_id = 3;
-  // 0 when the event belongs to no card.
-  int64 card_id = 4;
+  // Beehive: the run's UUID, empty when the event belongs to no run.
+  string run_id = 3;
+  // Beehive: the card's UUID, empty when the event belongs to no card.
+  string card_id = 4;
   // The type's payload as JSON.
   string payload_json = 5;
   google.protobuf.Timestamp at = 6;
+  // Beehive: the pubkey of the person or agent that caused the event.
+  string actor_pubkey = 7;
+  // Beehive: person or agent.
+  string actor_kind = 8;
 }
 
 // IssueRef names one issue on one host. Local issues use host and owner
@@ -506,7 +528,8 @@ message IssueRef {
 
 // Card is one issue on the board.
 message Card {
-  int64 id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string id = 1;
   reserved 2, 9;
   reserved "view_id", "lane_id";
   // The workflow package name; empty for a card in Backlog.
@@ -708,6 +731,11 @@ message CreateCardRequest {
   IssueRef issue = 2;
   reserved 3;
   reserved "view_id";
+  // Beehive: the card's title, 1 to 200 characters. A Beehive card has no
+  // issue until intake exists, so `issue` is refused when set.
+  string title = 4;
+  // Beehive: the card's description, up to 65536 characters.
+  string description = 5;
 }
 
 message CreateTaskRequest {
@@ -733,7 +761,8 @@ message CreateTaskRequest {
 }
 
 message GetCardRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
 }
 
 message ListCardsRequest {
@@ -826,7 +855,7 @@ message ResetCardRequest {
 }
 
 message RemoveCardRequest {
-  int64 card_id = 1;
+  string card_id = 1;
 }
 
 message RemoveCardResponse {}
@@ -848,13 +877,13 @@ message SetCardWorkflowResponse {
 }
 
 message ArchiveCardsRequest {
-  repeated int64 card_ids = 1;
+  repeated string card_ids = 1;
 }
 
 message ArchiveCardsResponse {}
 
 message RestoreCardRequest {
-  int64 card_id = 1;
+  string card_id = 1;
 }
 
 message AddIssueRepoRequest {
@@ -2454,7 +2483,7 @@ message ListActivityResponse {
 }
 
 message AddNoteRequest {
-  int64 card_id = 1;
+  string card_id = 1;
   string summary = 2;
   string detail = 3;
 }
@@ -2499,11 +2528,11 @@ message ActivityRef {
 message ActivityEntry {
   int64 seq = 1;
   string key = 2;
-  int64 card_id = 3;
+  string card_id = 3;
   string stage_id = 4;
   int32 visit = 5;
-  // 0 for a note between runs.
-  int64 run_id = 6;
+  // Empty for a note between runs.
+  string run_id = 6;
   // The run_events seq of the entry's activity.added event.
   int64 event_seq = 7;
   google.protobuf.Timestamp at = 8;

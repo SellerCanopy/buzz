@@ -20,6 +20,19 @@ pub struct Ctx {
     pub community: CommunityId,
 }
 
+impl Ctx {
+    /// The caller as the engine's operations and event log see it.
+    pub fn op(&self) -> buzz_hive_core::orchestrator::Ctx {
+        buzz_hive_core::orchestrator::Ctx {
+            community: self.community,
+            actor: buzz_hive_core::domain::events::Actor {
+                pubkey: self.actor.pubkey.clone(),
+                kind: self.actor.kind,
+            },
+        }
+    }
+}
+
 /// A POST route that needs `needs`. The body is Connect JSON; an empty body means `{}`.
 ///
 /// Add it to a router that goes through [`crate::finish`], which caps the body at 16 MiB.

@@ -10,6 +10,7 @@ use buzz_hive_api::routes::{path, ROUTES};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::access::RelayRole;
+use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::ports::store::CommunityId;
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
@@ -41,6 +42,7 @@ fn app(store: MemStore) -> App {
             TokenMinter::new(b"0123456789abcdef0123456789abcdef", Arc::new(SystemClock)).unwrap(),
         ),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        bus: Bus::new(0),
         community: community(),
     }
 }

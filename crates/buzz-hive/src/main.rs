@@ -7,6 +7,7 @@ use std::sync::Arc;
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
+use buzz_hive_core::bus::Bus;
 use buzz_hive_store::pg::PgStore;
 use buzz_hive_store::relay_read::{verify_relay_columns, RelayRead};
 
@@ -61,8 +62,10 @@ async fn run() -> Result<(), String> {
             Arc::new(SystemClock),
         )?),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        bus: Bus::new(0),
         community,
     };
+    let bus = app.bus.clone();
     let router = buzz_hive_api::finish(buzz_hive_api::routes(&app), app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
@@ -70,7 +73,11 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, %community, "buzz-hive started");
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            // Parked polls would otherwise hold the shutdown for up to 25 seconds.
+            bus.close();
+        })
         .await
         .map_err(|e| format!("server error: {e}"))
 }

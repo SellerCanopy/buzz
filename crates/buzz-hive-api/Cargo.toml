@@ -37,4 +37,6 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 buzz-hive-core = { path = "../buzz-hive-core", features = ["testing"] }
 tower = { workspace = true }
+# `start_paused` for the poll wait tests.
+tokio = { workspace = true, features = ["test-util"] }
 hex = { workspace = true }

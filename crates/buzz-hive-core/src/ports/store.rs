@@ -2,6 +2,7 @@
 
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::card::Card;
+use crate::domain::events::Event;
 
 pub type CommunityId = uuid::Uuid;
 /// 64 hex characters, lowercase.
@@ -20,17 +21,30 @@ pub enum StoreError {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync {
     async fn begin(&self, community: CommunityId) -> Result<Box<dyn Tx>, StoreError>;
+
+    /// Committed events of a community with seq greater than `after_seq`, oldest first.
+    async fn events_after(
+        &self,
+        community: CommunityId,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut tx = self.begin(community).await?;
+        tx.events().after(after_seq, limit).await
+    }
 }
 
 /// One transaction. Dropping it without `commit` rolls it back.
 ///
-/// `commit` returns `()` in this phase and `Vec<Event>` from Phase 4.
+/// `commit` returns the events appended in the transaction with their seq assigned.
+/// The caller publishes them on the [`crate::bus::Bus`] once the commit has succeeded.
 #[async_trait::async_trait]
 pub trait Tx: Send {
     fn access(&mut self) -> &mut dyn AccessRepo;
     fn settings(&mut self) -> &mut dyn SettingsRepo;
     fn cards(&mut self) -> &mut dyn CardsRepo;
-    async fn commit(self: Box<Self>) -> Result<(), StoreError>;
+    fn events(&mut self) -> &mut dyn EventsRepo;
+    async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -68,6 +82,27 @@ pub trait CardsRepo: Send {
     /// The board's cards, newest first, or the archive when `archived` is set.
     async fn list(&mut self, archived: bool) -> Result<Vec<Card>, StoreError>;
     async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError>;
+    /// Like `get`, and holds the card until the transaction ends, so two changes to one card queue.
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError>;
+    /// `Conflict` when the id is taken.
+    async fn insert(&mut self, card: &Card) -> Result<(), StoreError>;
+    /// Writes the card's title, description, state and workflow. `NotFound` when it does not exist.
+    async fn update(&mut self, card: &Card) -> Result<(), StoreError>;
+    /// Sets the card aside, or brings it back. `NotFound` when it does not exist.
+    async fn set_archived(&mut self, id: uuid::Uuid, archived: bool) -> Result<(), StoreError>;
+    /// `NotFound` when it does not exist.
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<(), StoreError>;
+}
+
+#[async_trait::async_trait]
+pub trait EventsRepo: Send {
+    /// Adds an event to the log. The kind must pass [`crate::domain::events::check_new`].
+    /// The seq is assigned by the store and returned by `Tx::commit`.
+    async fn append(&mut self, event: Event) -> Result<(), StoreError>;
+    /// Committed events with seq greater than `seq`, oldest first, at most `limit`.
+    async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError>;
+    /// The newest committed seq of this community, 0 when there is none.
+    async fn latest_seq(&mut self) -> Result<i64, StoreError>;
 }
 
 /// Relay facts, read-only. Implemented by `buzz-hive-store::relay_read`.

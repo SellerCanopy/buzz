@@ -147,3 +147,207 @@ async fn cards_list_newest_first_by_board_or_archive_and_stay_in_their_community
         "another community's card"
     );
 }
+
+fn actor(pubkey: &str) -> buzz_hive_core::domain::events::Actor {
+    buzz_hive_core::domain::events::Actor {
+        pubkey: pubkey.into(),
+        kind: ActorKind::Person,
+    }
+}
+
+fn event(kind: &str, card: Option<uuid::Uuid>) -> buzz_hive_core::domain::events::Event {
+    buzz_hive_core::domain::events::Event::new(
+        kind,
+        card,
+        None,
+        actor("aa"),
+        serde_json::json!({ "n": 1 }),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn cards_insert_update_archive_restore_and_delete() {
+    use buzz_hive_core::domain::card::{Card, CardState};
+    let (store, _guard, _relay) = store("hive_store_cardops").await;
+    let community = CommunityId::from_u128(1);
+    let card = Card {
+        id: uuid::Uuid::new_v4(),
+        title: "t".into(),
+        description: "d".into(),
+        state: CardState::Idle,
+        workflow: String::new(),
+        archived: false,
+        created_by: "aa".into(),
+    };
+
+    let mut tx = store.begin(community).await.unwrap();
+    tx.cards().insert(&card).await.unwrap();
+    assert!(
+        matches!(
+            tx.cards().insert(&card).await,
+            Err(buzz_hive_core::ports::store::StoreError::Conflict(_))
+        ),
+        "a taken id"
+    );
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin(community).await.unwrap();
+    let mut changed = tx.cards().get_for_update(card.id).await.unwrap().unwrap();
+    assert_eq!(changed, card);
+    changed.workflow = "rpi".into();
+    changed.state = CardState::Running;
+    tx.cards().update(&changed).await.unwrap();
+    tx.cards().set_archived(card.id, true).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin(community).await.unwrap();
+    let stored = tx.cards().get(card.id).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.workflow.as_str(), stored.state, stored.archived),
+        ("rpi", CardState::Running, true)
+    );
+    assert_eq!(stored.description, "d");
+    tx.cards().set_archived(card.id, false).await.unwrap();
+    tx.cards().delete(card.id).await.unwrap();
+    assert!(matches!(
+        tx.cards().delete(card.id).await,
+        Err(buzz_hive_core::ports::store::StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        tx.cards().update(&card).await,
+        Err(buzz_hive_core::ports::store::StoreError::NotFound(_))
+    ));
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin(community).await.unwrap();
+    assert_eq!(tx.cards().get(card.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn events_get_a_seq_on_commit_and_a_rolled_back_append_leaves_none() {
+    let (store, _guard, _relay) = store("hive_store_events").await;
+    let one = CommunityId::from_u128(1);
+    let two = CommunityId::from_u128(2);
+    let card = uuid::Uuid::new_v4();
+
+    let mut tx = store.begin(one).await.unwrap();
+    tx.events()
+        .append(event("card.created", Some(card)))
+        .await
+        .unwrap();
+    tx.events()
+        .append(event("card.state", Some(card)))
+        .await
+        .unwrap();
+    let committed = tx.commit().await.unwrap();
+    assert_eq!(committed.len(), 2);
+    assert!(committed[0].seq > 0 && committed[1].seq == committed[0].seq + 1);
+
+    {
+        let mut tx = store.begin(one).await.unwrap();
+        tx.events()
+            .append(event("card.removed", Some(card)))
+            .await
+            .unwrap();
+    }
+    let mut tx = store.begin(two).await.unwrap();
+    tx.events()
+        .append(event("card.created", None))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin(one).await.unwrap();
+    let all = tx.events().after(0, 10).await.unwrap();
+    assert_eq!(
+        all.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        ["card.created", "card.state"],
+        "no rolled-back event and nothing from another community"
+    );
+    assert_eq!(
+        all[0], committed[0],
+        "an event reads back as it was committed apart from `at` precision"
+    );
+    assert_eq!(
+        tx.events().after(committed[0].seq, 10).await.unwrap().len(),
+        1
+    );
+    assert_eq!(tx.events().after(0, 1).await.unwrap().len(), 1);
+    assert_eq!(tx.events().latest_seq().await.unwrap(), committed[1].seq);
+    assert_eq!(
+        store.events_after(one, committed[1].seq, 10).await.unwrap(),
+        vec![]
+    );
+    let mut empty = store.begin(CommunityId::from_u128(3)).await.unwrap();
+    assert_eq!(empty.events().latest_seq().await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn an_unlisted_event_kind_is_refused() {
+    let (store, _guard, _relay) = store("hive_store_kind").await;
+    let mut tx = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    assert!(tx
+        .events()
+        .append(event("card.exploded", None))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn parallel_commits_never_show_a_reader_a_gap() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (store, _guard, _relay) = store("hive_store_gap").await;
+    let store = Arc::new(store);
+    let community = CommunityId::from_u128(1);
+    const WRITERS: usize = 20;
+
+    let mut writers = Vec::new();
+    for _ in 0..WRITERS {
+        let store = store.clone();
+        writers.push(tokio::spawn(async move {
+            let mut tx = store.begin(community).await.unwrap();
+            tx.events()
+                .append(event("card.created", None))
+                .await
+                .unwrap();
+            // Hold the transaction open so a later writer would commit first if appends did not queue.
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            tx.commit().await.unwrap();
+        }));
+    }
+    let reader = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                let seqs: Vec<i64> = store
+                    .events_after(community, 0, 100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.seq)
+                    .collect();
+                let first = seqs.first().copied().unwrap_or(1);
+                let expected: Vec<i64> = (first..first + seqs.len() as i64).collect();
+                assert_eq!(seqs, expected, "visible seqs must be consecutive");
+                if seqs.len() == WRITERS {
+                    return seqs;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    let seqs = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("the reader sees every event")
+        .unwrap();
+    assert_eq!(seqs.len(), WRITERS);
+}

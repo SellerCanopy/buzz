@@ -1340,6 +1340,7 @@ dependencies = [
  "async-trait",
  "buzz-db",
  "buzz-hive-core",
+ "chrono",
  "hex",
  "serde_json",
  "sqlx",

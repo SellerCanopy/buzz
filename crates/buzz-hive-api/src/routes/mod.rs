@@ -5,6 +5,7 @@
 //! `engine.proto` is routed, dropped with a reason, or still pending.
 
 mod cards;
+pub mod poll;
 mod status;
 
 use axum::Router;
@@ -18,6 +19,14 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("GetStatus", Level::Read),
     ("WhoAmI", Level::None),
     ("ListCards", Level::Read),
+    ("GetCard", Level::Read),
+    ("CreateCard", Level::Run),
+    ("CreateTask", Level::Run),
+    ("AddNote", Level::Run),
+    ("RemoveCard", Level::Run),
+    ("ArchiveCards", Level::Run),
+    ("RestoreCard", Level::Run),
+    ("PollEvents", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -73,5 +82,37 @@ pub fn router(app: &App) -> Router<App> {
         .route(
             &path("ListCards"),
             unary(app.clone(), needs("ListCards"), cards::list_cards),
+        )
+        .route(
+            &path("GetCard"),
+            unary(app.clone(), needs("GetCard"), cards::get_card),
+        )
+        .route(
+            &path("CreateCard"),
+            unary(app.clone(), needs("CreateCard"), cards::create_card),
+        )
+        .route(
+            &path("CreateTask"),
+            unary(app.clone(), needs("CreateTask"), cards::create_task),
+        )
+        .route(
+            &path("AddNote"),
+            unary(app.clone(), needs("AddNote"), cards::add_note),
+        )
+        .route(
+            &path("RemoveCard"),
+            unary(app.clone(), needs("RemoveCard"), cards::remove_card),
+        )
+        .route(
+            &path("ArchiveCards"),
+            unary(app.clone(), needs("ArchiveCards"), cards::archive_cards),
+        )
+        .route(
+            &path("RestoreCard"),
+            unary(app.clone(), needs("RestoreCard"), cards::restore_card),
+        )
+        .route(
+            &path("PollEvents"),
+            unary(app.clone(), needs("PollEvents"), poll::poll_events),
         )
 }

@@ -2,8 +2,9 @@
 
 use buzz_hive_core::access::{ActorKind, Level};
 use buzz_hive_core::domain::card::{Card, CardState};
+use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, SettingsRepo, Store, StoreError, Tx,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, SettingsRepo, Store, StoreError, Tx,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -26,13 +27,22 @@ fn unavailable(error: sqlx::Error) -> StoreError {
 impl Store for PgStore {
     async fn begin(&self, community: CommunityId) -> Result<Box<dyn Tx>, StoreError> {
         let tx = self.pool.begin().await.map_err(unavailable)?;
-        Ok(Box::new(PgTx { community, tx }))
+        Ok(Box::new(PgTx {
+            community,
+            tx,
+            appended: Vec::new(),
+            locked_log: false,
+        }))
     }
 }
 
 struct PgTx {
     community: CommunityId,
     tx: Transaction<'static, Postgres>,
+    /// Events appended in this transaction, with the seq Postgres gave them.
+    appended: Vec<Event>,
+    /// Whether this transaction holds the event-log lock.
+    locked_log: bool,
 }
 
 #[async_trait::async_trait]
@@ -46,8 +56,13 @@ impl Tx for PgTx {
     fn cards(&mut self) -> &mut dyn CardsRepo {
         self
     }
-    async fn commit(self: Box<Self>) -> Result<(), StoreError> {
-        self.tx.commit().await.map_err(unavailable)
+    fn events(&mut self) -> &mut dyn EventsRepo {
+        self
+    }
+    async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
+        let PgTx { tx, appended, .. } = *self;
+        tx.commit().await.map_err(unavailable)?;
+        Ok(appended)
     }
 }
 
@@ -216,5 +231,177 @@ impl CardsRepo for PgTx {
                 .await
                 .map_err(unavailable)?;
         row.map(decode_card).transpose()
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError> {
+        let row: Option<CardRow> = sqlx::query_as(select_card!(
+            "WHERE community_id = $1 AND id = $2 FOR UPDATE"
+        ))
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        row.map(decode_card).transpose()
+    }
+
+    async fn insert(&mut self, card: &Card) -> Result<(), StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO hive.cards \
+             (community_id, id, title, description, state, workflow, archived_at, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $7 THEN now() END, $8) \
+             ON CONFLICT (community_id, id) DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(card.id)
+        .bind(&card.title)
+        .bind(&card.description)
+        .bind(card.state.as_str())
+        .bind(&card.workflow)
+        .bind(card.archived)
+        .bind(&card.created_by)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::Conflict(format!("card {} exists", card.id)));
+        }
+        Ok(())
+    }
+
+    async fn update(&mut self, card: &Card) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE hive.cards SET title = $3, description = $4, state = $5, workflow = $6 \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(card.id)
+        .bind(&card.title)
+        .bind(&card.description)
+        .bind(card.state.as_str())
+        .bind(&card.workflow)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        not_found_if_none(updated.rows_affected(), card.id)
+    }
+
+    async fn set_archived(&mut self, id: uuid::Uuid, archived: bool) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE hive.cards \
+             SET archived_at = CASE WHEN $3 THEN COALESCE(archived_at, now()) END \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .bind(archived)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        not_found_if_none(updated.rows_affected(), id)
+    }
+
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<(), StoreError> {
+        let deleted = sqlx::query("DELETE FROM hive.cards WHERE community_id = $1 AND id = $2")
+            .bind(self.community)
+            .bind(id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(unavailable)?;
+        not_found_if_none(deleted.rows_affected(), id)
+    }
+}
+
+fn not_found_if_none(rows: u64, id: uuid::Uuid) -> Result<(), StoreError> {
+    if rows == 0 {
+        Err(StoreError::NotFound(format!("card {id}")))
+    } else {
+        Ok(())
+    }
+}
+
+type EventRow = (
+    i64,
+    String,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    String,
+    String,
+    serde_json::Value,
+    chrono::DateTime<chrono::Utc>,
+);
+
+fn decode_event(row: EventRow) -> Result<Event, StoreError> {
+    let (seq, kind, card_id, run_id, pubkey, actor_kind, payload, at) = row;
+    let kind_of_actor = ActorKind::parse(&actor_kind)
+        .ok_or_else(|| StoreError::Conflict(format!("stored actor kind {actor_kind} at {seq}")))?;
+    Ok(Event {
+        seq,
+        kind,
+        card_id,
+        run_id,
+        actor: Actor {
+            pubkey,
+            kind: kind_of_actor,
+        },
+        payload,
+        at,
+    })
+}
+
+#[async_trait::async_trait]
+impl EventsRepo for PgTx {
+    async fn append(&mut self, mut event: Event) -> Result<(), StoreError> {
+        check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
+        if !self.locked_log {
+            // `bigserial` hands out seq before commit, so without this a reader could see
+            // seq 6 while seq 5 is still uncommitted and move past it for good. Holding
+            // the lock to commit makes seq order the same as commit order.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive.events'))")
+                .execute(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+            self.locked_log = true;
+        }
+        event.seq = sqlx::query_scalar(
+            "INSERT INTO hive.events \
+             (community_id, kind, card_id, run_id, actor_pubkey, actor_kind, payload, at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING seq",
+        )
+        .bind(self.community)
+        .bind(&event.kind)
+        .bind(event.card_id)
+        .bind(event.run_id)
+        .bind(&event.actor.pubkey)
+        .bind(event.actor.kind.as_str())
+        .bind(&event.payload)
+        .bind(event.at)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        self.appended.push(event);
+        Ok(())
+    }
+
+    async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT seq, kind, card_id, run_id, actor_pubkey, actor_kind, payload, at \
+             FROM hive.events WHERE community_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+        )
+        .bind(self.community)
+        .bind(seq)
+        .bind(limit.max(0))
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter().map(decode_event).collect()
+    }
+
+    async fn latest_seq(&mut self) -> Result<i64, StoreError> {
+        sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM hive.events WHERE community_id = $1")
+            .bind(self.community)
+            .fetch_one(&mut *self.tx)
+            .await
+            .map_err(unavailable)
     }
 }

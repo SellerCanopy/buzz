@@ -9,6 +9,7 @@ use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::unary::unary;
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::access::{ActorKind, Level, RelayRole};
+use buzz_hive_core::bus::Bus;
 use buzz_hive_core::ports::store::{CommunityId, Store};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use nostr::nips::nip98::{HttpData, HttpMethod};
@@ -32,6 +33,7 @@ fn app(directory: FakeDirectory, store: MemStore) -> App {
         directory: Arc::new(directory),
         minter: Arc::new(TokenMinter::new(SECRET, Arc::new(SystemClock)).unwrap()),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        bus: Bus::new(0),
         community: community(),
     }
 }

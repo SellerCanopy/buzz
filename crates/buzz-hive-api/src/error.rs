@@ -1,5 +1,6 @@
 //! One error type, one mapping to the Connect JSON body and HTTP status.
 
+use buzz_hive_core::orchestrator::OpError;
 use buzz_hive_core::ports::store::StoreError;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +66,17 @@ impl From<StoreError> for HiveError {
             }
             StoreError::Conflict(message) => Self::FailedPrecondition(message),
             StoreError::NotFound(message) => Self::NotFound(message),
+        }
+    }
+}
+
+impl From<OpError> for HiveError {
+    fn from(error: OpError) -> Self {
+        match error {
+            OpError::InvalidArgument(message) => Self::InvalidArgument(message),
+            OpError::NotFound(message) => Self::NotFound(message),
+            OpError::FailedPrecondition(message) => Self::FailedPrecondition(message),
+            OpError::Store(error) => error.into(),
         }
     }
 }

@@ -70,8 +70,8 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `core/background` | 9 | pending | unassigned |
 | `core/config` | 1 | ported | 6 |
 | `core/domain` | 12 | pending | unassigned |
-| `core/events` | 1 | pending | 4 |
-| `core/events/schema` | 1 | pending | 4 |
+| `core/events` | 1 | changed (Phase 4: `domain/events.rs`, `bus.rs` and the `hive.events` log; one Postgres transaction per change and a long poll replace the Go subscription) | 4 |
+| `core/events/schema` | 1 | changed (Phase 4: `EVENT_KINDS` and `check_new` refuse an unlisted kind or a payload over 64 KiB; each later phase registers the kinds it emits) | 4 |
 | `core/issuefiles` | 7 | pending | 16 |
 | `core/kinds` | 8 | pending | unassigned |
 | `core/openspec` | 1 | pending | 5 |
@@ -103,7 +103,7 @@ spec's title and are confirmed when that phase starts.
 | `actions` | pending | 11 |
 | `activity` | pending | 12 |
 | `answers` | pending | 12 |
-| `archive` | pending | 4 |
+| `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
 | `artifacts` | pending | 9 |
 | `assistant` | pending | 20 |
 | `auto-mode` | pending | 13 |
@@ -113,11 +113,11 @@ spec's title and are confirmed when that phase starts.
 | `builder-run` | pending | 19 |
 | `builder` | pending | 19 |
 | `calls` | pending | 12 |
-| `card` | pending | 4 |
+| `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
 | `files` | pending | 9 |
-| `filters` | pending | 4 |
+| `filters` | pending (filters narrow by run state and search, which the Phase 4 board does not have; it needs runs) | 6 |
 | `guide` | pending | 5 |
 | `home` | pending | 3 |
 | `importexport` | pending | 19 |
@@ -167,3 +167,24 @@ spec's title and are confirmed when that phase starts.
 - buzz-app: `src/features/beehive/` (types from this proto, client, session,
   dock page, offline fixture and journey), and the `beehive_authorization` and
   `beehive_request` desktop commands.
+
+## Phase 4 deliverables
+
+- Proto ids: `Card.id`, `Event.card_id`, `Event.run_id`, `GetCardRequest.card_id`,
+  `RemoveCardRequest.card_id`, `RestoreCardRequest.card_id`,
+  `AddNoteRequest.card_id`, `ArchiveCardsRequest.card_ids` and
+  `ActivityEntry.card_id` and `run_id` are string UUIDs (the Go engine used
+  `int64`). `Run.id`, `Run.card_id` and the other request `card_id` fields stay
+  `int64` until the phase that serves them.
+- Additive proto fields: `Event.actor_pubkey = 7`, `Event.actor_kind = 8`,
+  `CreateCardRequest.title = 4` and `description = 5`, and the rpc `PollEvents`.
+- Served: `GetCard`, `CreateCard`, `CreateTask`, `AddNote`, `RemoveCard`,
+  `ArchiveCards`, `RestoreCard` and `PollEvents`. `WatchEvents` stays dropped.
+- Store: `hive.events` (migration `0003_events.sql`); appends take
+  `pg_advisory_xact_lock(hashtext('hive.events'))` so seq order equals commit order.
+- Events: `card.created`, `card.moved`, `card.state`, `card.archived`,
+  `card.restored`, `card.removed` and `activity.added` (registered now because
+  `AddNote` appends it). `tests/event_coverage.rs` fails when a registered kind
+  for the current phase is never emitted; each phase bumps `CURRENT_PHASE`.
+- buzz-app: `engine/poll.ts`, `engine/useLive.ts`, the board with an archive
+  view, the card page as an addressable visit, and the New card dialog.
