@@ -553,6 +553,16 @@ impl RunsRepo for MemTx {
             })
             .map(|(_, t)| t.clone()))
     }
+
+    async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError> {
+        Ok(self
+            .work
+            .threads
+            .iter()
+            .filter(|(c, t)| *c == self.community && t.card_id == card)
+            .map(|(_, t)| t.clone())
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]

@@ -246,6 +246,8 @@ pub trait RunsRepo: Send {
         stage: &str,
         visit: u32,
     ) -> Result<Option<StageThread>, StoreError>;
+    /// Every thread the card's stages opened, in the order they were recorded.
+    async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError>;
 }
 
 /// The relay thread a stage task opened. Its root is the message that mentions the agent.
@@ -256,6 +258,8 @@ pub struct StageThread {
     pub visit: u32,
     pub root_event_id: String,
     pub agent_pubkey: Pubkey,
+    /// The channel the task was posted in, which is where the thread is read.
+    pub channel_id: uuid::Uuid,
 }
 
 /// What a queued post says. The text is rendered when the post is queued, so a change to

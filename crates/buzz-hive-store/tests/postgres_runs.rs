@@ -158,6 +158,7 @@ async fn a_stage_thread_is_recorded_once() {
         visit: 1,
         root_event_id: "e1".into(),
         agent_pubkey: "bb".into(),
+        channel_id: Uuid::from_u128(77),
     };
     tx.runs().record_thread(&thread).await.unwrap();
     // A repeat keeps the first event.
@@ -326,4 +327,37 @@ async fn settings_remove_and_list_stay_in_their_scope() {
         tx.settings().list("workflow", "demo").await.unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_cards_threads_come_back_in_the_order_they_were_recorded() {
+    let (store, _guard, _relay) = store("hive_threads_order").await;
+    let community = CommunityId::from_u128(1);
+    let mut tx = store.begin(community).await.unwrap();
+    tx.cards().insert(&card(1)).await.unwrap();
+    tx.cards().insert(&card(2)).await.unwrap();
+    // Stage names that sort the other way, and a revisit of the first stage last.
+    for (card, stage, visit, root) in [
+        (1, "plan", 1, "r1"),
+        (1, "build", 1, "r2"),
+        (2, "plan", 1, "other"),
+        (1, "plan", 2, "r3"),
+    ] {
+        tx.runs()
+            .record_thread(&StageThread {
+                card_id: Uuid::from_u128(card),
+                stage: stage.into(),
+                visit,
+                root_event_id: root.into(),
+                agent_pubkey: "bb".into(),
+                channel_id: Uuid::from_u128(77),
+            })
+            .await
+            .unwrap();
+    }
+    let got = tx.runs().threads(Uuid::from_u128(1)).await.unwrap();
+    let roots: Vec<_> = got.iter().map(|t| t.root_event_id.as_str()).collect();
+    assert_eq!(roots, ["r1", "r2", "r3"], "card 2's thread is not here");
+    assert!(got.iter().all(|t| t.channel_id == Uuid::from_u128(77)));
 }

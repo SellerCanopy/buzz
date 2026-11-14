@@ -62,6 +62,25 @@ pub struct Handoff {
     pub channel: Option<uuid::Uuid>,
 }
 
+/// The id buzz-app registers Beehive under (`PLUGIN_ID` in `src/features/beehive/routes.ts`).
+pub const BEEHIVE_FEATURE_ID: &str = "buzz.beehive";
+/// The id of the page Beehive registers (`PAGE_ID` in the same file).
+pub const BEEHIVE_PAGE_ID: &str = "beehive";
+
+/// Link a Buzz client opens as the card's page. buzz-app's link parser turns it into a plugin
+/// link, and the page's own route check accepts the card id (`parsePluginLink` in
+/// `src/features/navigation/buzz-links.ts`), so it opens inside the app and not at the
+/// service's address.
+pub fn card_link(card: uuid::Uuid) -> String {
+    format!("buzz://plugin?id={BEEHIVE_FEATURE_ID}&page={BEEHIVE_PAGE_ID}&route.card={card}")
+}
+
+/// `text` followed by a line that links back to the card, for the posts a person opens the
+/// card from: the status post and the first post of a stage thread.
+pub fn with_card_link(text: &str, card: uuid::Uuid) -> String {
+    format!("{text}\n\nOpen the card in Beehive: {}", card_link(card))
+}
+
 /// The message for `stage`: the card's title and description, the stage's prompt with its
 /// variables filled in, and the instruction to report a result. A stage that runs a plugin
 /// command starts with the command line instead, because the agent reads a leading slash as
@@ -570,6 +589,19 @@ mod tests {
         assert!(
             !got.contains("Input artifacts") && !got.contains("Outputs to save"),
             "{got}"
+        );
+    }
+
+    #[test]
+    fn the_card_link_names_the_page_buzz_app_registers_and_the_card() {
+        assert_eq!(
+            card_link(CARD),
+            "buzz://plugin?id=buzz.beehive&page=beehive&route.card=00000000-0000-0000-0000-00000000002a"
+        );
+        let got = with_card_link("Task text.", CARD);
+        assert_eq!(
+            got,
+            "Task text.\n\nOpen the card in Beehive: buzz://plugin?id=buzz.beehive&page=beehive&route.card=00000000-0000-0000-0000-00000000002a"
         );
     }
 }

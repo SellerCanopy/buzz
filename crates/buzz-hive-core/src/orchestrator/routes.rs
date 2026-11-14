@@ -11,7 +11,7 @@ use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::task_message::{render_task, CardText, Handoff};
+use super::task_message::{render_task, with_card_link, CardText, Handoff};
 use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
 use crate::config::{self, Layer, Layers, Resolution};
@@ -193,7 +193,7 @@ pub(super) async fn apply(
             } => {
                 let posting = Posting::Status {
                     channel: need_channel(channel)?,
-                    text: format!("{}: {text}", card.title),
+                    text: with_card_link(&format!("{}: {text}", card.title), id),
                 };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
@@ -234,7 +234,9 @@ pub(super) async fn apply(
                     visit,
                     agent_name,
                     agent,
-                    text,
+                    // The first post of a thread, so a person who finds it in the channel can
+                    // open the card.
+                    text: with_card_link(&text, id),
                 };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }

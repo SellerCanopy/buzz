@@ -241,3 +241,67 @@ async fn an_agent_may_not_move_a_card_unless_the_workflow_allows_it() {
         .unwrap()
         .contains("agent_moves_cards"));
 }
+
+#[tokio::test]
+async fn get_card_returns_the_stage_threads_in_visit_order_and_the_stage_it_is_in() {
+    let app = ready().await;
+    let id = card(&app, "two").await;
+    let (_, before) = call(&app, "GetCard", MEMBER, json!({"cardId": id})).await;
+    assert!(before.get("stages").is_none(), "no thread before a run");
+    assert!(before.get("stageId").is_none());
+
+    call(&app, "StartStage", OWNER, json!({"cardId": id})).await;
+    call(
+        &app,
+        "StageDone",
+        BUILDER,
+        json!({"cardId": id, "result": "passed"}),
+    )
+    .await;
+    // The drain records a thread when the relay takes the post. Stage names sort the other
+    // way from the order they were posted in, and the channel of the first differs.
+    let card_id = uuid::Uuid::parse_str(&id).unwrap();
+    let first_channel = uuid::Uuid::from_u128(0x99);
+    let mut tx = app.store.begin(community()).await.unwrap();
+    for (stage, visit, root, agent, channel) in [
+        ("build", 1, "r1", BUILDER, first_channel),
+        (
+            "review",
+            1,
+            "r2",
+            REVIEWER,
+            uuid::Uuid::parse_str(CHANNEL).unwrap(),
+        ),
+    ] {
+        tx.runs()
+            .record_thread(&buzz_hive_core::ports::store::StageThread {
+                card_id,
+                stage: stage.into(),
+                visit,
+                root_event_id: root.into(),
+                agent_pubkey: agent.into(),
+                channel_id: channel,
+            })
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let (status, got) = call(&app, "GetCard", MEMBER, json!({"cardId": id})).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["stageId"], "review");
+    let stages = got["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 2);
+    assert_eq!(
+        stages[0],
+        json!({
+            "stage": "build", "visit": 1, "rootEventId": "r1", "agentPubkey": BUILDER,
+            "channelId": first_channel.to_string(),
+        })
+    );
+    assert_eq!(stages[1]["stage"], "review");
+    assert_eq!(stages[1]["channelId"], CHANNEL);
+    // The board's list does not carry them.
+    let (_, list) = call(&app, "ListCards", MEMBER, json!({})).await;
+    assert!(list["cards"][0].get("stages").is_none());
+}

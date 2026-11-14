@@ -12,7 +12,7 @@ use crate::proto::{
     ActivityAuthor, ActivityEntry, AddNoteRequest, AddNoteResponse, ArchiveCardsRequest,
     ArchiveCardsResponse, Card, CreateCardRequest, CreateTaskRequest, GetCardRequest,
     ListCardsRequest, ListCardsResponse, RemoveCardRequest, RemoveCardResponse, RestoreCardRequest,
-    SetCardWorkflowRequest, SetCardWorkflowResponse,
+    SetCardWorkflowRequest, SetCardWorkflowResponse, StageThread,
 };
 use crate::unary::Ctx;
 
@@ -41,8 +41,31 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         .get(id)
         .await?
         .ok_or_else(|| HiveError::NotFound(format!("card {id} does not exist")))?;
-    // `body` is set by GetCard only: it can be 64 KiB.
-    Ok(to_proto(card, true))
+    // `body` is set by GetCard only: it can be 64 KiB. So are the stage threads, which the
+    // Live tab reads, and the stage the card's newest run is in.
+    let mut proto = to_proto(card, true);
+    proto.stage_id = tx
+        .runs()
+        .list(Some(id))
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|run| run.current_stage)
+        .unwrap_or_default();
+    proto.stages = tx
+        .runs()
+        .threads(id)
+        .await?
+        .into_iter()
+        .map(|t| StageThread {
+            stage: t.stage,
+            visit: i32::try_from(t.visit).unwrap_or(i32::MAX),
+            root_event_id: t.root_event_id,
+            agent_pubkey: t.agent_pubkey,
+            channel_id: t.channel_id.to_string(),
+        })
+        .collect();
+    Ok(proto)
 }
 
 pub async fn create_card(app: App, ctx: Ctx, req: CreateCardRequest) -> Result<Card, HiveError> {

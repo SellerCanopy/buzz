@@ -1052,8 +1052,8 @@ impl RunsRepo for PgTx {
     async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO hive.stage_threads \
-             (community_id, card_id, stage, visit, root_event_id, agent_pubkey) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+             (community_id, card_id, stage, visit, root_event_id, agent_pubkey, channel_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (community_id, card_id, stage, visit) DO NOTHING",
         )
         .bind(self.community)
@@ -1062,6 +1062,7 @@ impl RunsRepo for PgTx {
         .bind(thread.visit as i32)
         .bind(&thread.root_event_id)
         .bind(&thread.agent_pubkey)
+        .bind(thread.channel_id)
         .execute(&mut *self.tx)
         .await
         .map_err(unavailable)?;
@@ -1074,8 +1075,8 @@ impl RunsRepo for PgTx {
         stage: &str,
         visit: u32,
     ) -> Result<Option<StageThread>, StoreError> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT root_event_id, agent_pubkey FROM hive.stage_threads \
+        let row: Option<(String, String, uuid::Uuid)> = sqlx::query_as(
+            "SELECT root_event_id, agent_pubkey, channel_id FROM hive.stage_threads \
              WHERE community_id = $1 AND card_id = $2 AND stage = $3 AND visit = $4",
         )
         .bind(self.community)
@@ -1085,13 +1086,41 @@ impl RunsRepo for PgTx {
         .fetch_optional(&mut *self.tx)
         .await
         .map_err(unavailable)?;
-        Ok(row.map(|(root_event_id, agent_pubkey)| StageThread {
-            card_id: card,
-            stage: stage.to_owned(),
-            visit,
-            root_event_id,
-            agent_pubkey,
-        }))
+        Ok(
+            row.map(|(root_event_id, agent_pubkey, channel_id)| StageThread {
+                card_id: card,
+                stage: stage.to_owned(),
+                visit,
+                root_event_id,
+                agent_pubkey,
+                channel_id,
+            }),
+        )
+    }
+
+    async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError> {
+        let rows: Vec<(String, i32, String, String, uuid::Uuid)> = sqlx::query_as(
+            "SELECT stage, visit, root_event_id, agent_pubkey, channel_id \
+             FROM hive.stage_threads WHERE community_id = $1 AND card_id = $2 ORDER BY seq",
+        )
+        .bind(self.community)
+        .bind(card)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(stage, visit, root_event_id, agent_pubkey, channel_id)| StageThread {
+                    card_id: card,
+                    stage,
+                    visit: visit.max(0) as u32,
+                    root_event_id,
+                    agent_pubkey,
+                    channel_id,
+                },
+            )
+            .collect())
     }
 }
 

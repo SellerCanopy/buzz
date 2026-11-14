@@ -290,6 +290,38 @@ async fn scenario(
     assert_eq!(rows[1].2, plan.id.to_hex());
     assert_eq!(rows[2].2, scout.id.to_hex());
 
+    // Each thread's first post, as the relay holds it, ends with the link that opens the card
+    // in buzz-app, and GetCard hands the Live tab the threads in the order they opened.
+    let link = format!(
+        "Open the card in Beehive: buzz://plugin?id=buzz.beehive&page=beehive&route.card={card}"
+    );
+    for post in [&scout, &plan, &build] {
+        assert!(post.content.ends_with(&link), "{}", post.content);
+    }
+    let (_, got) = call(app, "GetCard", owner, json!({"cardId": card})).await;
+    let threads: Vec<_> = got["stages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("GetCard returned no stages: {got}"))
+        .iter()
+        .map(|t| {
+            (
+                t["stage"].as_str().unwrap().to_owned(),
+                t["rootEventId"].as_str().unwrap().to_owned(),
+                t["channelId"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let channel = world.channel.to_string();
+    assert_eq!(
+        threads,
+        [
+            ("scout".to_owned(), scout.id.to_hex(), channel.clone()),
+            ("plan".to_owned(), plan.id.to_hex(), channel.clone()),
+            ("build".to_owned(), build.id.to_hex(), channel),
+        ]
+    );
+    assert_eq!(got["stageId"], "build");
+
     let (replies, _) = script
         .play(vec![Step::Call(
             "stage_done",

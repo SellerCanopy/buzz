@@ -58,6 +58,7 @@ pub async fn drain_outbox(
             Ok(root) => {
                 tx.outbox().mark_done(row.id).await?;
                 if let Posting::StageTask {
+                    channel,
                     stage,
                     visit,
                     agent,
@@ -71,6 +72,7 @@ pub async fn drain_outbox(
                             visit: *visit,
                             root_event_id: root.clone(),
                             agent_pubkey: agent.clone(),
+                            channel_id: *channel,
                         })
                         .await?;
                     let event = Event::new(

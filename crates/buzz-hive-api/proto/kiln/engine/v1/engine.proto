@@ -632,6 +632,22 @@ message Card {
   // suggested_workflows lists, sorted, the workflows a Backlog card's issue
   // labels suggest. Empty for any card with a workflow.
   repeated string suggested_workflows = 24;
+  // Beehive: the thread each stage visit opened, in the order they were posted. Only
+  // GetCard sets it. stage_id is then the stage the card's latest run is in.
+  repeated StageThread stages = 25;
+}
+
+// Beehive: the relay thread one visit to a stage opened. Its root is the top-level
+// message that mentions the stage's agent, in the channel the task was posted in.
+message StageThread {
+  string stage = 1;
+  int32 visit = 2;
+  // 64 hex characters.
+  string root_event_id = 3;
+  // 64 hex characters.
+  string agent_pubkey = 4;
+  // The channel's UUID.
+  string channel_id = 5;
 }
 
 // One repo on a card. worktree_path and branch are empty until a stage

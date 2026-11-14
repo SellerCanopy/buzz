@@ -160,7 +160,14 @@ async fn start_run_queues_the_status_and_the_task_and_moves_the_card_to_running(
     match &rows[0].posting {
         Posting::Status { channel, text } => {
             assert_eq!(*channel, CHANNEL);
-            assert_eq!(text, "Fix login: run started on demo, at stage Research.");
+            // The status post links back to the card, which opens in buzz-app.
+            let link = format!("buzz://plugin?id=buzz.beehive&page=beehive&route.card={card_id}");
+            assert_eq!(
+                text,
+                &format!(
+                    "Fix login: run started on demo, at stage Research.\n\nOpen the card in Beehive: {link}"
+                )
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -177,6 +184,13 @@ async fn start_run_queues_the_status_and_the_task_and_moves_the_card_to_running(
                 "the task renders {{issue.title}} and the package default of params.depth:\n{text}"
             );
             assert!(text.starts_with("Fix login\n\nIt breaks.\n\n"), "{text}");
+            // The first post of the thread ends with the link back to the card, after the
+            // instruction to report a result.
+            let link = format!(
+                "Open the card in Beehive: buzz://plugin?id=buzz.beehive&page=beehive&route.card={card_id}"
+            );
+            assert!(text.ends_with(&link), "{text}");
+            assert!(text.find("stage_done").unwrap() < text.rfind(&link).unwrap());
         }
         other => panic!("{other:?}"),
     }
@@ -205,6 +219,7 @@ async fn draining_posts_the_status_then_the_task_and_records_the_thread() {
         .unwrap();
     assert_eq!(thread.root_event_id, posts[1].event_id);
     assert_eq!(thread.agent_pubkey, BUILDER);
+    assert_eq!(thread.channel_id, CHANNEL, "the thread keeps its channel");
     assert!(tx
         .outbox()
         .all()
