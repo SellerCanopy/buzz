@@ -10,6 +10,7 @@ pub mod domain;
 pub mod orchestrator;
 pub mod ports;
 pub mod resolve;
+pub mod workflow;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

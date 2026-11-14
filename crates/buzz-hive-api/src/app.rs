@@ -5,6 +5,7 @@ use std::sync::Arc;
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::resolve::{resolve_actor, Actor};
+use buzz_hive_core::workflow::source::CatalogSource;
 
 use crate::error::HiveError;
 use crate::replay::ReplayGuard;
@@ -26,6 +27,9 @@ pub struct App {
     pub replay: Arc<ReplayGuard>,
     /// Wakes parked `PollEvents` calls after a commit.
     pub bus: Bus,
+    /// Where workflow packages load from. Read on every call, so an edited package counts
+    /// from the next one.
+    pub catalog: Arc<dyn CatalogSource>,
     pub community: CommunityId,
 }
 

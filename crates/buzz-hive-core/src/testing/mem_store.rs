@@ -6,8 +6,9 @@ use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
 use crate::ports::store::{
     AccessRepo, AccessRow, CardsRepo, CommunityId, Directory, EventsRepo, Pubkey, SettingsRepo,
-    Store, StoreError, Tx,
+    Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
 };
+use crate::workflow::options::WorkflowOptions;
 
 #[derive(Default, Clone)]
 struct State {
@@ -15,6 +16,10 @@ struct State {
     settings: HashMap<(CommunityId, String, String, String), serde_json::Value>,
     /// In creation order, so the newest card is last.
     cards: Vec<(CommunityId, Card)>,
+    /// `(community, name)` to `(builtin, current hash)`.
+    packages: std::collections::BTreeMap<(CommunityId, String), (bool, String)>,
+    versions: std::collections::BTreeMap<(CommunityId, String, String), serde_json::Value>,
+    options: std::collections::BTreeMap<(CommunityId, String), WorkflowOptions>,
 }
 
 /// The committed event log, shared by every transaction. It sits outside `State` so
@@ -86,6 +91,9 @@ impl Tx for MemTx {
         self
     }
     fn events(&mut self) -> &mut dyn EventsRepo {
+        self
+    }
+    fn workflows(&mut self) -> &mut dyn WorkflowsRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -272,6 +280,77 @@ impl CardsRepo for MemTx {
         if self.work.cards.len() == before {
             return Err(StoreError::NotFound(format!("card {id}")));
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowsRepo for MemTx {
+    async fn record_version(
+        &mut self,
+        name: &str,
+        hash: &str,
+        body: serde_json::Value,
+        _created_by: &str,
+        builtin: bool,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        self.work
+            .versions
+            .entry((community, name.to_owned(), hash.to_owned()))
+            .or_insert(body);
+        self.work
+            .packages
+            .insert((community, name.to_owned()), (builtin, hash.to_owned()));
+        Ok(())
+    }
+
+    async fn packages(&mut self) -> Result<Vec<StoredPackage>, StoreError> {
+        Ok(self
+            .work
+            .packages
+            .iter()
+            .filter(|((community, _), _)| *community == self.community)
+            .map(|((_, name), (builtin, hash))| StoredPackage {
+                name: name.clone(),
+                builtin: *builtin,
+                current_hash: hash.clone(),
+            })
+            .collect())
+    }
+
+    async fn version(
+        &mut self,
+        name: &str,
+        hash: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        Ok(self
+            .work
+            .versions
+            .get(&(self.community, name.to_owned(), hash.to_owned()))
+            .cloned())
+    }
+
+    async fn options(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, WorkflowOptions>, StoreError> {
+        Ok(self
+            .work
+            .options
+            .iter()
+            .filter(|((community, _), _)| *community == self.community)
+            .map(|((_, name), options)| (name.clone(), options.clone()))
+            .collect())
+    }
+
+    async fn set_options(
+        &mut self,
+        name: &str,
+        options: &WorkflowOptions,
+    ) -> Result<(), StoreError> {
+        self.work
+            .options
+            .insert((self.community, name.to_owned()), options.clone());
         Ok(())
     }
 }

@@ -12,6 +12,8 @@ use buzz_hive_core::access::{ActorKind, Level, RelayRole};
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::ports::store::{CommunityId, Store};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
+use buzz_hive_core::workflow::builtin::builtin_source;
+use buzz_hive_core::workflow::source::Sources;
 use nostr::nips::nip98::{HttpData, HttpMethod};
 use nostr::{EventBuilder, JsonUtil, Keys, Timestamp, Url};
 use tower::ServiceExt;
@@ -34,6 +36,7 @@ fn app(directory: FakeDirectory, store: MemStore) -> App {
         minter: Arc::new(TokenMinter::new(SECRET, Arc::new(SystemClock)).unwrap()),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
         bus: Bus::new(0),
+        catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
     }
 }

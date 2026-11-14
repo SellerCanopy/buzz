@@ -1,0 +1,7 @@
+This package adapts the spec-driven workflow of OpenSpec (https://github.com/Fission-AI/OpenSpec),
+version 1.15.0, which is released under the MIT license. The license text is in LICENSE-OpenSpec.
+
+The artifact formats, validation rules, delta merge order and the wording of several skills follow
+OpenSpec's schemas/spec-driven and src/core/templates/workflows. Kiln changes them to hand artifacts
+between stages with its own tools and to run without the OpenSpec command line. The mapping from each
+skill to its upstream source is in engine/internal/workflows/openspec-source.json.

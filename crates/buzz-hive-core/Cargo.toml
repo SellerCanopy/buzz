@@ -19,6 +19,11 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
+# The workflow file format. YAML is parsed from text, so none of these do I/O.
+serde_yaml = { workspace = true }
+schemars = { workspace = true, features = ["derive", "std"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 # Lets this crate's own integration tests use the `testing` module.

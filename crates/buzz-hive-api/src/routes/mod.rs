@@ -7,6 +7,7 @@
 mod cards;
 pub mod poll;
 mod status;
+mod workflows;
 
 use axum::Router;
 use buzz_hive_core::access::Level;
@@ -27,6 +28,10 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ArchiveCards", Level::Run),
     ("RestoreCard", Level::Run),
     ("PollEvents", Level::Read),
+    ("ListWorkflows", Level::Read),
+    ("CheckWorkflow", Level::Read),
+    ("ListTemplateVariables", Level::Read),
+    ("ListStageTemplates", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -114,5 +119,37 @@ pub fn router(app: &App) -> Router<App> {
         .route(
             &path("PollEvents"),
             unary(app.clone(), needs("PollEvents"), poll::poll_events),
+        )
+        .route(
+            &path("ListWorkflows"),
+            unary(
+                app.clone(),
+                needs("ListWorkflows"),
+                workflows::list_workflows,
+            ),
+        )
+        .route(
+            &path("CheckWorkflow"),
+            unary(
+                app.clone(),
+                needs("CheckWorkflow"),
+                workflows::check_workflow,
+            ),
+        )
+        .route(
+            &path("ListTemplateVariables"),
+            unary(
+                app.clone(),
+                needs("ListTemplateVariables"),
+                workflows::list_template_variables,
+            ),
+        )
+        .route(
+            &path("ListStageTemplates"),
+            unary(
+                app.clone(),
+                needs("ListStageTemplates"),
+                workflows::list_stage_templates,
+            ),
         )
 }

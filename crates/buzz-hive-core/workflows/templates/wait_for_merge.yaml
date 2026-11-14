@@ -1,0 +1,5 @@
+id: wait_for_merge
+name: Wait for merge
+description: Waits until the issue's pull request is merged.
+kind: wait
+wait: { pull_request: merged }

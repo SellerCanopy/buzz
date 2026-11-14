@@ -14,6 +14,8 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::ports::store::CommunityId;
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
+use buzz_hive_core::workflow::builtin::builtin_source;
+use buzz_hive_core::workflow::source::Sources;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -43,6 +45,7 @@ fn app(store: MemStore) -> App {
         ),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
         bus: Bus::new(0),
+        catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
     }
 }

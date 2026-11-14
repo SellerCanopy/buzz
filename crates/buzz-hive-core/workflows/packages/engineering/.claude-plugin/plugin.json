@@ -1,0 +1,5 @@
+{
+  "name": "engineering",
+  "version": "0.1.0",
+  "description": "Research, plan, plan review, implement, code review, a draft pull request and CI, then cleanup once a person moves the card to Done."
+}

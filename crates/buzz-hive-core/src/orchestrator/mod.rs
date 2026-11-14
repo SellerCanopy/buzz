@@ -4,6 +4,7 @@
 //! [`crate::bus::Bus`], so a rolled-back operation wakes nobody.
 
 pub mod cards;
+pub mod workflows;
 
 use crate::domain::events::Actor;
 use crate::ports::store::{CommunityId, StoreError};

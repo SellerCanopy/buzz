@@ -13,6 +13,9 @@ pub struct Config {
     pub community_host: String,
     /// `BUZZ_HIVE_ALLOWED_ORIGINS`, comma separated browser origins. Empty means none.
     pub allowed_origins: Vec<String>,
+    /// `BUZZ_HIVE_WORKFLOWS_DIR`, a folder of workflow packages loaded beside the built-in
+    /// ones. Unset means built-ins only.
+    pub workflows_dir: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -46,6 +49,9 @@ impl Config {
             token_secret,
             community_host: required("BUZZ_HIVE_COMMUNITY_HOST")?,
             allowed_origins,
+            workflows_dir: get("BUZZ_HIVE_WORKFLOWS_DIR")
+                .filter(|v| !v.trim().is_empty())
+                .map(Into::into),
         })
     }
 }
@@ -147,6 +153,16 @@ mod tests {
                 "{bad}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn the_workflows_folder_is_optional() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert_eq!(config.workflows_dir, None);
+        let mut pairs = FULL.to_vec();
+        pairs.push(("BUZZ_HIVE_WORKFLOWS_DIR", "/srv/workflows"));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.workflows_dir, Some("/srv/workflows".into()));
     }
 
     #[test]

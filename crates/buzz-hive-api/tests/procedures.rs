@@ -11,11 +11,6 @@ const PROTO: &str = include_str!("../proto/kiln/engine/v1/engine.proto");
 
 /// Methods a later phase serves. Each phase removes its own.
 const PENDING: &[&str] = &[
-    // Phase 5
-    "ListWorkflows",
-    "CheckWorkflow",
-    "ListTemplateVariables",
-    "ListStageTemplates",
     // Phase 6
     "GetRun",
     "ListRuns",

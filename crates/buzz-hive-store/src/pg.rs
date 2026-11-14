@@ -4,8 +4,10 @@ use buzz_hive_core::access::{ActorKind, Level};
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, SettingsRepo, Store, StoreError, Tx,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, SettingsRepo, Store, StoreError,
+    StoredPackage, Tx, WorkflowsRepo,
 };
+use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
 pub struct PgStore {
@@ -57,6 +59,9 @@ impl Tx for PgTx {
         self
     }
     fn events(&mut self) -> &mut dyn EventsRepo {
+        self
+    }
+    fn workflows(&mut self) -> &mut dyn WorkflowsRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -403,5 +408,119 @@ impl EventsRepo for PgTx {
             .fetch_one(&mut *self.tx)
             .await
             .map_err(unavailable)
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowsRepo for PgTx {
+    async fn record_version(
+        &mut self,
+        name: &str,
+        hash: &str,
+        body: serde_json::Value,
+        created_by: &str,
+        builtin: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.workflow_versions (community_id, name, hash, body, created_by) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (community_id, name, hash) DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(name)
+        .bind(hash)
+        .bind(body)
+        .bind(created_by)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        sqlx::query(
+            "INSERT INTO hive.workflow_packages (community_id, name, builtin, current_hash) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (community_id, name) DO UPDATE \
+             SET builtin = $3, current_hash = $4, updated_at = now()",
+        )
+        .bind(self.community)
+        .bind(name)
+        .bind(builtin)
+        .bind(hash)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(())
+    }
+
+    async fn packages(&mut self) -> Result<Vec<StoredPackage>, StoreError> {
+        let rows: Vec<(String, bool, String)> = sqlx::query_as(
+            "SELECT name, builtin, current_hash FROM hive.workflow_packages \
+             WHERE community_id = $1 ORDER BY name",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, builtin, current_hash)| StoredPackage {
+                name,
+                builtin,
+                current_hash,
+            })
+            .collect())
+    }
+
+    async fn version(
+        &mut self,
+        name: &str,
+        hash: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT body FROM hive.workflow_versions \
+             WHERE community_id = $1 AND name = $2 AND hash = $3",
+        )
+        .bind(self.community)
+        .bind(name)
+        .bind(hash)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)
+    }
+
+    async fn options(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, WorkflowOptions>, StoreError> {
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT name, options FROM hive.workflow_options WHERE community_id = $1",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter()
+            .map(|(name, value)| {
+                serde_json::from_value(value)
+                    .map(|options| (name.clone(), options))
+                    .map_err(|e| StoreError::Conflict(format!("stored options for {name}: {e}")))
+            })
+            .collect()
+    }
+
+    async fn set_options(
+        &mut self,
+        name: &str,
+        options: &WorkflowOptions,
+    ) -> Result<(), StoreError> {
+        let value = serde_json::to_value(options)
+            .map_err(|e| StoreError::Conflict(format!("options for {name}: {e}")))?;
+        sqlx::query(
+            "INSERT INTO hive.workflow_options (community_id, name, options) VALUES ($1, $2, $3) \
+             ON CONFLICT (community_id, name) DO UPDATE SET options = $3",
+        )
+        .bind(self.community)
+        .bind(name)
+        .bind(value)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(())
     }
 }

@@ -1,0 +1,5 @@
+id: plan_review
+name: Plan review
+description: Waits for a person to approve the plan artifact before the card moves on.
+kind: approval
+approval: { artifacts: [plan] }

@@ -3,6 +3,7 @@
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
+use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
 /// 64 hex characters, lowercase.
@@ -44,6 +45,7 @@ pub trait Tx: Send {
     fn settings(&mut self) -> &mut dyn SettingsRepo;
     fn cards(&mut self) -> &mut dyn CardsRepo;
     fn events(&mut self) -> &mut dyn EventsRepo;
+    fn workflows(&mut self) -> &mut dyn WorkflowsRepo;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -103,6 +105,48 @@ pub trait EventsRepo: Send {
     async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError>;
     /// The newest committed seq of this community, 0 when there is none.
     async fn latest_seq(&mut self) -> Result<i64, StoreError>;
+}
+
+/// What the store keeps of workflow packages: each version by content hash, which one is
+/// current, and a person's changes to a workflow's board behavior.
+#[async_trait::async_trait]
+pub trait WorkflowsRepo: Send {
+    /// Stores a package version by its hash, once, and makes it the package's current one.
+    /// `body` is the package's files by path. Recording a hash already stored only moves
+    /// the current pointer.
+    async fn record_version(
+        &mut self,
+        name: &str,
+        hash: &str,
+        body: serde_json::Value,
+        created_by: &str,
+        builtin: bool,
+    ) -> Result<(), StoreError>;
+    /// Every package with a stored version, by name.
+    async fn packages(&mut self) -> Result<Vec<StoredPackage>, StoreError>;
+    /// The files of one stored version.
+    async fn version(
+        &mut self,
+        name: &str,
+        hash: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError>;
+    /// Every workflow's stored options, by name. A workflow with no row has none.
+    async fn options(
+        &mut self,
+    ) -> Result<std::collections::BTreeMap<String, WorkflowOptions>, StoreError>;
+    async fn set_options(
+        &mut self,
+        name: &str,
+        options: &WorkflowOptions,
+    ) -> Result<(), StoreError>;
+}
+
+/// A package the store holds versions of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPackage {
+    pub name: String,
+    pub builtin: bool,
+    pub current_hash: String,
 }
 
 /// Relay facts, read-only. Implemented by `buzz-hive-store::relay_read`.

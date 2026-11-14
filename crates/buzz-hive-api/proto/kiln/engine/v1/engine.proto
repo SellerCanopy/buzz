@@ -1093,6 +1093,22 @@ message Workflow {
   // labels are the issue labels a person added that suggest the workflow.
   // Its own name always suggests it too.
   repeated string labels = 13;
+  // The stages in file order, so the page can show what the workflow does.
+  // Beehive addition: the Go engine's list left stages to GetWorkflowDraft.
+  repeated WorkflowStage stages = 14;
+}
+
+// WorkflowStage is one stage of a listed workflow, in short.
+message WorkflowStage {
+  string id = 1;
+  // The name the board shows; the id when the file sets none.
+  string name = 2;
+  // prompt, approval, wait or action.
+  string kind = 3;
+  // The Buzz agent a prompt stage runs on. Empty for other kinds.
+  string agent = 4;
+  // True when a card waits before this stage until a person starts it.
+  bool pause = 5;
 }
 
 message SetWorkflowOptionsRequest {

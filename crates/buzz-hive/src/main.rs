@@ -1,6 +1,7 @@
 //! The Beehive workflow engine service.
 
 mod config;
+mod dir_source;
 
 use std::sync::Arc;
 
@@ -8,6 +9,9 @@ use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::bus::Bus;
+use buzz_hive_core::orchestrator::workflows::record_builtins;
+use buzz_hive_core::workflow::builtin::builtin_source;
+use buzz_hive_core::workflow::source::{CatalogSource, Source, Sources};
 use buzz_hive_store::pg::PgStore;
 use buzz_hive_store::relay_read::{verify_relay_columns, RelayRead};
 
@@ -50,12 +54,27 @@ async fn run() -> Result<(), String> {
             )
         })?;
 
+    let mut sources = vec![builtin_source()];
+    if let Some(dir) = &config.workflows_dir {
+        sources.push(Source::new(
+            dir.display().to_string(),
+            false,
+            dir_source::DirSource::new(dir),
+        ));
+    }
+    let catalog = Arc::new(Sources(sources));
+    let store = Arc::new(PgStore::new(pool));
+    let recorded = record_builtins(store.as_ref(), community, &catalog.load())
+        .await
+        .map_err(|e| format!("cannot record the built-in workflows: {e}"))?;
+    tracing::info!(recorded, "built-in workflows recorded");
+
     let app = App {
         config: Arc::new(ApiConfig {
             public_url: config.public_url.clone(),
             allowed_origins: config.allowed_origins.clone(),
         }),
-        store: Arc::new(PgStore::new(pool)),
+        store,
         directory: Arc::new(relay),
         minter: Arc::new(TokenMinter::new(
             config.token_secret.as_bytes(),
@@ -63,6 +82,7 @@ async fn run() -> Result<(), String> {
         )?),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
         bus: Bus::new(0),
+        catalog,
         community,
     };
     let bus = app.bus.clone();

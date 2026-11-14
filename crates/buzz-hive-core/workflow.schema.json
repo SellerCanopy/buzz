@@ -1,0 +1,548 @@
+{
+  "$defs": {
+    "ActionArg": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "One argument of an action stage: a string, or for an argument that takes one, a\nlist of strings such as `run_command`'s argv."
+    },
+    "ApprovalSettings": {
+      "additionalProperties": false,
+      "description": "The artifacts an approval stage asks a person to approve.",
+      "properties": {
+        "artifacts": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Conditions": {
+      "additionalProperties": false,
+      "description": "Checked before a stage opens a session.",
+      "properties": {
+        "else": {
+          "default": "",
+          "type": "string"
+        },
+        "labels": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Execution": {
+      "additionalProperties": false,
+      "description": "A stage's timeouts and retries.",
+      "properties": {
+        "retries": {
+          "$ref": "#/$defs/Retries",
+          "default": {
+            "backoff": "0s",
+            "max": 0
+          }
+        },
+        "timeout": {
+          "default": "0s",
+          "description": "a Go duration, such as 30m or 1h30m",
+          "format": "go-duration",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Input": {
+      "additionalProperties": false,
+      "description": "A document a prompt stage reads. `required` means the stage cannot start until the\ndocument has a saved version.",
+      "properties": {
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Output": {
+      "additionalProperties": false,
+      "description": "An artifact a stage produces.",
+      "properties": {
+        "artifact": {
+          "default": "",
+          "type": "string"
+        },
+        "file": {
+          "default": "",
+          "description": "The repo file the stage writes, as a path pattern with `{{variables}}` and `*`.",
+          "type": "string"
+        },
+        "handoff": {
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "optional": {
+          "default": false,
+          "description": "The stage may pass without saving this document, so a missing version opens no question.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "PackageFile": {
+      "additionalProperties": false,
+      "description": "Metadata in a package's `kiln-package.yaml`. The package name is the workflow's identity.",
+      "properties": {
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "parameters": {
+          "default": [],
+          "description": "The typed values the package asks for. Each becomes the setting `params.<name>`.",
+          "items": {
+            "$ref": "#/$defs/Parameter"
+          },
+          "type": "array"
+        },
+        "version": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "title": "PackageFile",
+      "type": "object"
+    },
+    "ParamType": {
+      "description": "What kind of value a package parameter holds. Every value is stored and passed as\na string; the type decides which strings are valid.",
+      "enum": [
+        "text",
+        "number",
+        "bool",
+        "choice",
+        "branch"
+      ],
+      "type": "string"
+    },
+    "Parameter": {
+      "additionalProperties": false,
+      "description": "One typed parameter a package declares. `default` is always text, even for a number.",
+      "properties": {
+        "choices": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "default": {
+          "default": "",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParamType"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`None` when the file leaves it out or names a type that does not exist. The\ndecoder reports the second case."
+        }
+      },
+      "type": "object"
+    },
+    "Repeat": {
+      "additionalProperties": false,
+      "description": "Runs a stage in rounds until its plan artifact is complete.",
+      "properties": {
+        "fresh_session": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_rounds": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        },
+        "plan": {
+          "default": "",
+          "type": "string"
+        },
+        "stall_after": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        },
+        "until": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Retries": {
+      "additionalProperties": false,
+      "description": "Reruns a failed stage before its failed route.",
+      "properties": {
+        "backoff": {
+          "default": "0s",
+          "description": "a Go duration, such as 30m or 1h30m",
+          "format": "go-duration",
+          "type": "string"
+        },
+        "max": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Route": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/RouteCall"
+        }
+      ],
+      "description": "Where a result sends the card. It reads as a stage id, `stop` or `ask`, or as a call\nthat also gives the target different documents."
+    },
+    "RouteCall": {
+      "additionalProperties": false,
+      "description": "A call: the target, the documents it is given, and where the card goes after it passes.",
+      "properties": {
+        "give": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Maps one of the target's input names to the artifact it reads this time.",
+          "type": "object"
+        },
+        "then": {
+          "default": "",
+          "type": "string"
+        },
+        "to": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RouteKeyword": {
+      "description": "Route targets beside stage ids.",
+      "enum": [
+        "stop",
+        "ask"
+      ],
+      "type": "string"
+    },
+    "Stage": {
+      "additionalProperties": false,
+      "description": "One stage of a workflow. Routes, results and every behavior key off `kind` and the\ndeclared results, never off `id` or `name`.",
+      "properties": {
+        "action": {
+          "default": "",
+          "description": "The built-in action an action stage runs.",
+          "type": "string"
+        },
+        "agent": {
+          "default": null,
+          "description": "The name of the Buzz agent that works the stage. Its profile, model and effort\nare set on the agent in Buzz.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalSettings"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "args": {
+          "default": "",
+          "description": "The argument line sent after the command. It holds `{{variables}}`.",
+          "type": "string"
+        },
+        "command": {
+          "default": "",
+          "description": "The bare name of a plugin command to run, with no package prefix.",
+          "type": "string"
+        },
+        "conditions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Conditions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "execution": {
+          "$ref": "#/$defs/Execution",
+          "default": {
+            "retries": {
+              "backoff": "0s",
+              "max": 0
+            },
+            "timeout": "0s"
+          }
+        },
+        "id": {
+          "default": "",
+          "type": "string"
+        },
+        "inputs": {
+          "default": [],
+          "description": "The documents a prompt stage reads. A stage with inputs reads only these plus its own outputs.",
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "default": "",
+          "description": "One of prompt, approval, wait or action. Left open here so a misspelling is the\nfinding `kind_unknown` and not a decode error.",
+          "type": "string",
+          "x-known-values": [
+            "prompt",
+            "approval",
+            "wait",
+            "action"
+          ]
+        },
+        "loop_limit": {
+          "default": 0,
+          "description": "Backward routes in a row from this stage before a person is asked.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "on": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Route"
+          },
+          "default": {},
+          "description": "Result to route. A route is a stage id, `stop`, `ask`, or a call that gives the target other documents.",
+          "type": "object"
+        },
+        "outputs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Output"
+          },
+          "type": "array"
+        },
+        "pause": {
+          "default": false,
+          "description": "Hold the card before this stage until a person starts it.",
+          "type": "boolean"
+        },
+        "prompt": {
+          "default": "",
+          "type": "string"
+        },
+        "prompt_file": {
+          "default": "",
+          "type": "string"
+        },
+        "repeat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Repeat"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "results": {
+          "default": [],
+          "description": "The stage's own results, beside the standard ones.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "roles": {
+          "default": [],
+          "description": "What the stage does to the issue or its pull request, beside the default role of\nits built-in action. One of opens_pull_request, merges or closes_issue.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "x-known-values": [
+            "opens_pull_request",
+            "merges",
+            "closes_issue"
+          ]
+        },
+        "wait": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Wait"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "with": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionArg"
+          },
+          "default": null,
+          "description": "The action's arguments by name. `Some` with no entries is not the same as `None`:\na prompt stage that writes `with: {}` still gets `with_not_allowed`.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Workspace"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Empty derives it from the stage's kind and action."
+        }
+      },
+      "type": "object"
+    },
+    "StageRole": {
+      "description": "What a stage can do to an issue or its pull request.",
+      "enum": [
+        "opens_pull_request",
+        "merges",
+        "closes_issue"
+      ],
+      "type": "string"
+    },
+    "StandardResult": {
+      "description": "The results every prompt stage may report.",
+      "enum": [
+        "passed",
+        "needs_work",
+        "failed",
+        "needs_input"
+      ],
+      "type": "string"
+    },
+    "Wait": {
+      "additionalProperties": false,
+      "description": "What a wait stage waits for: labels on the issue, a state of its pull request, or\nboth, and its timing.",
+      "properties": {
+        "labels": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "poll": {
+          "default": "0s",
+          "description": "a Go duration, such as 30m or 1h30m",
+          "format": "go-duration",
+          "type": "string"
+        },
+        "pull_request": {
+          "default": "",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "0s",
+          "description": "a Go duration, such as 30m or 1h30m",
+          "format": "go-duration",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Workspace": {
+      "description": "Whether a stage runs in the issue's worktree. `none` starts it with no worktree,\nand `branch` prepares the worktree on the issue's branch first.",
+      "enum": [
+        "none",
+        "branch"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A package's `workflow.yaml`.",
+  "properties": {
+    "stages": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Stage"
+      },
+      "type": "array"
+    },
+    "version": {
+      "default": 0,
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "title": "Kiln workflow (workflow.yaml)",
+  "type": "object"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "demo",
+  "version": "0.1.0",
+  "description": "One Claude Code stage that reads a file, runs a command with permission, asks a question and saves notes, then an approval stage for the notes."
+}

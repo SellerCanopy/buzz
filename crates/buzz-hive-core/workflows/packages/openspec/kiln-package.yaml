@@ -1,0 +1,3 @@
+name: openspec
+version: 0.1.0
+description: Spec-driven development with OpenSpec. A proposal, delta specs, design and tasks, each reviewed by a person, then apply, verify, archive and a draft pull request that carries the code and the OpenSpec change record.

@@ -1,0 +1,17 @@
+version: 2
+stages:
+  - id: do
+    pause: true
+    name: Do
+    kind: prompt
+    agent: builder
+    command: do
+    args: '''{{issue.title}}'' ''{{issue.body}}'' ''{{artifacts.result.path}}'' ''{{sendback.comments}}'''
+    outputs: [{artifact: result}]
+    execution: {timeout: 30m}
+  - id: review
+    name: Review
+    kind: approval
+    approval: {artifacts: [result]}
+    on: {needs_work: do}
+    loop_limit: 3
