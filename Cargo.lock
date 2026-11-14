@@ -1275,6 +1275,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-hive"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "buzz-hive-api",
+ "buzz-hive-core",
+ "buzz-hive-store",
+ "nostr 0.44.7",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "buzz-hive-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "buzz-auth",
+ "buzz-hive-core",
+ "chrono",
+ "hex",
+ "jsonwebtoken",
+ "nostr 0.44.7",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-hive-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "buzz-hive-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-hive-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "buzz-db",
+ "buzz-hive-core",
+ "hex",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-media"
 version = "0.1.0"
 dependencies = [

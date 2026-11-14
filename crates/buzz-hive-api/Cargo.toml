@@ -1,0 +1,29 @@
+[package]
+name = "buzz-hive-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP routes and token auth for the Beehive workflow engine"
+
+[dependencies]
+buzz-hive-core = { path = "../buzz-hive-core" }
+buzz-auth = { workspace = true }
+async-trait = "0.1"
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+nostr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+buzz-hive-core = { path = "../buzz-hive-core", features = ["testing"] }
+tower = { workspace = true }
+hex = { workspace = true }

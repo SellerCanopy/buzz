@@ -1,0 +1,25 @@
+[package]
+name = "buzz-hive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure logic and ports for the Beehive workflow engine"
+
+[features]
+# In-memory store and fakes for tests in this crate and its dependents.
+testing = []
+
+[dependencies]
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+# Lets this crate's own integration tests use the `testing` module.
+buzz-hive-core = { path = ".", features = ["testing"] }

@@ -1,0 +1,154 @@
+# Port ledger: Carrier (Go) to Beehive (Rust)
+
+Every Go package with tests, every `app/e2e` spec and every named feature in the
+Go engine has one row. Columns: `item | decision | phase`. A decision is
+`ported`, `changed`, `dropped` or `pending`. Each phase updates the rows it
+settles. Phase 27 closes the ledger: no row may stay `pending`.
+
+The Go engine (`SellerCanopy/kiln`, directory `engine/`) is the reference and is
+never edited. Phase numbers refer to the Beehive plan.
+
+## Features
+
+| item | decision | phase |
+|---|---|---|
+| ACP adapter | dropped (stages run on Buzz agents) | 1 |
+| `mcptools` | dropped | 1 |
+| Local runner | dropped | 1 |
+| `gitwork` | dropped | 1 |
+| Scratch folders | dropped | 1 |
+| Usage reporter | dropped (usage counts runs and cards only) | 1 |
+| Cost ledger | dropped | 1 |
+| Pricing | dropped | 1 |
+| `fakebeacon` | dropped | 1 |
+| Keyring | dropped (secrets are write-only rows, Phase 23) | 23 |
+| The five sign-in procedures | dropped (OAuth sign-in is Phase 24) | 23 |
+| Sign-in modes | dropped (a Buzz key signs in) | 1 |
+| Cookie session | dropped | 1 |
+| Dev issuer | dropped | 1 |
+| `apiVersion` header | dropped | 1 |
+| Update feed | dropped | 1 |
+| Engine lease and heartbeat | dropped (one `buzz-hive` per community) | 1 |
+| Permission prompts | dropped | 1 |
+| The `interrupted` inbox item | dropped | 1 |
+| `core/openspec` | pending | 5 |
+| `core/issuefiles` | pending | 16 |
+| `core/config` | ported | 6 |
+
+## Go test directories
+
+Counts are test files per directory in the kiln checkout when this ledger was
+seeded. A directory is `pending` until the phase that ports it names it.
+
+| item (`engine/...`) | test files | decision | phase |
+|---|---|---|---|
+| `adapters/acp` | 9 | dropped | 1 |
+| `adapters/actions` | 1 | pending | 18 |
+| `adapters/artifacts/local` | 2 | pending | 9 |
+| `adapters/downloadmark` | 3 | pending | unassigned |
+| `adapters/github` | 20 | pending | 16 |
+| `adapters/gitwork` | 5 | dropped | 1 |
+| `adapters/keyring` | 1 | dropped | 23 |
+| `adapters/localrepo` | 2 | dropped (scratch folders) | 1 |
+| `adapters/mcptools` | 6 | dropped | 1 |
+| `adapters/notify` | 1 | pending | unassigned |
+| `adapters/runner/local` | 2 | dropped | 1 |
+| `adapters/runner/remote` | 1 | dropped | 1 |
+| `adapters/runner/wire` | 1 | dropped | 1 |
+| `adapters/secrets/sqlcrypt` | 1 | pending | 23 |
+| `adapters/signin/devissuer` | 1 | dropped | 1 |
+| `adapters/signin/issuerclient` | 1 | dropped | 1 |
+| `adapters/signin/jwt` | 1 | dropped | 1 |
+| `adapters/sqlite` | 28 | pending | unassigned |
+| `adapters/testenv` | 1 | pending | unassigned |
+| `adapters/usage` | 8 | dropped | 1 |
+| `adapters/webfetch` | 1 | pending | unassigned |
+| `api` | 23 | pending | unassigned |
+| `cmd/carrier-runner` | 1 | dropped (local runner) | 1 |
+| `cmd/kiln-engine` | 88 | pending | unassigned |
+| `core/assistant` | 15 | pending | 20 |
+| `core/background` | 9 | pending | unassigned |
+| `core/config` | 1 | ported | 6 |
+| `core/domain` | 12 | pending | unassigned |
+| `core/events` | 1 | pending | 4 |
+| `core/events/schema` | 1 | pending | 4 |
+| `core/issuefiles` | 7 | pending | 16 |
+| `core/kinds` | 8 | pending | unassigned |
+| `core/openspec` | 1 | pending | 5 |
+| `core/orchestrator` | 56 | pending | unassigned |
+| `core/pricing` | 1 | dropped | 1 |
+| `core/pullrequests` | 2 | pending | 17 |
+| `core/redact` | 1 | pending | unassigned |
+| `core/rules` | 21 | pending | unassigned |
+| `core/session` | 18 | pending | unassigned |
+| `core/workflow` | 13 | pending | 5 |
+| `core/workflow/schema` | 1 | pending | 5 |
+| `internal/fakeagent` | 2 | pending | unassigned |
+| `internal/ghreplay` | 1 | pending | 16 |
+| `internal/gitconfig` | 1 | pending | unassigned |
+| `internal/proc` | 3 | pending | unassigned |
+| `internal/workflows` | 4 | pending | 5 |
+| `ports` | 4 | pending | unassigned |
+| `runnerd` | 1 | dropped (local runner) | 1 |
+
+## `app/e2e` specs
+
+The plan names the phase for `board`, `card`, `archive`, `list`, `browse`,
+`guide`, `start`, `needs-you`, `usage`, `activity`, `permissions`, `merge`,
+`assistant` and the dropped group. The other phases are assigned here from each
+spec's title and are confirmed when that phase starts.
+
+| item (`app/e2e/<name>.spec.ts`) | decision | phase |
+|---|---|---|
+| `actions` | pending | 11 |
+| `activity` | pending | 12 |
+| `answers` | pending | 12 |
+| `archive` | pending | 4 |
+| `artifacts` | pending | 9 |
+| `assistant` | pending | 20 |
+| `auto-mode` | pending | 13 |
+| `board` | pending | 3 |
+| `boot` | pending | 3 |
+| `browse` | pending | 5 |
+| `builder-run` | pending | 19 |
+| `builder` | pending | 19 |
+| `calls` | pending | 12 |
+| `card` | pending | 4 |
+| `costs-pull-requests` | dropped (cost figures) | 1 |
+| `costs` | dropped (cost figures) | 1 |
+| `files` | pending | 9 |
+| `filters` | pending | 4 |
+| `guide` | pending | 5 |
+| `home` | pending | 3 |
+| `importexport` | pending | 19 |
+| `kilntask` | dropped (Carrier task kind, no Buzz stage) | 1 |
+| `list` | pending | 5 |
+| `login` | dropped (team login and cookie session) | 1 |
+| `merge` | pending | 18 |
+| `needs-you` | pending | 12 |
+| `newtask` | pending | 16 |
+| `parameters` | pending | 6 |
+| `paused-turn` | pending | 12 |
+| `permissions` | pending | 14 |
+| `pick-repo` | pending | 21 |
+| `plugin-command` | dropped (plugins) | 1 |
+| `plugin-contents` | dropped (plugins) | 1 |
+| `prompt-skill` | dropped (prompt skills) | 1 |
+| `remove` | pending | 4 |
+| `repos` | pending | 21 |
+| `reset` | pending | 17 |
+| `runners` | dropped (runner pairing, stages run on Buzz agents) | 1 |
+| `select` | pending | 5 |
+| `session` | pending | 3 |
+| `sidebar` | pending | 3 |
+| `signin-token` | dropped (sign-in modes) | 1 |
+| `signin` | dropped (sign-in modes) | 1 |
+| `skills` | dropped | 1 |
+| `sources-layout` | pending | 16 |
+| `sources-repo-rule` | pending | 16 |
+| `stack-seed` | pending | 16 |
+| `start` | pending | 6 |
+| `testrun` | dropped (`StartTestRun`) | 1 |
+| `usage` | pending | 12 |
+| `web` | dropped (token screen, sign-in modes) | 1 |
+| `workflow-options` | pending | 19 |

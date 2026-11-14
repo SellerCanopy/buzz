@@ -1,0 +1,25 @@
+[package]
+name = "buzz-hive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Beehive workflow engine service"
+
+[[bin]]
+name = "buzz-hive"
+path = "src/main.rs"
+
+[dependencies]
+buzz-hive-api = { path = "../buzz-hive-api" }
+buzz-hive-core = { path = "../buzz-hive-core" }
+buzz-hive-store = { path = "../buzz-hive-store" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+nostr = { workspace = true }
