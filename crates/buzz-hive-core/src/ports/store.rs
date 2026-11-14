@@ -3,6 +3,7 @@
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
+use crate::domain::run::Run;
 use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
@@ -46,6 +47,8 @@ pub trait Tx: Send {
     fn cards(&mut self) -> &mut dyn CardsRepo;
     fn events(&mut self) -> &mut dyn EventsRepo;
     fn workflows(&mut self) -> &mut dyn WorkflowsRepo;
+    fn runs(&mut self) -> &mut dyn RunsRepo;
+    fn outbox(&mut self) -> &mut dyn OutboxRepo;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -77,6 +80,14 @@ pub trait SettingsRepo: Send {
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), StoreError>;
+    /// Removes a setting. Nothing happens when it is not set.
+    async fn remove(&mut self, scope: &str, scope_id: &str, key: &str) -> Result<(), StoreError>;
+    /// Every setting of one scope, by key.
+    async fn list(
+        &mut self,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -141,6 +152,97 @@ pub trait WorkflowsRepo: Send {
     ) -> Result<(), StoreError>;
 }
 
+/// Runs and the stage threads they open.
+#[async_trait::async_trait]
+pub trait RunsRepo: Send {
+    /// `Conflict` when the id is taken.
+    async fn insert(&mut self, run: &Run) -> Result<(), StoreError>;
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError>;
+    /// Like `get`, and holds the run until the transaction ends, so two inputs to one run queue.
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError>;
+    /// Writes the run's state, stage, visit, requester and end time. `NotFound` when it does not exist.
+    async fn update(&mut self, run: &Run) -> Result<(), StoreError>;
+    /// A card's runs, or every run, newest first.
+    async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError>;
+    /// The card's run that has not ended, if any.
+    async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError>;
+    /// The highest visit any of the card's runs has made to `stage`, 0 when none has.
+    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError>;
+    /// Records the thread a stage task opened. Recording one already stored changes nothing.
+    async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError>;
+    async fn thread(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Option<StageThread>, StoreError>;
+}
+
+/// The relay thread a stage task opened. Its root is the message that mentions the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageThread {
+    pub card_id: uuid::Uuid,
+    pub stage: String,
+    pub visit: u32,
+    pub root_event_id: String,
+    pub agent_pubkey: Pubkey,
+}
+
+/// What a queued post says. The text is rendered when the post is queued, so a change to
+/// the settings or the workflow afterwards does not change a post already waiting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Posting {
+    Status {
+        channel: uuid::Uuid,
+        text: String,
+    },
+    StageTask {
+        channel: uuid::Uuid,
+        stage: String,
+        visit: u32,
+        /// The name the workflow gives the agent.
+        agent_name: String,
+        /// The agent's pubkey when the post was queued.
+        agent: Pubkey,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxRow {
+    pub id: i64,
+    /// Unique per community. Queueing a key already queued adds nothing.
+    pub key: String,
+    pub card_id: uuid::Uuid,
+    pub posting: Posting,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub done_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+}
+
+/// Posts waiting for the relay. Written in the transaction that changes a run, so a crash
+/// loses none and a retry repeats none.
+#[async_trait::async_trait]
+pub trait OutboxRepo: Send {
+    /// Queues a post. `false` when the key is already queued, done or not.
+    async fn enqueue(
+        &mut self,
+        key: &str,
+        card: uuid::Uuid,
+        posting: &Posting,
+    ) -> Result<bool, StoreError>;
+    /// The oldest post not done, other than those of `skip_cards`, held until the
+    /// transaction ends so two drainers never take the same one.
+    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError>;
+    async fn mark_done(&mut self, id: i64) -> Result<(), StoreError>;
+    /// Counts a failed attempt and keeps the cause.
+    async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError>;
+    /// Every post, done or not, oldest first.
+    async fn all(&mut self) -> Result<Vec<OutboxRow>, StoreError>;
+}
+
 /// A package the store holds versions of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPackage {
@@ -163,6 +265,36 @@ pub trait Directory: Send + Sync {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<Option<Pubkey>, StoreError>;
+    /// Every agent whose display name is `name`, compared case-insensitively.
+    async fn agents_named(
+        &self,
+        community: CommunityId,
+        name: &str,
+    ) -> Result<Vec<AgentInfo>, StoreError>;
+    /// Every agent in the community, by name.
+    async fn list_agents(&self, community: CommunityId) -> Result<Vec<AgentInfo>, StoreError>;
+    /// Whether the channel exists and is not deleted.
+    async fn channel_exists(
+        &self,
+        community: CommunityId,
+        channel: uuid::Uuid,
+    ) -> Result<bool, StoreError>;
+    /// Whether `pubkey` is a current member of the channel.
+    async fn member_of_channel(
+        &self,
+        community: CommunityId,
+        channel: uuid::Uuid,
+        pubkey: &str,
+    ) -> Result<bool, StoreError>;
+}
+
+/// A Buzz agent as the relay lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInfo {
+    pub name: String,
+    pub pubkey: Pubkey,
+    /// The agent's owner, who is a person.
+    pub owner: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

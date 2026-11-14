@@ -239,6 +239,9 @@ service EngineService {
   // when it is unset. It starts no agent. The choice itself is saved with
   // SetSetting and the key agent.profile.
   rpc ListAgentProfiles(ListAgentProfilesRequest) returns (ListAgentProfilesResponse);
+  // Beehive addition, in place of ListAgentProfiles: the Buzz agents a stage
+  // can name, by display name, with the pubkey of each and of its owner.
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   // ListHosts returns every host signed in now or before, with the person's login and whether it has a
   // usable token, and the hosts where StartSignIn can start a browser sign-in.
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
@@ -637,8 +640,10 @@ message PullRequest {
 
 // Run is one attempt at one stage for one card.
 message Run {
-  int64 id = 1;
-  int64 card_id = 2;
+  // Beehive: the run's UUID. The Go engine used an int64.
+  string id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 2;
   string stage_id = 3;
   // running, waiting, paused or ended.
   string state = 4;
@@ -778,9 +783,11 @@ message ListCardsResponse {
 }
 
 message StartStageRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   // Empty starts the card's current stage, or the first stage when the card
-  // has none.
+  // has none. Beehive: only empty is accepted until Phase 8, and the run
+  // starts at the workflow's first stage.
   string stage_id = 2;
   // Parameter values by the name the workflow's package declares. They
   // are the new run's own settings (params.<name>). An undeclared name or a
@@ -1000,12 +1007,13 @@ message SendMessageResponse {
 }
 
 message GetRunRequest {
-  int64 run_id = 1;
+  // Beehive: the run's UUID.
+  string run_id = 1;
 }
 
 message ListRunsRequest {
-  // 0 lists every run.
-  int64 card_id = 1;
+  // Beehive: the card's UUID. Empty lists every run.
+  string card_id = 1;
 }
 
 message ListRunsResponse {
@@ -1827,8 +1835,8 @@ message Setting {
 message GetSettingsRequest {
   // user, workflow, card or run.
   string scope = 1;
-  // The card or run id; unused for user and workflow.
-  int64 scope_id = 2;
+  // Beehive: the card's or run's UUID; empty for user and workflow.
+  string scope_id = 2;
   // With a stage, stage settings include its workflow package values and
   // its stage overrides. A card defaults to its current stage; a run always
   // uses its own.
@@ -1857,8 +1865,8 @@ message InvalidSetting {
 message SetSettingRequest {
   // user, workflow or card.
   string scope = 1;
-  // The card id; unused for user and workflow.
-  int64 scope_id = 2;
+  // Beehive: the card's UUID; empty for user and workflow.
+  string scope_id = 2;
   // A setting key, such as "agent.model_tier". A workflow or card key may name
   // one stage: "stage.<id>.<key>".
   string key = 3;
@@ -1866,6 +1874,23 @@ message SetSettingRequest {
   string value_json = 4;
   // The workflow name for scope "workflow".
   string workflow = 5;
+}
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  // Sorted by name.
+  repeated AgentInfo agents = 1;
+}
+
+// AgentInfo is one Buzz agent as the relay lists it.
+message AgentInfo {
+  // The agent's display name, which a workflow stage names in agent.
+  string name = 1;
+  // 64 hex characters.
+  string pubkey = 2;
+  // The pubkey of the person who owns the agent, 64 hex characters.
+  string owner_pubkey = 3;
 }
 
 message ListAgentProfilesRequest {}

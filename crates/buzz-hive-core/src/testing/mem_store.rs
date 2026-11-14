@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
+use crate::domain::run::{Run, RunState};
 use crate::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, Directory, EventsRepo, Pubkey, SettingsRepo,
-    Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
+    AccessRepo, AccessRow, AgentInfo, CardsRepo, CommunityId, Directory, EventsRepo, OutboxRepo,
+    OutboxRow, Posting, Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
+    StoredPackage, Tx, WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -20,6 +22,12 @@ struct State {
     packages: std::collections::BTreeMap<(CommunityId, String), (bool, String)>,
     versions: std::collections::BTreeMap<(CommunityId, String, String), serde_json::Value>,
     options: std::collections::BTreeMap<(CommunityId, String), WorkflowOptions>,
+    /// In creation order, so the newest run is last.
+    runs: Vec<(CommunityId, Run)>,
+    threads: Vec<(CommunityId, StageThread)>,
+    /// In queue order.
+    outbox: Vec<(CommunityId, OutboxRow)>,
+    next_outbox_id: i64,
 }
 
 /// The committed event log, shared by every transaction. It sits outside `State` so
@@ -94,6 +102,12 @@ impl Tx for MemTx {
         self
     }
     fn workflows(&mut self) -> &mut dyn WorkflowsRepo {
+        self
+    }
+    fn runs(&mut self) -> &mut dyn RunsRepo {
+        self
+    }
+    fn outbox(&mut self) -> &mut dyn OutboxRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -226,6 +240,197 @@ impl SettingsRepo for MemTx {
         );
         Ok(())
     }
+
+    async fn remove(&mut self, scope: &str, scope_id: &str, key: &str) -> Result<(), StoreError> {
+        self.work.settings.remove(&(
+            self.community,
+            scope.to_owned(),
+            scope_id.to_owned(),
+            key.to_owned(),
+        ));
+        Ok(())
+    }
+
+    async fn list(
+        &mut self,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, StoreError> {
+        Ok(self
+            .work
+            .settings
+            .iter()
+            .filter(|((community, s, id, _), _)| {
+                *community == self.community && s == scope && id == scope_id
+            })
+            .map(|((_, _, _, key), value)| (key.clone(), value.clone()))
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl RunsRepo for MemTx {
+    async fn insert(&mut self, run: &Run) -> Result<(), StoreError> {
+        if self.find_run(run.id).is_some() {
+            return Err(StoreError::Conflict(format!("run {} exists", run.id)));
+        }
+        self.work.runs.push((self.community, run.clone()));
+        Ok(())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        Ok(self.find_run(id).cloned())
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        Ok(self.find_run(id).cloned())
+    }
+
+    async fn update(&mut self, run: &Run) -> Result<(), StoreError> {
+        let community = self.community;
+        let found = self
+            .work
+            .runs
+            .iter_mut()
+            .find(|(c, r)| *c == community && r.id == run.id)
+            .map(|(_, r)| r)
+            .ok_or_else(|| StoreError::NotFound(format!("run {}", run.id)))?;
+        *found = run.clone();
+        Ok(())
+    }
+
+    async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError> {
+        Ok(self
+            .work
+            .runs
+            .iter()
+            .rev()
+            .filter(|(c, r)| *c == self.community && card.is_none_or(|id| r.card_id == id))
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+
+    async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        Ok(self
+            .work
+            .runs
+            .iter()
+            .rev()
+            .find(|(c, r)| *c == self.community && r.card_id == card && r.state != RunState::Ended)
+            .map(|(_, r)| r.clone()))
+    }
+
+    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError> {
+        Ok(self
+            .work
+            .runs
+            .iter()
+            .filter(|(c, r)| {
+                *c == self.community
+                    && r.card_id == card
+                    && r.current_stage.as_deref() == Some(stage)
+            })
+            .map(|(_, r)| r.visit)
+            .max()
+            .unwrap_or(0))
+    }
+
+    async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError> {
+        let community = self.community;
+        let known = self.work.threads.iter().any(|(c, t)| {
+            *c == community
+                && t.card_id == thread.card_id
+                && t.stage == thread.stage
+                && t.visit == thread.visit
+        });
+        if !known {
+            self.work.threads.push((community, thread.clone()));
+        }
+        Ok(())
+    }
+
+    async fn thread(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Option<StageThread>, StoreError> {
+        Ok(self
+            .work
+            .threads
+            .iter()
+            .find(|(c, t)| {
+                *c == self.community && t.card_id == card && t.stage == stage && t.visit == visit
+            })
+            .map(|(_, t)| t.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl OutboxRepo for MemTx {
+    async fn enqueue(
+        &mut self,
+        key: &str,
+        card: uuid::Uuid,
+        posting: &Posting,
+    ) -> Result<bool, StoreError> {
+        let community = self.community;
+        if self
+            .work
+            .outbox
+            .iter()
+            .any(|(c, row)| *c == community && row.key == key)
+        {
+            return Ok(false);
+        }
+        self.work.next_outbox_id += 1;
+        let row = OutboxRow {
+            id: self.work.next_outbox_id,
+            key: key.to_owned(),
+            card_id: card,
+            posting: posting.clone(),
+            created_at: chrono::Utc::now(),
+            done_at: None,
+            attempts: 0,
+            last_error: None,
+        };
+        self.work.outbox.push((community, row));
+        Ok(true)
+    }
+
+    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError> {
+        Ok(self
+            .work
+            .outbox
+            .iter()
+            .find(|(c, row)| {
+                *c == self.community && row.done_at.is_none() && !skip_cards.contains(&row.card_id)
+            })
+            .map(|(_, row)| row.clone()))
+    }
+
+    async fn mark_done(&mut self, id: i64) -> Result<(), StoreError> {
+        let row = self.outbox_row(id)?;
+        row.done_at = Some(chrono::Utc::now());
+        Ok(())
+    }
+
+    async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError> {
+        let row = self.outbox_row(id)?;
+        row.attempts += 1;
+        row.last_error = Some(error.to_owned());
+        Ok(())
+    }
+
+    async fn all(&mut self) -> Result<Vec<OutboxRow>, StoreError> {
+        Ok(self
+            .work
+            .outbox
+            .iter()
+            .filter(|(c, _)| *c == self.community)
+            .map(|(_, row)| row.clone())
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]
@@ -356,6 +561,24 @@ impl WorkflowsRepo for MemTx {
 }
 
 impl MemTx {
+    fn find_run(&self, id: uuid::Uuid) -> Option<&Run> {
+        self.work
+            .runs
+            .iter()
+            .find(|(community, run)| *community == self.community && run.id == id)
+            .map(|(_, run)| run)
+    }
+
+    fn outbox_row(&mut self, id: i64) -> Result<&mut OutboxRow, StoreError> {
+        let community = self.community;
+        self.work
+            .outbox
+            .iter_mut()
+            .find(|(c, row)| *c == community && row.id == id)
+            .map(|(_, row)| row)
+            .ok_or_else(|| StoreError::NotFound(format!("outbox row {id}")))
+    }
+
     fn find(&self, id: uuid::Uuid) -> Option<&(CommunityId, Card)> {
         self.work
             .cards
@@ -379,6 +602,8 @@ impl MemTx {
 pub struct FakeDirectory {
     roles: HashMap<Pubkey, RelayRole>,
     owners: HashMap<Pubkey, Pubkey>,
+    agents: Vec<AgentInfo>,
+    channels: HashMap<uuid::Uuid, Vec<Pubkey>>,
 }
 
 impl FakeDirectory {
@@ -393,6 +618,24 @@ impl FakeDirectory {
 
     pub fn with_agent(mut self, agent: &str, owner: &str) -> Self {
         self.owners.insert(agent.to_owned(), owner.to_owned());
+        self
+    }
+
+    /// An agent the relay lists under `name`. Its owner is `owner`.
+    pub fn with_named_agent(mut self, name: &str, pubkey: &str, owner: &str) -> Self {
+        self.owners.insert(pubkey.to_owned(), owner.to_owned());
+        self.agents.push(AgentInfo {
+            name: name.to_owned(),
+            pubkey: pubkey.to_owned(),
+            owner: Some(owner.to_owned()),
+        });
+        self
+    }
+
+    /// A channel that exists, with these current members.
+    pub fn with_channel(mut self, channel: uuid::Uuid, members: &[&str]) -> Self {
+        self.channels
+            .insert(channel, members.iter().map(|m| (*m).to_owned()).collect());
         self
     }
 }
@@ -413,5 +656,44 @@ impl Directory for FakeDirectory {
         pubkey: &str,
     ) -> Result<Option<Pubkey>, StoreError> {
         Ok(self.owners.get(pubkey).cloned())
+    }
+
+    async fn agents_named(
+        &self,
+        _community: CommunityId,
+        name: &str,
+    ) -> Result<Vec<AgentInfo>, StoreError> {
+        Ok(self
+            .agents
+            .iter()
+            .filter(|a| a.name.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_agents(&self, _community: CommunityId) -> Result<Vec<AgentInfo>, StoreError> {
+        let mut agents = self.agents.clone();
+        agents.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.pubkey.cmp(&b.pubkey)));
+        Ok(agents)
+    }
+
+    async fn channel_exists(
+        &self,
+        _community: CommunityId,
+        channel: uuid::Uuid,
+    ) -> Result<bool, StoreError> {
+        Ok(self.channels.contains_key(&channel))
+    }
+
+    async fn member_of_channel(
+        &self,
+        _community: CommunityId,
+        channel: uuid::Uuid,
+        pubkey: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .channels
+            .get(&channel)
+            .is_some_and(|members| members.iter().any(|m| m == pubkey)))
     }
 }

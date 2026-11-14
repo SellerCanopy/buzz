@@ -38,6 +38,8 @@ fn app(directory: FakeDirectory, store: MemStore) -> App {
         bus: Bus::new(0),
         catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
+        hive_pubkey: "ee".into(),
+        outbox: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

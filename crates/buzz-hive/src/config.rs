@@ -16,6 +16,13 @@ pub struct Config {
     /// `BUZZ_HIVE_WORKFLOWS_DIR`, a folder of workflow packages loaded beside the built-in
     /// ones. Unset means built-ins only.
     pub workflows_dir: Option<std::path::PathBuf>,
+    /// `BUZZ_HIVE_NOSTR_KEY`, the secret key of the Beehive account, as `nsec1...` or 64
+    /// hex characters. It signs the posts in the update channel. Unset means the service
+    /// runs but cannot start a run.
+    pub nostr_key: Option<String>,
+    /// `BUZZ_HIVE_RELAY_URL`, the relay's WebSocket address, such as `ws://relay:3000`.
+    /// Required with `BUZZ_HIVE_NOSTR_KEY`.
+    pub relay_url: Option<String>,
 }
 
 impl Config {
@@ -40,6 +47,21 @@ impl Config {
             return Err("BUZZ_HIVE_TOKEN_SECRET must be at least 32 bytes".into());
         }
         let allowed_origins = parse_origins(get("BUZZ_HIVE_ALLOWED_ORIGINS").as_deref())?;
+        let optional = |name: &str| {
+            get(name)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let nostr_key = optional("BUZZ_HIVE_NOSTR_KEY");
+        let relay_url = optional("BUZZ_HIVE_RELAY_URL");
+        if nostr_key.is_some() && relay_url.is_none() {
+            return Err("BUZZ_HIVE_RELAY_URL is required with BUZZ_HIVE_NOSTR_KEY".into());
+        }
+        if let Some(url) = &relay_url {
+            if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+                return Err("BUZZ_HIVE_RELAY_URL must start with ws:// or wss://".into());
+            }
+        }
         Ok(Self {
             database_url: required("BUZZ_HIVE_DATABASE_URL")?,
             listen,
@@ -52,6 +74,8 @@ impl Config {
             workflows_dir: get("BUZZ_HIVE_WORKFLOWS_DIR")
                 .filter(|v| !v.trim().is_empty())
                 .map(Into::into),
+            nostr_key,
+            relay_url,
         })
     }
 }
@@ -163,6 +187,27 @@ mod tests {
         pairs.push(("BUZZ_HIVE_WORKFLOWS_DIR", "/srv/workflows"));
         let config = Config::from_lookup(env(&pairs)).unwrap();
         assert_eq!(config.workflows_dir, Some("/srv/workflows".into()));
+    }
+
+    #[test]
+    fn the_relay_account_is_optional_but_needs_its_relay() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert_eq!((config.nostr_key, config.relay_url), (None, None));
+
+        let mut pairs = FULL.to_vec();
+        pairs.push(("BUZZ_HIVE_NOSTR_KEY", "ab".repeat(32).leak()));
+        let error = Config::from_lookup(env(&pairs)).err().unwrap();
+        assert!(error.contains("BUZZ_HIVE_RELAY_URL"), "{error}");
+
+        pairs.push(("BUZZ_HIVE_RELAY_URL", "http://relay:3000"));
+        let error = Config::from_lookup(env(&pairs)).err().unwrap();
+        assert!(error.contains("ws://"), "{error}");
+
+        pairs.pop();
+        pairs.push(("BUZZ_HIVE_RELAY_URL", "ws://relay:3000"));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.relay_url.as_deref(), Some("ws://relay:3000"));
+        assert!(config.nostr_key.is_some());
     }
 
     #[test]

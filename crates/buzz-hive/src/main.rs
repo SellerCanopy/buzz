@@ -1,10 +1,8 @@
 //! The Beehive workflow engine service.
 
-mod config;
-mod dir_source;
-
 use std::sync::Arc;
 
+use buzz_hive::{config, dir_source, drain, relay_adapter};
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
@@ -69,6 +67,28 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("cannot record the built-in workflows: {e}"))?;
     tracing::info!(recorded, "built-in workflows recorded");
 
+    // The Beehive account posts to the update channel. Without a key the service still
+    // serves everything else, and a start names the missing variable.
+    let relay_adapter = match (&config.nostr_key, &config.relay_url) {
+        (Some(key), Some(url)) => {
+            let keys = nostr::Keys::parse(key).map_err(|_| {
+                "BUZZ_HIVE_NOSTR_KEY is not an nsec or 64 hex characters".to_owned()
+            })?;
+            Some(Arc::new(relay_adapter::RelayAdapter::new(
+                keys,
+                url.clone(),
+            )))
+        }
+        _ => {
+            tracing::warn!("BUZZ_HIVE_NOSTR_KEY is not set: runs cannot be started");
+            None
+        }
+    };
+    let hive_pubkey = relay_adapter
+        .as_ref()
+        .map(|adapter| adapter.pubkey())
+        .unwrap_or_default();
+
     let app = App {
         config: Arc::new(ApiConfig {
             public_url: config.public_url.clone(),
@@ -84,14 +104,29 @@ async fn run() -> Result<(), String> {
         bus: Bus::new(0),
         catalog,
         community,
+        hive_pubkey: hive_pubkey.clone(),
+        outbox: Arc::new(tokio::sync::Notify::new()),
     };
     let bus = app.bus.clone();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let drain = relay_adapter.map(|relay| {
+        let drain = drain::Drain {
+            store: app.store.clone(),
+            directory: app.directory.clone(),
+            relay,
+            bus: app.bus.clone(),
+            community,
+            hive: hive_pubkey.clone(),
+            wake: app.outbox.clone(),
+        };
+        tokio::spawn(drain.run(stopped))
+    });
     let router = buzz_hive_api::finish(buzz_hive_api::routes(&app), app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.listen))?;
-    tracing::info!(listen = %config.listen, %community, "buzz-hive started");
+    tracing::info!(listen = %config.listen, %community, account = %hive_pubkey, "buzz-hive started");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown().await;
@@ -99,7 +134,12 @@ async fn run() -> Result<(), String> {
             bus.close();
         })
         .await
-        .map_err(|e| format!("server error: {e}"))
+        .map_err(|e| format!("server error: {e}"))?;
+    let _ = stop.send(true);
+    if let Some(drain) = drain {
+        let _ = drain.await;
+    }
+    Ok(())
 }
 
 /// Resolves on SIGTERM or Ctrl-C.

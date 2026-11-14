@@ -4,8 +4,11 @@
 //! and generated types carry over. `tests/procedures.rs` checks that every rpc in
 //! `engine.proto` is routed, dropped with a reason, or still pending.
 
+mod agents;
 mod cards;
 pub mod poll;
+mod runs;
+mod settings;
 mod status;
 mod workflows;
 
@@ -32,6 +35,14 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("CheckWorkflow", Level::Read),
     ("ListTemplateVariables", Level::Read),
     ("ListStageTemplates", Level::Read),
+    ("StartStage", Level::Run),
+    ("GetRun", Level::Read),
+    ("ListRuns", Level::Read),
+    ("GetSettings", Level::Read),
+    // Run admits a card or workflow setting. The handler asks for Admin when the scope is
+    // the community's own.
+    ("SetSetting", Level::Run),
+    ("ListAgents", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -151,5 +162,29 @@ pub fn router(app: &App) -> Router<App> {
                 needs("ListStageTemplates"),
                 workflows::list_stage_templates,
             ),
+        )
+        .route(
+            &path("StartStage"),
+            unary(app.clone(), needs("StartStage"), runs::start_stage),
+        )
+        .route(
+            &path("GetRun"),
+            unary(app.clone(), needs("GetRun"), runs::get_run),
+        )
+        .route(
+            &path("ListRuns"),
+            unary(app.clone(), needs("ListRuns"), runs::list_runs),
+        )
+        .route(
+            &path("GetSettings"),
+            unary(app.clone(), needs("GetSettings"), settings::get_settings),
+        )
+        .route(
+            &path("SetSetting"),
+            unary(app.clone(), needs("SetSetting"), settings::set_setting),
+        )
+        .route(
+            &path("ListAgents"),
+            unary(app.clone(), needs("ListAgents"), agents::list_agents),
         )
 }

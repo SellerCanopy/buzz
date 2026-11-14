@@ -31,9 +31,25 @@ pub struct App {
     /// from the next one.
     pub catalog: Arc<dyn CatalogSource>,
     pub community: CommunityId,
+    /// The Beehive account's pubkey, hex, empty when the service has no key. It posts to
+    /// the update channel, so it must be a member of it.
+    pub hive_pubkey: String,
+    /// Wakes the outbox drain after a commit that queued a post.
+    pub outbox: Arc<tokio::sync::Notify>,
 }
 
 impl App {
+    /// The Beehive account's pubkey, or the sentence to show when the service has no key.
+    pub fn require_hive(&self) -> Result<&str, HiveError> {
+        if self.hive_pubkey.is_empty() {
+            return Err(HiveError::FailedPrecondition(
+                "Beehive has no relay account yet: set BUZZ_HIVE_NOSTR_KEY and BUZZ_HIVE_RELAY_URL, then restart it"
+                    .into(),
+            ));
+        }
+        Ok(&self.hive_pubkey)
+    }
+
     /// The actor behind `pubkey`, with the level it holds right now.
     pub async fn resolve(&self, pubkey: &str) -> Result<Actor, HiveError> {
         let mut tx = self.store.begin(self.community).await?;

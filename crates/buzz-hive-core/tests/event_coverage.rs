@@ -11,10 +11,13 @@ use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
 };
+use buzz_hive_core::orchestrator::outbox::drain_outbox;
+use buzz_hive_core::orchestrator::run::start_run;
+use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::testing::MemStore;
-use common::person;
+use common::{person, Fixture, CHANNEL, COMMUNITY};
 
-const CURRENT_PHASE: u8 = 4;
+const CURRENT_PHASE: u8 = 6;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -56,10 +59,39 @@ async fn card_scenarios(store: &MemStore) {
     delete_card(store, &ctx, card.id).await.unwrap();
 }
 
+/// Phase 6: the update channel, a run that starts, and the stage task that reaches the relay.
+async fn run_scenarios(f: &Fixture) {
+    let ctx = person();
+    set_setting(
+        &f.env(),
+        &ctx,
+        &Scope::User,
+        "update_channel",
+        Some(serde_json::json!(CHANNEL.to_string())),
+    )
+    .await
+    .unwrap();
+    let (card, _) = create_card(
+        &f.store,
+        &ctx,
+        NewCard {
+            title: "run".into(),
+            workflow: "demo".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    start_run(&f.env(), &ctx, card.id).await.unwrap();
+    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
-    let store = MemStore::new();
-    card_scenarios(&store).await;
+    let f = Fixture::new();
+    let store = &f.store;
+    card_scenarios(store).await;
+    run_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

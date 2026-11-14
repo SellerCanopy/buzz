@@ -117,17 +117,17 @@ spec's title and are confirmed when that phase starts.
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
 | `files` | pending | 9 |
-| `filters` | pending (filters narrow by run state and search, which the Phase 4 board does not have; it needs runs) | 6 |
+| `filters` | pending (filters narrow by run state and search; a run now starts, but a card leaves Running only when a stage ends, Phase 7) | 7 |
 | `guide` | pending (the Go spec drives the workflow builder) | 19 |
 | `home` | pending | 3 |
 | `importexport` | pending | 19 |
 | `kilntask` | dropped (Carrier task kind, no Buzz stage) | 1 |
-| `list` | pending (the Go spec lists the board's cards; it needs runs and stages) | 6 |
+| `list` | pending (the Go spec lists the board's cards with their run state; a card finishes only in Phase 7) | 7 |
 | `login` | dropped (team login and cookie session) | 1 |
 | `merge` | pending | 18 |
 | `needs-you` | pending | 12 |
 | `newtask` | pending | 16 |
-| `parameters` | pending | 6 |
+| `parameters` | pending (`StartStage` refuses `parameters` until the run keeps them, Phase 8) | 8 |
 | `paused-turn` | pending | 12 |
 | `permissions` | pending | 14 |
 | `pick-repo` | pending | 21 |
@@ -147,7 +147,7 @@ spec's title and are confirmed when that phase starts.
 | `sources-layout` | pending | 16 |
 | `sources-repo-rule` | pending | 16 |
 | `stack-seed` | pending | 16 |
-| `start` | pending | 6 |
+| `start` | ported (Phase 6: an idle card with a workflow sits in To do, Start run posts the status and the first stage task, the card moves to Running; the third Go test, opening the Issue tab, waits for the card's later tabs) | 6 |
 | `testrun` | dropped (`StartTestRun`) | 1 |
 | `usage` | pending | 12 |
 | `web` | dropped (token screen, sign-in modes) | 1 |

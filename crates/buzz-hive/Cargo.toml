@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "The Beehive workflow engine service"
 
+[lib]
+name = "buzz_hive"
+path = "src/lib.rs"
+
 [[bin]]
 name = "buzz-hive"
 path = "src/main.rs"
@@ -15,12 +19,23 @@ path = "src/main.rs"
 buzz-hive-api = { path = "../buzz-hive-api" }
 buzz-hive-core = { path = "../buzz-hive-core" }
 buzz-hive-store = { path = "../buzz-hive-store" }
+buzz-sdk = { workspace = true }
+buzz-ws-client = { workspace = true }
+async-trait = "0.1"
 axum = { workspace = true }
+chrono = { workspace = true }
+nostr = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 base64 = { workspace = true }
-nostr = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tower = { workspace = true }

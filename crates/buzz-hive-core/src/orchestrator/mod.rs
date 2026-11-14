@@ -4,16 +4,32 @@
 //! [`crate::bus::Bus`], so a rolled-back operation wakes nobody.
 
 pub mod cards;
+pub mod outbox;
+pub mod run;
+pub mod settings;
+pub mod task_message;
 pub mod workflows;
 
 use crate::domain::events::Actor;
-use crate::ports::store::{CommunityId, StoreError};
+use crate::ports::store::{CommunityId, Directory, Store, StoreError};
+use crate::workflow::load::Catalog;
 
 /// Who is acting, and in which community.
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub community: CommunityId,
     pub actor: Actor,
+}
+
+/// What the operations that reach past the store need.
+#[derive(Clone, Copy)]
+pub struct Env<'a> {
+    pub store: &'a dyn Store,
+    pub directory: &'a dyn Directory,
+    /// The packages as they are on disk right now.
+    pub catalog: &'a Catalog,
+    /// The Beehive account's pubkey, the one that posts and must be in the update channel.
+    pub hive: &'a str,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -3,9 +3,10 @@
 use buzz_hive_core::access::{ActorKind, Level};
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
+use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, SettingsRepo, Store, StoreError,
-    StoredPackage, Tx, WorkflowsRepo,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, OutboxRepo, OutboxRow, Posting,
+    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -62,6 +63,12 @@ impl Tx for PgTx {
         self
     }
     fn workflows(&mut self) -> &mut dyn WorkflowsRepo {
+        self
+    }
+    fn runs(&mut self) -> &mut dyn RunsRepo {
+        self
+    }
+    fn outbox(&mut self) -> &mut dyn OutboxRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -181,6 +188,39 @@ impl SettingsRepo for PgTx {
         .await
         .map_err(unavailable)?;
         Ok(())
+    }
+
+    async fn remove(&mut self, scope: &str, scope_id: &str, key: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM hive.settings \
+             WHERE community_id = $1 AND scope = $2 AND scope_id = $3 AND key = $4",
+        )
+        .bind(self.community)
+        .bind(scope)
+        .bind(scope_id)
+        .bind(key)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(())
+    }
+
+    async fn list(
+        &mut self,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, StoreError> {
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT key, value FROM hive.settings \
+             WHERE community_id = $1 AND scope = $2 AND scope_id = $3",
+        )
+        .bind(self.community)
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(rows.into_iter().collect())
     }
 }
 
@@ -522,5 +562,333 @@ impl WorkflowsRepo for PgTx {
         .await
         .map_err(unavailable)?;
         Ok(())
+    }
+}
+
+type RunRow = (
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    String,
+    String,
+    Option<String>,
+    i32,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// `SELECT` for [`RunRow`] followed by `$tail`, as one literal so sqlx sees a static string.
+macro_rules! select_run {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, card_id, workflow, workflow_hash, state, current_stage, visit, requester, \
+             started_at, ended_at FROM hive.runs ",
+            $tail
+        )
+    };
+}
+
+fn decode_run(row: RunRow) -> Result<Run, StoreError> {
+    let (
+        id,
+        card_id,
+        workflow,
+        workflow_hash,
+        state,
+        current_stage,
+        visit,
+        requester,
+        started_at,
+        ended_at,
+    ) = row;
+    let state = RunState::parse(&state)
+        .ok_or_else(|| StoreError::Conflict(format!("stored state {state} for run {id}")))?;
+    Ok(Run {
+        id,
+        card_id,
+        workflow,
+        workflow_hash,
+        state,
+        current_stage,
+        visit: u32::try_from(visit)
+            .map_err(|_| StoreError::Conflict(format!("stored visit {visit} for run {id}")))?,
+        requester,
+        started_at,
+        ended_at,
+    })
+}
+
+#[async_trait::async_trait]
+impl RunsRepo for PgTx {
+    async fn insert(&mut self, run: &Run) -> Result<(), StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO hive.runs \
+             (community_id, id, card_id, workflow, workflow_hash, state, current_stage, visit, \
+              requester, started_at, ended_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(run.id)
+        .bind(run.card_id)
+        .bind(&run.workflow)
+        .bind(&run.workflow_hash)
+        .bind(run.state.as_str())
+        .bind(&run.current_stage)
+        .bind(run.visit as i32)
+        .bind(&run.requester)
+        .bind(run.started_at)
+        .bind(run.ended_at)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        // `ON CONFLICT DO NOTHING` with no target covers the id and the one-active-run index,
+        // and leaves the transaction usable, which a raised unique violation would not.
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::Conflict(format!(
+                "run {} exists, or card {} already has a run that has not ended",
+                run.id, run.card_id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        let row: Option<RunRow> =
+            sqlx::query_as(select_run!("WHERE community_id = $1 AND id = $2"))
+                .bind(self.community)
+                .bind(id)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+        row.map(decode_run).transpose()
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        let row: Option<RunRow> = sqlx::query_as(select_run!(
+            "WHERE community_id = $1 AND id = $2 FOR UPDATE"
+        ))
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        row.map(decode_run).transpose()
+    }
+
+    async fn update(&mut self, run: &Run) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE hive.runs SET state = $3, current_stage = $4, visit = $5, requester = $6, \
+             ended_at = $7 WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(run.id)
+        .bind(run.state.as_str())
+        .bind(&run.current_stage)
+        .bind(run.visit as i32)
+        .bind(&run.requester)
+        .bind(run.ended_at)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("run {}", run.id)));
+        }
+        Ok(())
+    }
+
+    async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError> {
+        let rows: Vec<RunRow> = sqlx::query_as(select_run!(
+            "WHERE community_id = $1 AND ($2::uuid IS NULL OR card_id = $2) \
+             ORDER BY started_at DESC, id DESC"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter().map(decode_run).collect()
+    }
+
+    async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError> {
+        let row: Option<RunRow> = sqlx::query_as(select_run!(
+            "WHERE community_id = $1 AND card_id = $2 AND state <> 'ended'"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        row.map(decode_run).transpose()
+    }
+
+    async fn visits(&mut self, card: uuid::Uuid, stage: &str) -> Result<u32, StoreError> {
+        let visits: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(max(visit), 0) FROM hive.runs \
+             WHERE community_id = $1 AND card_id = $2 AND current_stage = $3",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(stage)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(visits.max(0) as u32)
+    }
+
+    async fn record_thread(&mut self, thread: &StageThread) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.stage_threads \
+             (community_id, card_id, stage, visit, root_event_id, agent_pubkey) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (community_id, card_id, stage, visit) DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(thread.card_id)
+        .bind(&thread.stage)
+        .bind(thread.visit as i32)
+        .bind(&thread.root_event_id)
+        .bind(&thread.agent_pubkey)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(())
+    }
+
+    async fn thread(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Option<StageThread>, StoreError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT root_event_id, agent_pubkey FROM hive.stage_threads \
+             WHERE community_id = $1 AND card_id = $2 AND stage = $3 AND visit = $4",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(stage)
+        .bind(visit as i32)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(row.map(|(root_event_id, agent_pubkey)| StageThread {
+            card_id: card,
+            stage: stage.to_owned(),
+            visit,
+            root_event_id,
+            agent_pubkey,
+        }))
+    }
+}
+
+type OutboxDbRow = (
+    i64,
+    String,
+    uuid::Uuid,
+    serde_json::Value,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i32,
+    Option<String>,
+);
+
+/// `SELECT` for [`OutboxDbRow`] followed by `$tail`.
+macro_rules! select_outbox {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, key, card_id, effect, created_at, done_at, attempts, last_error \
+             FROM hive.outbox ",
+            $tail
+        )
+    };
+}
+
+fn decode_outbox(row: OutboxDbRow) -> Result<OutboxRow, StoreError> {
+    let (id, key, card_id, effect, created_at, done_at, attempts, last_error) = row;
+    let posting: Posting = serde_json::from_value(effect)
+        .map_err(|e| StoreError::Conflict(format!("stored post {key}: {e}")))?;
+    Ok(OutboxRow {
+        id,
+        key,
+        card_id,
+        posting,
+        created_at,
+        done_at,
+        attempts,
+        last_error,
+    })
+}
+
+#[async_trait::async_trait]
+impl OutboxRepo for PgTx {
+    async fn enqueue(
+        &mut self,
+        key: &str,
+        card: uuid::Uuid,
+        posting: &Posting,
+    ) -> Result<bool, StoreError> {
+        let effect = serde_json::to_value(posting)
+            .map_err(|e| StoreError::Conflict(format!("post {key}: {e}")))?;
+        let inserted = sqlx::query(
+            "INSERT INTO hive.outbox (community_id, key, card_id, effect) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, key) DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(key)
+        .bind(card)
+        .bind(effect)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(inserted.rows_affected() == 1)
+    }
+
+    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError> {
+        let row: Option<OutboxDbRow> = sqlx::query_as(select_outbox!(
+            "WHERE community_id = $1 AND done_at IS NULL AND NOT (card_id = ANY($2)) \
+             ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ))
+        .bind(self.community)
+        .bind(skip_cards)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        row.map(decode_outbox).transpose()
+    }
+
+    async fn mark_done(&mut self, id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE hive.outbox SET done_at = now() WHERE community_id = $1 AND id = $2")
+            .bind(self.community)
+            .bind(id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE hive.outbox SET attempts = attempts + 1, last_error = $3 \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .bind(error)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        Ok(())
+    }
+
+    async fn all(&mut self) -> Result<Vec<OutboxRow>, StoreError> {
+        let rows: Vec<OutboxDbRow> =
+            sqlx::query_as(select_outbox!("WHERE community_id = $1 ORDER BY id"))
+                .bind(self.community)
+                .fetch_all(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+        rows.into_iter().map(decode_outbox).collect()
     }
 }

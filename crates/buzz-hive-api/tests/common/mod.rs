@@ -23,6 +23,8 @@ pub const OWNER: &str = "aa";
 pub const MEMBER: &str = "bb";
 pub const STRANGER: &str = "cc";
 pub const AGENT: &str = "dd";
+/// The Beehive account.
+pub const HIVE: &str = "ee";
 
 pub fn community() -> CommunityId {
     CommunityId::from_u128(1)
@@ -54,6 +56,8 @@ pub async fn app(store: MemStore) -> App {
         bus: Bus::new(0),
         catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
+        hive_pubkey: HIVE.into(),
+        outbox: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

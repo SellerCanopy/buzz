@@ -61,6 +61,9 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // `AddNote` appends it in Phase 4, ahead of the activity feed in Phase 12.
     ("activity.added", 4),
     ("setting.changed", 6),
+    ("run.started", 6),
+    // A stage task reached the relay and opened its thread.
+    ("stage.posted", 6),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

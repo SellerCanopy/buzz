@@ -6,10 +6,12 @@
 
 pub mod access;
 pub mod bus;
+pub mod config;
 pub mod domain;
 pub mod orchestrator;
 pub mod ports;
 pub mod resolve;
+pub mod rules;
 pub mod workflow;
 
 #[cfg(any(test, feature = "testing"))]
