@@ -88,3 +88,62 @@ async fn settings_round_trip_and_update() {
         Some(serde_json::json!({"a": 2}))
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn cards_list_newest_first_by_board_or_archive_and_stay_in_their_community() {
+    let (store, guard, _relay) = store("hive_store_cards").await;
+    let admin = sqlx::PgPool::connect(guard.url()).await.unwrap();
+    let one = CommunityId::from_u128(1);
+    let two = CommunityId::from_u128(2);
+    let ids: Vec<uuid::Uuid> = (1..=4).map(uuid::Uuid::from_u128).collect();
+    // (community, id, title, archived, minutes ago)
+    for (community, id, title, archived, ago) in [
+        (one, ids[0], "oldest", false, 30),
+        (one, ids[1], "newest", false, 1),
+        (one, ids[2], "archived", true, 10),
+        (two, ids[3], "elsewhere", false, 5),
+    ] {
+        sqlx::query(
+            "INSERT INTO hive.cards (community_id, id, title, created_by, created_at, archived_at) \
+             VALUES ($1, $2, $3, 'aa', now() - make_interval(mins => $4), \
+                     CASE WHEN $5 THEN now() END)",
+        )
+        .bind(community)
+        .bind(id)
+        .bind(title)
+        .bind(ago)
+        .bind(archived)
+        .execute(&admin)
+        .await
+        .unwrap();
+    }
+
+    let mut tx = store.begin(one).await.unwrap();
+    let board: Vec<String> = tx
+        .cards()
+        .list(false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.title)
+        .collect();
+    assert_eq!(board, ["newest", "oldest"]);
+    let archive = tx.cards().list(true).await.unwrap();
+    assert_eq!(archive.len(), 1);
+    assert!(archive[0].archived);
+    assert_eq!(
+        archive[0].state,
+        buzz_hive_core::domain::card::CardState::Idle
+    );
+
+    assert_eq!(
+        tx.cards().get(ids[1]).await.unwrap().unwrap().title,
+        "newest"
+    );
+    assert_eq!(
+        tx.cards().get(ids[3]).await.unwrap(),
+        None,
+        "another community's card"
+    );
+}

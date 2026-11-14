@@ -18,6 +18,16 @@ impl Level {
         self as i16
     }
 
+    /// The lowercase name shown to people and sent to clients.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Run => "run",
+            Self::Admin => "admin",
+        }
+    }
+
     /// The inverse of [`Level::as_i16`]. `None` for a value outside 0 to 3.
     pub fn from_i16(value: i16) -> Option<Self> {
         match value {

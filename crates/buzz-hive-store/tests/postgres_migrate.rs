@@ -25,7 +25,10 @@ async fn hive_keeps_its_own_migration_history() {
         .fetch_one(&relay_pool)
         .await
         .unwrap();
-    assert_eq!(hive, 1);
+    let files = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .count() as i64;
+    assert_eq!(hive, files, "one history row per migration file");
     assert_eq!(
         before, after,
         "the relay's migration history must not change"
@@ -61,12 +64,12 @@ async fn migrating_without_create_on_the_database_works_once_the_schema_exists()
     buzz_hive_store::migrate::migrate(&pool).await.unwrap();
     let tables: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables \
-         WHERE table_schema = 'hive' AND table_name IN ('access_levels', 'settings')",
+         WHERE table_schema = 'hive' AND table_name IN ('access_levels', 'settings', 'cards')",
     )
     .fetch_one(&relay_pool)
     .await
     .unwrap();
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 3);
     pool.close().await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP SCHEMA hive CASCADE; DROP ROLE {role};"

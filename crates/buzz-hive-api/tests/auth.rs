@@ -62,7 +62,7 @@ async fn send(router: &Router, request: Request<Body>) -> (StatusCode, serde_jso
 }
 
 fn router(app: App) -> Router {
-    buzz_hive_api::finish(buzz_hive_api::routes(), app)
+    buzz_hive_api::finish(buzz_hive_api::routes(&app), app)
 }
 
 fn member(keys: &Keys) -> FakeDirectory {
@@ -223,7 +223,7 @@ fn echo_router(app: App, needs: Level) -> Router {
             Ok(serde_json::json!({ "who": ctx.actor.pubkey, "got": req }))
         },
     );
-    buzz_hive_api::finish(buzz_hive_api::routes().route("/test/echo", route), app)
+    buzz_hive_api::finish(buzz_hive_api::routes(&app).route("/test/echo", route), app)
 }
 
 fn bearer(app: &App, pubkey: &str) -> String {

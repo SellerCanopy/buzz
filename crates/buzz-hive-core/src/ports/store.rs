@@ -1,6 +1,7 @@
 //! Storage port: one transaction per community, plus read-only relay facts.
 
 use crate::access::{ActorKind, Level, RelayRole};
+use crate::domain::card::Card;
 
 pub type CommunityId = uuid::Uuid;
 /// 64 hex characters, lowercase.
@@ -28,6 +29,7 @@ pub trait Store: Send + Sync {
 pub trait Tx: Send {
     fn access(&mut self) -> &mut dyn AccessRepo;
     fn settings(&mut self) -> &mut dyn SettingsRepo;
+    fn cards(&mut self) -> &mut dyn CardsRepo;
     async fn commit(self: Box<Self>) -> Result<(), StoreError>;
 }
 
@@ -59,6 +61,13 @@ pub trait SettingsRepo: Send {
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), StoreError>;
+}
+
+#[async_trait::async_trait]
+pub trait CardsRepo: Send {
+    /// The board's cards, newest first, or the archive when `archived` is set.
+    async fn list(&mut self, archived: bool) -> Result<Vec<Card>, StoreError>;
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError>;
 }
 
 /// Relay facts, read-only. Implemented by `buzz-hive-store::relay_read`.

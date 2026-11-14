@@ -63,7 +63,7 @@ async fn run() -> Result<(), String> {
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
         community,
     };
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app);
+    let router = buzz_hive_api::finish(buzz_hive_api::routes(&app), app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await

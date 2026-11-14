@@ -2,14 +2,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::access::{ActorKind, Level, RelayRole};
+use crate::domain::card::Card;
 use crate::ports::store::{
-    AccessRepo, AccessRow, CommunityId, Directory, Pubkey, SettingsRepo, Store, StoreError, Tx,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, Directory, Pubkey, SettingsRepo, Store,
+    StoreError, Tx,
 };
 
 #[derive(Default, Clone)]
 struct State {
     access: HashMap<(CommunityId, Pubkey), (Level, ActorKind, String)>,
     settings: HashMap<(CommunityId, String, String, String), serde_json::Value>,
+    /// In creation order, so the newest card is last.
+    cards: Vec<(CommunityId, Card)>,
 }
 
 /// A `Store` held in memory. `begin` copies the state and `commit` swaps the
@@ -22,6 +26,11 @@ pub struct MemStore {
 impl MemStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Puts a card on a community's board, as the newest. Later phases create cards through routes.
+    pub fn seed_card(&self, community: CommunityId, card: Card) {
+        self.state.lock().unwrap().cards.push((community, card));
     }
 }
 
@@ -49,6 +58,9 @@ impl Tx for MemTx {
         self
     }
     fn settings(&mut self) -> &mut dyn SettingsRepo {
+        self
+    }
+    fn cards(&mut self) -> &mut dyn CardsRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<(), StoreError> {
@@ -135,6 +147,29 @@ impl SettingsRepo for MemTx {
             value,
         );
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CardsRepo for MemTx {
+    async fn list(&mut self, archived: bool) -> Result<Vec<Card>, StoreError> {
+        Ok(self
+            .work
+            .cards
+            .iter()
+            .rev()
+            .filter(|(community, card)| *community == self.community && card.archived == archived)
+            .map(|(_, card)| card.clone())
+            .collect())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError> {
+        Ok(self
+            .work
+            .cards
+            .iter()
+            .find(|(community, card)| *community == self.community && card.id == id)
+            .map(|(_, card)| card.clone()))
     }
 }
 

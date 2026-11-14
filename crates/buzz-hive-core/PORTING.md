@@ -107,7 +107,7 @@ spec's title and are confirmed when that phase starts.
 | `artifacts` | pending | 9 |
 | `assistant` | pending | 20 |
 | `auto-mode` | pending | 13 |
-| `board` | pending | 3 |
+| `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
 | `boot` | pending | 3 |
 | `browse` | pending | 5 |
 | `builder-run` | pending | 19 |
@@ -152,3 +152,18 @@ spec's title and are confirmed when that phase starts.
 | `usage` | pending | 12 |
 | `web` | dropped (token screen, sign-in modes) | 1 |
 | `workflow-options` | pending | 19 |
+
+## Phase 3 deliverables
+
+- Proto: `crates/buzz-hive-api/proto/kiln/engine/v1/engine.proto` is kiln `main`
+  (89 rpcs) at `proto/kiln/engine/v1/engine.proto`, plus three additive fields:
+  `GetStatusResponse.community_id = 6`, `WhoAmIResponse.kind = 6` and
+  `WhoAmIResponse.owner = 7`.
+- Served: `GetStatus`, `WhoAmI` and `ListCards`. `tests/procedures.rs` fails when
+  an rpc is in none of `ROUTES`, `DROPPED` and `PENDING`, or in two of them.
+- Store: `hive.cards` (migration `0002_cards.sql`) and `CardsRepo` (`list`, `get`).
+  `Card.id` is `int64` in the proto and `uuid` in the table, so `ListCards` sends
+  `id: 0` until Phase 4 settles it.
+- buzz-app: `src/features/beehive/` (types from this proto, client, session,
+  dock page, offline fixture and journey), and the `beehive_authorization` and
+  `beehive_request` desktop commands.

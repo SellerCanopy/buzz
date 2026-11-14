@@ -1,8 +1,9 @@
 //! `Store` over Postgres: one `sqlx` transaction per community.
 
 use buzz_hive_core::access::{ActorKind, Level};
+use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, CommunityId, SettingsRepo, Store, StoreError, Tx,
+    AccessRepo, AccessRow, CardsRepo, CommunityId, SettingsRepo, Store, StoreError, Tx,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -40,6 +41,9 @@ impl Tx for PgTx {
         self
     }
     fn settings(&mut self) -> &mut dyn SettingsRepo {
+        self
+    }
+    fn cards(&mut self) -> &mut dyn CardsRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<(), StoreError> {
@@ -157,5 +161,60 @@ impl SettingsRepo for PgTx {
         .await
         .map_err(unavailable)?;
         Ok(())
+    }
+}
+
+type CardRow = (uuid::Uuid, String, String, String, String, bool, String);
+
+/// `SELECT` for [`CardRow`] followed by `$tail`, as one literal so sqlx sees a static string.
+macro_rules! select_card {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, title, description, state, workflow, archived_at IS NOT NULL, created_by \
+             FROM hive.cards ",
+            $tail
+        )
+    };
+}
+
+fn decode_card(row: CardRow) -> Result<Card, StoreError> {
+    let (id, title, description, state, workflow, archived, created_by) = row;
+    let state = CardState::parse(&state)
+        .ok_or_else(|| StoreError::Conflict(format!("stored state {state} for card {id}")))?;
+    Ok(Card {
+        id,
+        title,
+        description,
+        state,
+        workflow,
+        archived,
+        created_by,
+    })
+}
+
+#[async_trait::async_trait]
+impl CardsRepo for PgTx {
+    async fn list(&mut self, archived: bool) -> Result<Vec<Card>, StoreError> {
+        let rows: Vec<CardRow> = sqlx::query_as(select_card!(
+            "WHERE community_id = $1 AND (archived_at IS NOT NULL) = $2 \
+             ORDER BY created_at DESC, id DESC"
+        ))
+        .bind(self.community)
+        .bind(archived)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter().map(decode_card).collect()
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<Card>, StoreError> {
+        let row: Option<CardRow> =
+            sqlx::query_as(select_card!("WHERE community_id = $1 AND id = $2"))
+                .bind(self.community)
+                .bind(id)
+                .fetch_optional(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+        row.map(decode_card).transpose()
     }
 }
