@@ -112,6 +112,28 @@ pub fn catalog() -> Catalog {
         ),
         // Where a finished card can be handed on to.
         ("second", stage("s1", "")),
+        // draft saves a plan (required), a logo and notes (optional, notes not handed on).
+        // review reads the plan. ship declares no inputs, so it gets what is handed on.
+        (
+            "docs",
+            [
+                stage(
+                    "draft",
+                    "    outputs:\n      - { artifact: plan }\n      - { artifact: logo, optional: true }\n      - { artifact: notes, handoff: false, optional: true }\n",
+                ),
+                stage("review", "    inputs:\n      - { name: plan, required: true }\n"),
+                stage("ship", ""),
+            ]
+            .concat(),
+        ),
+        // A stage that repeats until every item of its plan is checked.
+        (
+            "ticked",
+            stage(
+                "work",
+                "    repeat:\n      until: plan_complete\n      plan: todo\n      max_rounds: 5\n",
+            ),
+        ),
     ];
     for (name, stages) in routed {
         files = files

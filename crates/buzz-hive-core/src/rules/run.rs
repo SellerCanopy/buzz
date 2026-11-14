@@ -51,6 +51,13 @@ pub enum Input {
     Resume,
     /// The stage's agent moves the card to `stage`, in place of the route its result gives.
     Move { stage: String },
+    /// The stage's agent reported `passed`, or moved the card, without saving every output the
+    /// stage requires. The run waits for a person instead of going on.
+    MissingOutput {
+        stage: String,
+        missing: Vec<String>,
+        summary: String,
+    },
 }
 
 /// What the reducer needs to know that is not in the run or the workflow.
@@ -63,8 +70,8 @@ pub struct Facts {
     /// The highest visit the card has made to each stage across all its runs, this one included.
     pub visits: BTreeMap<String, u32>,
     /// The checked and the total items of the plan a `plan_complete` repeat counts, as they are
-    /// after the round that just ended. The plan is an artifact, which arrives with Phase 9, so
-    /// until then it is `(0, 0)`.
+    /// after the round that just ended: the latest version of the stage's plan artifact, or
+    /// `(0, 0)` when it has none.
     pub plan: (u32, u32),
 }
 
@@ -234,6 +241,11 @@ pub fn step(run: &Run, wf: &Package, facts: &Facts, input: Input) -> Step {
         Input::Pause => pause(run),
         Input::Resume => resume(run, wf, facts),
         Input::Move { stage } => move_to(run, wf, facts, &stage),
+        Input::MissingOutput {
+            stage,
+            missing,
+            summary,
+        } => missing_output(run, wf, facts, &stage, &missing, &summary),
     }
 }
 
@@ -325,11 +337,18 @@ impl<'a> Walk<'a> {
 
     /// The run waits for a person, who answers by skipping the stage or moving the card.
     fn wait(&mut self, reason: String) {
+        self.wait_for(reason, json!({}));
+    }
+
+    /// Like [`Self::wait`], with more fields in the `run.waiting` payload.
+    fn wait_for(&mut self, reason: String, extra: serde_json::Value) {
         self.run.state = RunState::Waiting;
-        self.emit(
-            "run.waiting",
-            json!({ "stage": self.run.current_stage, "visit": self.run.visit, "reason": reason }),
-        );
+        let mut payload =
+            json!({ "stage": self.run.current_stage, "visit": self.run.visit, "reason": reason });
+        if let (Some(fields), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+            fields.extend(extra.clone());
+        }
+        self.emit("run.waiting", payload);
         self.reason = Some(reason);
     }
 
@@ -711,6 +730,49 @@ fn stage_done(
     }
     walk.finish()
 }
+
+/// The stage's agent reported `passed` but left out a required output. The report is logged,
+/// and the run waits for a person, who skips the stage or moves the card.
+fn missing_output(
+    run: &Run,
+    wf: &Package,
+    facts: &Facts,
+    stage: &str,
+    missing: &[String],
+    summary: &str,
+) -> Step {
+    let current = run.state == RunState::Running && run.current_stage.as_deref() == Some(stage);
+    let Some((def, _)) = wf.stage(stage).filter(|_| current) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    let round = walk.current().round;
+    walk.emit(
+        "result.reported",
+        json!({
+            "stage": stage,
+            "visit": run.visit,
+            "round": round,
+            "result": RESULT_PASSED,
+            "summary": summary,
+        }),
+    );
+    walk.current().summary = summary.to_owned();
+    let reason = format!(
+        "{} reported passed without saving {}",
+        title(def),
+        missing.join(", ")
+    );
+    walk.wait_for(
+        reason,
+        json!({ "condition": CONDITION_MISSING_OUTPUT, "missing": missing }),
+    );
+    walk.finish()
+}
+
+/// The condition a `run.waiting` event names when a stage passed without a required output.
+/// Phase 12 opens a Needs you item of this kind.
+pub const CONDITION_MISSING_OUTPUT: &str = "missing_output";
 
 /// Moves a waiting or held card on as if its stage had passed.
 fn skip(run: &Run, wf: &Package, facts: &Facts) -> Step {

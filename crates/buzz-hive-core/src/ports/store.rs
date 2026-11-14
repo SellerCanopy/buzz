@@ -1,6 +1,7 @@
 //! Storage port: one transaction per community, plus read-only relay facts.
 
 use crate::access::{ActorKind, Level, RelayRole};
+use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
 use crate::domain::run::Run;
@@ -49,6 +50,7 @@ pub trait Tx: Send {
     fn workflows(&mut self) -> &mut dyn WorkflowsRepo;
     fn runs(&mut self) -> &mut dyn RunsRepo;
     fn outbox(&mut self) -> &mut dyn OutboxRepo;
+    fn artifacts(&mut self) -> &mut dyn ArtifactsRepo;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -116,6 +118,69 @@ pub trait EventsRepo: Send {
     async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError>;
     /// The newest committed seq of this community, 0 when there is none.
     async fn latest_seq(&mut self) -> Result<i64, StoreError>;
+    /// A card's committed events of `kind` with seq greater than `seq`, oldest first, at most
+    /// `limit`.
+    async fn of_card(
+        &mut self,
+        card: uuid::Uuid,
+        kind: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError>;
+}
+
+/// A card's artifacts: each save appends a version, and nothing is ever rewritten.
+#[async_trait::async_trait]
+pub trait ArtifactsRepo: Send {
+    /// What a save writes. The artifact is created by its first save, with `handoff` from the
+    /// stage's declaration (true when it declares none). `Conflict` when the artifact exists
+    /// with the other kind. Versions count from 1. The caller holds the card
+    /// (`CardsRepo::get_for_update`), so two saves of one name queue.
+    async fn save(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+        save: &ArtifactSave,
+    ) -> Result<ArtifactVersion, StoreError>;
+    /// The card's artifacts, by name.
+    async fn list(&mut self, card: uuid::Uuid) -> Result<Vec<ArtifactInfo>, StoreError>;
+    /// Every version of one artifact, oldest first, with content. Empty when it has none.
+    async fn versions(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+    ) -> Result<Vec<ArtifactVersion>, StoreError>;
+    /// One version, or the latest when `version` is `None`.
+    async fn version(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<ArtifactVersion>, StoreError>;
+    /// Sets whether later stages get the artifact. `NotFound` when it does not exist.
+    async fn set_handoff(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+    ) -> Result<(), StoreError>;
+    /// The names `stage` saved during its `visit`, by name.
+    async fn saved_in(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Vec<String>, StoreError>;
+}
+
+/// One save of an artifact version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactSave {
+    pub content: ArtifactContent,
+    pub stage: String,
+    pub visit: u32,
+    pub created_by: Pubkey,
 }
 
 /// What the store keeps of workflow packages: each version by content hash, which one is

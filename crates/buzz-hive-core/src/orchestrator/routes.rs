@@ -11,7 +11,8 @@ use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::task_message::{render_task, CardText};
+use super::task_message::{render_task, CardText, Handoff};
+use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
 use crate::config::{self, Layer, Layers, Resolution};
 use crate::domain::card::{Card, CardState};
@@ -31,20 +32,26 @@ pub(super) enum Mode {
     Update,
 }
 
-/// What the reducer needs to know about the card, read inside the transaction.
+/// What the reducer needs to know about the card, read inside the transaction. `stage` is
+/// the run's current stage, whose repeat plan the facts count.
 pub(super) async fn facts(
     tx: &mut dyn Tx,
     card: &Card,
     package: &Package,
+    stage: Option<&str>,
 ) -> Result<Facts, OpError> {
     let options = tx.workflows().options().await?;
     let resolved = resolve_options(package, options.get(&package.meta.name));
+    let plan = match stage.and_then(|id| package.stage(id)) {
+        Some((stage, _)) => artifacts::plan_progress(tx, card.id, stage).await?,
+        None => (0, 0),
+    };
     Ok(Facts {
-        // Issue labels arrive with intake (Phase 16), and the plan with artifacts (Phase 9).
+        // Issue labels arrive with intake (Phase 16).
         labels: Vec::new(),
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
-        plan: (0, 0),
+        plan,
     })
 }
 
@@ -116,7 +123,7 @@ pub(super) async fn begin_run(
     entry_stage(package, stage).map_err(OpError::FailedPrecondition)?;
     let mut run = Run::new(card.id, &package.meta.name, &package.hash());
     run.parameters = parameters;
-    let facts = facts(tx, card, package).await?;
+    let facts = facts(tx, card, package, None).await?;
     let stepped = step(
         &run,
         package,
@@ -209,7 +216,18 @@ pub(super) async fn apply(
                         "add {agent_name} to the update channel, then try again"
                     )));
                 }
-                let text = task_text(env, tx, card, &run, package, &stage, round.as_ref()).await?;
+                let text = task_text(
+                    env,
+                    tx,
+                    card,
+                    &run,
+                    package,
+                    &stage,
+                    visit,
+                    channel,
+                    round.as_ref(),
+                )
+                .await?;
                 let posting = Posting::StageTask {
                     channel,
                     stage,
@@ -238,7 +256,18 @@ pub(super) async fn apply(
                 };
                 let text = match &note {
                     Note::Round(round) => {
-                        task_text(env, tx, card, &run, package, &stage, Some(round)).await?
+                        task_text(
+                            env,
+                            tx,
+                            card,
+                            &run,
+                            package,
+                            &stage,
+                            visit,
+                            need_channel(channel)?,
+                            Some(round),
+                        )
+                        .await?
                     }
                     Note::Resumed => format!(
                         "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `stage_done` with card_id `{id}`."
@@ -291,7 +320,9 @@ fn card_state(run: &Run, ended: Option<Ended>) -> CardState {
     }
 }
 
-/// The text of a stage's task, with the round's line when it is a later round.
+/// The text of a stage's task, with the round's line when it is a later round. `visit` is the
+/// visit the task opens, and `channel` the channel it is posted in.
+#[allow(clippy::too_many_arguments)]
 async fn task_text(
     env: &Env<'_>,
     tx: &mut dyn Tx,
@@ -299,6 +330,8 @@ async fn task_text(
     run: &Run,
     package: &Package,
     stage: &str,
+    visit: u32,
+    channel: Uuid,
     round: Option<&Round>,
 ) -> Result<String, OpError> {
     let (def, _) = package.stage(stage).ok_or_else(|| {
@@ -310,6 +343,15 @@ async fn task_text(
     let params = resolve_settings(env, tx, card, &run.parameters, Some(stage))
         .await?
         .param_values();
+    let handoff = Handoff {
+        inputs: artifacts::task_inputs(tx, card.id, def).await?,
+        brief: if visit > 1 {
+            activity::brief_for(tx, card.id, stage).await?
+        } else {
+            String::new()
+        },
+        channel: Some(channel),
+    };
     let mut text = render_task(
         package,
         def,
@@ -319,6 +361,7 @@ async fn task_text(
             description: &card.description,
         },
         &params,
+        &handoff,
     )
     .map_err(OpError::FailedPrecondition)?;
     if let Some(round) = round {

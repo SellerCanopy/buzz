@@ -44,7 +44,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 |---|---|---|---|
 | `adapters/acp` | 9 | dropped | 1 |
 | `adapters/actions` | 1 | pending | 18 |
-| `adapters/artifacts/local` | 2 | pending | 9 |
+| `adapters/artifacts/local` | 2 | changed (documents live in the `hive.artifacts` tables of the relay's Postgres and a file is a pointer to a media-store blob, so there is no folder adapter; `postgres_artifacts.rs` and `tests/artifacts.rs` carry the contract) | 9 |
 | `adapters/downloadmark` | 3 | pending | unassigned |
 | `adapters/github` | 20 | pending | 16 |
 | `adapters/gitwork` | 5 | dropped | 1 |
@@ -104,7 +104,7 @@ spec's title and are confirmed when that phase starts.
 | `activity` | pending | 12 |
 | `answers` | pending | 12 |
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
-| `artifacts` | pending | 9 |
+| `artifacts` | changed (Phase 9 ports the contract: save, versions, read, hand-off, the stage-declared outputs rule and the task message naming inputs, in `tests/artifacts.rs` and `buzz-hive-api/tests/artifacts.rs`. The Go spec's approval and image-review screens are not ported; buzz-app `e2e` carries the Files tab) | 9 |
 | `assistant` | pending | 20 |
 | `auto-mode` | pending | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
@@ -112,11 +112,11 @@ spec's title and are confirmed when that phase starts.
 | `browse` | pending (the Go spec browses GitHub issues, which needs intake) | 16 |
 | `builder-run` | pending | 19 |
 | `builder` | pending | 19 |
-| `calls` | pending (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents, so it waits for Phase 9; the spec's inbox and screens are Phase 12) | 12 |
+| `calls` | pending (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents; Phase 9 did not port it, so it stays here; the spec's inbox and screens are Phase 12) | 12 |
 | `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
-| `files` | pending | 9 |
+| `files` | changed (the Files tab lists a card's saved files and documents with a download link, in buzz-app `beehive.journey.mjs` and `BeehivePage.test.tsx`; `buzz-hive/tests/e2e_files.rs` proves the file round trip through the relay's media store. Intake files stay Phase 16) | 9 |
 | `filters` | pending (filters narrow by run state and search; a card now reaches Done, but the Stopped and Failed states the spec filters on arrive with StopRun and routing, Phase 11) | 11 |
 | `guide` | pending (the Go spec drives the workflow builder) | 19 |
 | `home` | pending | 3 |
@@ -289,3 +289,31 @@ spec's title and are confirmed when that phase starts.
 - Dropped: `DecidePermission` and `LevelAsks`. Buzz owns who may do what.
 - Tests: `tests/rules_decide.rs`, `tests/routes.rs` (flat, not `tests/scenarios/routes.rs`),
   `buzz-hive-api/tests/routing.rs` and `buzz-hive/tests/e2e_fresh_session.rs`.
+
+## Phase 9 deliverables
+
+- Migration `0007_artifacts.sql` (timers shift to 0008): `hive.artifacts` with a `handoff`
+  flag and `hive.artifact_versions` with kind, size, media type, media ref and the `visit`
+  that saved it. A text version has no sha256; a file version's `media_ref` holds the media
+  URL if the agent gave one, else the sha256.
+- Core: `domain/artifact.rs`, `rules/checkboxes.rs` (`count_checkboxes`), `rules/brief.rs`,
+  `orchestrator/artifacts.rs` and `orchestrator/activity.rs`. `facts()` now computes
+  `Facts.plan` from the latest version of the stage's plan artifact, which closes the Phase 8
+  stub. Only the stage's mentioned agent saves an artifact. A first save sets the hand-off
+  flag from the stage's `ship`; later saves keep a person's change. A 1 MiB text limit applies.
+- A required output missing at `stage_done` (passed) or `move_card` sets the run and card
+  `waiting` with `run.waiting` condition `missing_output`. Phase 12 opens the inbox item.
+- The task message has an inputs section (artifacts handed to the stage) and an outputs
+  section (names the stage must save). `{{artifacts.*}}` and `{{inputs.*}}` stay empty.
+- Served at Read: `ListArtifacts`, `ListArtifactVersions`, `ReadArtifact`, `ListCardFiles`,
+  `GetBrief`, `ReadHistory`. Served at Run: `SetHandoff`, `SaveArtifact`, `UpdatePlan`,
+  `LogWork`, `RecordDecision`. `card_id` is a string in the existing artifact requests.
+  `ArtifactVersion`, `ArtifactInfo` and `CardFile` gained fields.
+- Tools: `save_artifact`, `read_artifact`, `update_plan`, `log_work`, `record_decision`,
+  `read_history`. The other five methods are `NOT_TOOLS` with reasons.
+- Brief: ported without blockers (there is no `report_blocker` tool); entries are decisions,
+  finished work and notes. It joins the task message only on a visit after the first.
+- Not done: `calls` `give` carrying documents, and `importexport` (Phase 19).
+- Tests: core `tests/artifacts.rs`, api `tests/artifacts.rs`, store
+  `tests/postgres_artifacts.rs`, `buzz-hive/tests/e2e_files.rs` (needs a relay with
+  `BUZZ_MEDIA_READ_MODE=enforce`, a private channel and the community host of the relay).

@@ -6,8 +6,11 @@
 mod common;
 
 use buzz_hive_core::access::ActorKind;
+use buzz_hive_core::domain::artifact::ArtifactContent;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::EVENT_KINDS;
+use buzz_hive_core::orchestrator::activity::log_work;
+use buzz_hive_core::orchestrator::artifacts::{save_artifact, set_handoff};
 use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
@@ -18,7 +21,7 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::testing::MemStore;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 
-const CURRENT_PHASE: u8 = 8;
+const CURRENT_PHASE: u8 = 9;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -170,6 +173,27 @@ async fn routing_scenarios(f: &Fixture) {
     report(card, "passed").await;
 }
 
+/// Phase 9: an agent saves an artifact and logs work, and a person sets the handoff.
+async fn artifact_scenarios(f: &Fixture) {
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let card = begun(f, "docs").await;
+    save_artifact(
+        &f.env(),
+        &agent,
+        card,
+        "plan",
+        ArtifactContent::Text("- [ ] one".into()),
+    )
+    .await
+    .unwrap();
+    log_work(&f.env(), &agent, card, "Wrote the plan.", "", "")
+        .await
+        .unwrap();
+    set_handoff(&f.env(), &person(), card, "plan", false)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let f = Fixture::new();
@@ -178,6 +202,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     run_scenarios(&f).await;
     report_scenarios(&f).await;
     routing_scenarios(&f).await;
+    artifact_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

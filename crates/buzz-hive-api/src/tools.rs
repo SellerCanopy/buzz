@@ -169,6 +169,48 @@ pub const TOOLS: &[Tool] = &[
         schema: set_setting,
     },
     Tool {
+        name: "save_artifact",
+        route: "SaveArtifact",
+        needs: Level::Run,
+        description: "Save the next version of one of the outputs your stage task lists. Give a document as content, or a file with kind file and the sha256, size, type and url that `buzz upload file` printed. Only the agent the stage task mentioned may call it.",
+        schema: save_artifact,
+    },
+    Tool {
+        name: "read_artifact",
+        route: "ReadArtifact",
+        needs: Level::Read,
+        description: "Read one version of a document a stage saved, the latest when version is 0. A file has no text: the result says where to download it with `buzz media get`.",
+        schema: read_artifact,
+    },
+    Tool {
+        name: "update_plan",
+        route: "UpdatePlan",
+        needs: Level::Run,
+        description: "Check or uncheck one item of your stage's plan. It saves a new version of the plan and returns how many items are checked. The plan must be saved with save_artifact first.",
+        schema: update_plan,
+    },
+    Tool {
+        name: "log_work",
+        route: "LogWork",
+        needs: Level::Run,
+        description: "Record one piece of work you finished, so a later session on this stage can see it. One line, up to 120 characters.",
+        schema: log_work,
+    },
+    Tool {
+        name: "record_decision",
+        route: "RecordDecision",
+        needs: Level::Run,
+        description: "Record a choice you made and why, with the options you turned down, so a later session does not reopen it.",
+        schema: record_decision,
+    },
+    Tool {
+        name: "read_history",
+        route: "ReadHistory",
+        needs: Level::Read,
+        description: "Read the work and decisions logged on a card, oldest first. Give after_seq of the last entry you saw to read on.",
+        schema: read_history,
+    },
+    Tool {
         name: "get_hive_health",
         route: "GetStatus",
         needs: Level::Read,
@@ -198,6 +240,26 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "ListStageTemplates",
         "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+    ),
+    (
+        "GetBrief",
+        "the stage task already carries the brief; read_history gives every entry",
+    ),
+    (
+        "ListArtifacts",
+        "the Files tab lists them; a stage task names the inputs it reads, and read_artifact reads one",
+    ),
+    (
+        "ListArtifactVersions",
+        "the Files tab shows every version; an agent reads the one it needs with read_artifact",
+    ),
+    (
+        "ListCardFiles",
+        "the Files tab lists a card's files; a stage task says how to download its inputs",
+    ),
+    (
+        "SetHandoff",
+        "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
     ),
 ];
 
@@ -360,6 +422,146 @@ fn archive_cards() -> Value {
             }),
         )],
         &["cardIds"],
+    )
+}
+
+fn save_artifact() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            (
+                "name",
+                string("The artifact's name, as the stage task lists it."),
+            ),
+            (
+                "kind",
+                string("text for a document (the default), or file for an uploaded file."),
+            ),
+            (
+                "content",
+                string("The document's full text, up to 1 MiB. Leave empty for a file."),
+            ),
+            (
+                "sha256",
+                string("For a file: the hash `buzz upload file` printed."),
+            ),
+            (
+                "size",
+                json!({ "type": "integer", "description": "For a file: its size in bytes." }),
+            ),
+            (
+                "mediaType",
+                string("For a file: its media type, such as image/png."),
+            ),
+            (
+                "mediaRef",
+                string("For a file: the url `buzz upload file` printed, or the hash when it printed none."),
+            ),
+        ],
+        &["cardId", "name"],
+    )
+}
+
+fn read_artifact() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            ("name", string("The artifact's name.")),
+            (
+                "version",
+                json!({ "type": "integer", "description": "The version to read. 0 reads the latest." }),
+            ),
+        ],
+        &["cardId", "name"],
+    )
+}
+
+fn update_plan() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            (
+                "item",
+                string("The item's text as written after its checkbox, up to 1 KiB."),
+            ),
+            (
+                "done",
+                json!({ "type": "boolean", "description": "true checks the item, false unchecks it." }),
+            ),
+        ],
+        &["cardId", "item", "done"],
+    )
+}
+
+fn log_work() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            ("summary", string("One line, 1 to 120 characters.")),
+            (
+                "detail",
+                string("More text, up to 2000 characters. Optional."),
+            ),
+            (
+                "planItem",
+                string("The plan item this work finished. Optional."),
+            ),
+        ],
+        &["cardId", "summary"],
+    )
+}
+
+fn record_decision() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            (
+                "summary",
+                string("The choice, one line of 1 to 120 characters."),
+            ),
+            ("why", string("Why, up to 300 characters.")),
+            (
+                "rejected",
+                json!({
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": object(
+                        vec![
+                            ("option", string("An option you turned down.")),
+                            ("reason", string("Why.")),
+                        ],
+                        &["option"],
+                    ),
+                    "description": "The options you turned down. Optional.",
+                }),
+            ),
+            (
+                "detail",
+                string("More text, up to 2000 characters. Optional."),
+            ),
+            (
+                "supersedes",
+                json!({ "type": "integer", "description": "The seq of an earlier decision this one replaces. Optional." }),
+            ),
+        ],
+        &["cardId", "summary", "why"],
+    )
+}
+
+fn read_history() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            (
+                "afterSeq",
+                json!({ "type": "integer", "description": "Read entries after this seq. 0 reads from the start." }),
+            ),
+            (
+                "limit",
+                json!({ "type": "integer", "description": "At most this many, up to 500. 0 means 100." }),
+            ),
+        ],
+        &["cardId"],
     )
 }
 

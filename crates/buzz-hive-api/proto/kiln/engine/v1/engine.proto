@@ -390,16 +390,18 @@ service EngineService {
   // issue has another card on the board, is FailedPrecondition. It publishes
   // card.restored.
   rpc RestoreCard(RestoreCardRequest) returns (Card);
-  // ListArtifacts lists the artifacts of the card's issue by name.
+  // ListArtifacts lists the card's artifacts by name.
   rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
   // ListArtifactVersions lists every version of one artifact, oldest first
   // and without content, and its approvals, oldest first. An unknown
   // artifact is NotFound.
   rpc ListArtifactVersions(ListArtifactVersionsRequest) returns (ListArtifactVersionsResponse);
-  // ReadArtifact returns one version of one artifact with its content.
+  // ReadArtifact returns one version of one artifact with its content. A
+  // file's content is empty: its media_ref says where to download it.
   rpc ReadArtifact(ReadArtifactRequest) returns (ArtifactVersion);
-  // ListCardFiles lists the files linked in the body of the card's issue:
-  // saved, refused and failed ones. Links to web pages are not listed.
+  // ListCardFiles lists the card's file artifacts, each at its latest
+  // version. A file lives in the Buzz media store, so every file here is
+  // saved.
   rpc ListCardFiles(ListCardFilesRequest) returns (ListCardFilesResponse);
   // GetCardFilePath returns where a saved file of the card's issue is on
   // disk. Only the desktop shell calls it, to open the file.
@@ -407,6 +409,22 @@ service EngineService {
   // SetHandoff sets whether the card's later stages get the artifact, and
   // records artifact.handoff.
   rpc SetHandoff(SetHandoffRequest) returns (ArtifactInfo);
+  // SaveArtifact saves the next version of one of the running stage's
+  // artifacts, as a document (content) or a file (kind "file" with sha256,
+  // size, media_type and media_ref). Only the agent the stage task mentioned
+  // may. A name the stage does not declare, a kind that differs from the
+  // artifact's, or a document over 1 MiB is InvalidArgument.
+  rpc SaveArtifact(SaveArtifactRequest) returns (ArtifactVersion);
+  // UpdatePlan checks or unchecks one item of the repeat plan of the running
+  // stage, which saves a new version of the plan.
+  rpc UpdatePlan(UpdatePlanRequest) returns (UpdatePlanResponse);
+  // LogWork records one piece of finished work in the card's activity.
+  rpc LogWork(LogWorkRequest) returns (LogWorkResponse);
+  // RecordDecision records a choice, why, and the options turned down.
+  rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
+  // ReadHistory returns the card's work and decision entries after after_seq,
+  // oldest first. A limit over 500 is InvalidArgument; 0 means 100.
+  rpc ReadHistory(ReadHistoryRequest) returns (ReadHistoryResponse);
   // ReportUsage records that a person opened a screen or took an action,
   // for the anonymous usage report. It stores nothing and returns OK
   // whether or not reporting is on. It fails with InvalidArgument for
@@ -872,11 +890,24 @@ message RetryRunRequest {
 message ArtifactVersion {
   string name = 1;
   int32 version = 2;
+  // The document's text. Empty for a file.
   string content = 3;
+  // The SHA-256 of the document's bytes, or of the file.
   string sha256 = 4;
-  // Who saved the version: "agent" or "person".
+  // The pubkey that saved the version.
   string by = 5;
   google.protobuf.Timestamp created_at = 6;
+  // "text" or "file".
+  string kind = 7;
+  // A file's size in bytes, and for a document the length of its text.
+  int64 size = 8;
+  // A file's media type. Empty for a document.
+  string media_type = 9;
+  // What `buzz media get` takes for a file: the blob's URL, else its hash.
+  string media_ref = 10;
+  // The stage that saved the version, and which visit of it.
+  string stage_id = 11;
+  int32 visit = 12;
 }
 
 // ArtifactInfo is one artifact of an issue.
@@ -886,6 +917,8 @@ message ArtifactInfo {
   int32 latest = 2;
   // Whether later stages get the artifact.
   bool handoff = 3;
+  // "text" or "file".
+  string kind = 4;
 }
 
 // Approval is one person's approval of one version, by its hash.
@@ -984,7 +1017,7 @@ message SetMergeOrderRequest {
 }
 
 message ListArtifactsRequest {
-  int64 card_id = 1;
+  string card_id = 1;
 }
 
 message ListArtifactsResponse {
@@ -992,7 +1025,7 @@ message ListArtifactsResponse {
 }
 
 message ListArtifactVersionsRequest {
-  int64 card_id = 1;
+  string card_id = 1;
   string name = 2;
 }
 
@@ -1002,35 +1035,40 @@ message ListArtifactVersionsResponse {
 }
 
 message ReadArtifactRequest {
-  int64 card_id = 1;
+  string card_id = 1;
   string name = 2;
   // 0 reads the latest version.
   int32 version = 3;
 }
 
 message ListCardFilesRequest {
-  int64 card_id = 1;
+  string card_id = 1;
 }
 
 message ListCardFilesResponse {
   repeated CardFile files = 1;
 }
 
-// CardFile is one link in an issue body and what Kiln did with it.
+// CardFile is one file artifact of a card at its latest version.
 message CardFile {
+  // Always 0: a file is named by its artifact.
   int64 id = 1;
-  // name is the saved file name, or the link's last path segment when the
-  // file was not saved.
+  // name is the artifact's name.
   string name = 2;
   int64 size = 3;
+  // What `buzz media get` takes: the blob's URL, else its hash.
   string url = 4;
-  // state is saved, refused or failed.
+  // state is always saved.
   string state = 5;
   // reason says why a refused or failed file was not saved.
   string reason = 6;
-  // opens_in_app is true when a saved file may be opened in the computer's
-  // default app. Any other saved file is only shown in its folder.
+  // Always false: the app downloads a file through the media store.
   bool opens_in_app = 7;
+  string media_type = 8;
+  string sha256 = 9;
+  int32 version = 10;
+  // The stage that saved this version.
+  string stage_id = 11;
 }
 
 message GetCardFilePathRequest {
@@ -1046,7 +1084,7 @@ message GetCardFilePathResponse {
 }
 
 message SetHandoffRequest {
-  int64 card_id = 1;
+  string card_id = 1;
   string name = 2;
   bool handoff = 3;
 }
@@ -2604,12 +2642,88 @@ message AddNoteResponse {
 }
 
 message GetBriefRequest {
-  int64 card_id = 1;
+  string card_id = 1;
   string stage_id = 2;
 }
 
 message GetBriefResponse {
   string text = 1;
+}
+
+message SaveArtifactRequest {
+  string card_id = 1;
+  string name = 2;
+  // "text" (the default) or "file".
+  string kind = 3;
+  // The document's text, for kind "text".
+  string content = 4;
+  // For kind "file": what `buzz upload file` printed.
+  string sha256 = 5;
+  int64 size = 6;
+  string media_type = 7;
+  // The blob's URL, or its hash when the upload printed no URL.
+  string media_ref = 8;
+}
+
+message UpdatePlanRequest {
+  string card_id = 1;
+  // The item's text, as written after the checkbox.
+  string item = 2;
+  // true checks the item, false unchecks it.
+  bool done = 3;
+}
+
+message UpdatePlanResponse {
+  // The artifact that holds the plan.
+  string plan = 1;
+  int32 checked = 2;
+  int32 total = 3;
+}
+
+message LogWorkRequest {
+  string card_id = 1;
+  // One line, 1 to 120 characters.
+  string summary = 2;
+  // Up to 2000 characters.
+  string detail = 3;
+  // The plan item this work finished. Optional.
+  string plan_item = 4;
+}
+
+message LogWorkResponse {
+  ActivityEntry entry = 1;
+}
+
+message RejectedOption {
+  string option = 1;
+  string reason = 2;
+}
+
+message RecordDecisionRequest {
+  string card_id = 1;
+  // One line, 1 to 120 characters.
+  string summary = 2;
+  // Up to 300 characters. Required.
+  string why = 3;
+  // At most 10.
+  repeated RejectedOption rejected = 4;
+  string detail = 5;
+  // The seq of an earlier decision this one replaces. 0 for none.
+  int64 supersedes = 6;
+}
+
+message RecordDecisionResponse {
+  ActivityEntry entry = 1;
+}
+
+message ReadHistoryRequest {
+  string card_id = 1;
+  int64 after_seq = 2;
+  int32 limit = 3;
+}
+
+message ReadHistoryResponse {
+  repeated ActivityEntry entries = 1;
 }
 
 message GetFullPayloadRequest {

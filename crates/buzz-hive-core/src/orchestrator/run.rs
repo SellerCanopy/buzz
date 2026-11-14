@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
+use super::artifacts::missing_outputs;
 use super::routes::{apply, begin_run, facts, resolve_settings, Mode};
 use super::settings;
 use super::{Ctx, Env, OpError};
@@ -13,6 +14,7 @@ use crate::config::LayerKind;
 use crate::domain::card::Card;
 use crate::domain::events::Event;
 use crate::domain::run::{Run, RunState};
+use crate::domain::workflow::RESULT_PASSED;
 use crate::ports::store::{Posting, Tx};
 use crate::rules::run::{entry_stage, step, task_key, Input};
 use crate::workflow::load::Package;
@@ -158,17 +160,26 @@ pub async fn stage_done(
             allowed.join(", ")
         )));
     }
-    let facts = facts(&mut *tx, &card, package).await?;
-    let stepped = step(
-        &run,
-        package,
-        &facts,
+    let facts = facts(&mut *tx, &card, package, Some(&stage_id)).await?;
+    let missing = if result == RESULT_PASSED {
+        missing_outputs(&mut *tx, card_id, stage, run.visit).await?
+    } else {
+        Vec::new()
+    };
+    let input = if missing.is_empty() {
         Input::StageDone {
             stage: stage_id,
             result: result.to_owned(),
             summary: summary.to_owned(),
-        },
-    );
+        }
+    } else {
+        Input::MissingOutput {
+            stage: stage_id,
+            missing,
+            summary: summary.to_owned(),
+        }
+    };
+    let stepped = step(&run, package, &facts, input);
     let run = apply(
         env,
         ctx,
@@ -197,7 +208,7 @@ pub async fn skip_stage(
             run.state.as_str()
         )));
     }
-    let facts = facts(&mut *tx, &card, package).await?;
+    let facts = facts(&mut *tx, &card, package, run.current_stage.as_deref()).await?;
     let stepped = step(&run, package, &facts, Input::Skip);
     let run = apply(
         env,
@@ -227,7 +238,7 @@ pub async fn pause_card(
             run.state.as_str()
         )));
     }
-    let facts = facts(&mut *tx, &card, package).await?;
+    let facts = facts(&mut *tx, &card, package, run.current_stage.as_deref()).await?;
     let stepped = step(&run, package, &facts, Input::Pause);
     let run = apply(
         env,
@@ -257,7 +268,7 @@ pub async fn resume_card(
             run.state.as_str()
         )));
     }
-    let facts = facts(&mut *tx, &card, package).await?;
+    let facts = facts(&mut *tx, &card, package, run.current_stage.as_deref()).await?;
     let stepped = step(&run, package, &facts, Input::Resume);
     let run = apply(
         env,
@@ -302,15 +313,24 @@ pub async fn move_card(
             run.workflow
         )));
     }
-    let facts = facts(&mut *tx, &card, package).await?;
-    let stepped = step(
-        &run,
-        package,
-        &facts,
+    let facts = facts(&mut *tx, &card, package, Some(&stage_id)).await?;
+    // A move with no result counts as passed for the stage's required outputs.
+    let (stage, _) = package.stage(&stage_id).ok_or_else(|| {
+        OpError::FailedPrecondition(format!("workflow {} has no stage {stage_id}", run.workflow))
+    })?;
+    let missing = missing_outputs(&mut *tx, card_id, stage, run.visit).await?;
+    let input = if missing.is_empty() {
         Input::Move {
             stage: target.to_owned(),
-        },
-    );
+        }
+    } else {
+        Input::MissingOutput {
+            stage: stage_id,
+            missing,
+            summary: String::new(),
+        }
+    };
+    let stepped = step(&run, package, &facts, input);
     let run = apply(
         env,
         ctx,
@@ -326,7 +346,7 @@ pub async fn move_card(
 }
 
 /// The card and its run, both held until the transaction ends, and the run's package.
-async fn locked<'a>(
+pub(super) async fn locked<'a>(
     env: &Env<'a>,
     tx: &mut dyn Tx,
     card_id: Uuid,
@@ -353,7 +373,7 @@ async fn locked<'a>(
 }
 
 /// The stage a running run waits on a result from.
-fn running_stage(run: &Run) -> Result<String, OpError> {
+pub(super) fn running_stage(run: &Run) -> Result<String, OpError> {
     match (run.state, run.current_stage.clone()) {
         (RunState::Running, Some(stage)) => Ok(stage),
         (state, _) => Err(OpError::FailedPrecondition(format!(
@@ -366,7 +386,12 @@ fn running_stage(run: &Run) -> Result<String, OpError> {
 /// Checks the caller is the agent the stage's task mentioned. The agent is read from the
 /// queued post, so it is known before the post reaches the relay and cannot change with the
 /// directory.
-async fn check_agent(tx: &mut dyn Tx, ctx: &Ctx, run: &Run, stage_id: &str) -> Result<(), OpError> {
+pub(super) async fn check_agent(
+    tx: &mut dyn Tx,
+    ctx: &Ctx,
+    run: &Run,
+    stage_id: &str,
+) -> Result<(), OpError> {
     let queued = tx
         .outbox()
         .by_key(&task_key(run.card_id, stage_id, run.visit))

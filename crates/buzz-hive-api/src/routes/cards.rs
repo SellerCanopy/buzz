@@ -201,12 +201,33 @@ pub(super) async fn card_of(app: &App, ctx: &Ctx, id: Uuid) -> Result<DomainCard
         .ok_or_else(|| HiveError::NotFound(format!("card {id} does not exist")))
 }
 
-fn to_activity(event: Event) -> ActivityEntry {
+pub(super) fn to_activity(event: Event) -> ActivityEntry {
     let text = |key: &str| event.payload[key].as_str().unwrap_or_default().to_owned();
+    // What the entry holds beyond the fields every entry has.
+    let fields: serde_json::Map<String, serde_json::Value> = event
+        .payload
+        .as_object()
+        .map(|p| {
+            p.iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "type" | "summary" | "detail" | "stage" | "visit"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     ActivityEntry {
         seq: event.seq,
-        key: format!("note:{}", event.seq),
+        key: format!("{}:{}", text("type"), event.seq),
         card_id: event.card_id.map(|id| id.to_string()).unwrap_or_default(),
+        stage_id: text("stage"),
+        visit: event.payload["visit"]
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or_default(),
         event_seq: event.seq,
         at: Some(crate::routes::poll::timestamp(event.at)),
         r#type: text("type"),
@@ -216,7 +237,7 @@ fn to_activity(event: Event) -> ActivityEntry {
         }),
         summary: text("summary"),
         detail: text("detail"),
-        fields_json: "{}".to_owned(),
+        fields_json: serde_json::Value::Object(fields).to_string(),
         v: 1,
         ..Default::default()
     }

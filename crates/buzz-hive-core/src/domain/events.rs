@@ -83,6 +83,11 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // A round of a repeat stage began, and ended with the plan's progress.
     ("round.started", 8),
     ("round.ended", 8),
+    // A stage saved a version of an artifact. The payload names the artifact, its version,
+    // its kind and the stage.
+    ("artifact.saved", 9),
+    // A person set whether later stages get an artifact.
+    ("artifact.handoff", 9),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

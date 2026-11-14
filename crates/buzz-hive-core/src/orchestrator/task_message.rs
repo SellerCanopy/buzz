@@ -1,8 +1,10 @@
 //! The message that asks a stage's agent to do the stage.
 //!
 //! Ported from the Go engine's `RenderPrompt` (`core/workflow/render.go`). The variables
-//! that need an issue, a worktree or an artifact copy (`issue.url`, `branch`, `scratch`,
-//! `artifacts.*`, `inputs.*`) render as empty text until the phases that supply them.
+//! that need an issue, a worktree or a scratch folder (`issue.url`, `branch`, `scratch`,
+//! `artifacts.*`, `inputs.*`) render as empty text. A stage reads its artifacts through the
+//! input and output sections this message adds and the `read_artifact` and `save_artifact`
+//! tools.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +21,47 @@ pub struct CardText<'a> {
     pub description: &'a str,
 }
 
+/// A text input under this many bytes is written into the task. A larger one is named, and
+/// the agent reads it with `read_artifact`.
+pub const INLINE_LIMIT: usize = 8 * 1024;
+
+/// What the stage's agent is told about one artifact it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputView {
+    pub name: String,
+    pub state: InputState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputState {
+    /// The stage declares the input and no version is saved yet.
+    Missing,
+    Text {
+        version: i32,
+        bytes: usize,
+        /// The text itself, when it is under [`INLINE_LIMIT`].
+        body: Option<String>,
+    },
+    File {
+        version: i32,
+        size: i64,
+        media_type: String,
+        /// What `buzz media get` takes: the blob's URL, else its hash.
+        media_ref: String,
+    },
+}
+
+/// What the task says beyond the card and the stage's prompt.
+#[derive(Debug, Clone, Default)]
+pub struct Handoff {
+    /// The artifacts the stage reads.
+    pub inputs: Vec<InputView>,
+    /// What earlier sessions on this stage left, when it has been visited before.
+    pub brief: String,
+    /// The channel the task is posted in, which a file is posted in too.
+    pub channel: Option<uuid::Uuid>,
+}
+
 /// The message for `stage`: the card's title and description, the stage's prompt with its
 /// variables filled in, and the instruction to report a result. A stage that runs a plugin
 /// command starts with the command line instead, because the agent reads a leading slash as
@@ -28,6 +71,7 @@ pub fn render_task(
     stage: &Stage,
     card: &CardText<'_>,
     params: &BTreeMap<String, String>,
+    handoff: &Handoff,
 ) -> Result<String, String> {
     let text = package.prompt_text(stage)?;
     let results = reportable_results(stage);
@@ -69,6 +113,9 @@ pub fn render_task(
         parts.push(body);
         parts.push(card_block);
     }
+    parts.push(handoff.brief.clone());
+    parts.push(inputs_section(&handoff.inputs));
+    parts.push(outputs_section(stage, card.id, handoff.channel));
     parts.push(format!(
         "When you are done, call the Beehive tool `stage_done` with card_id `{}` and result one of: {}.",
         card.id,
@@ -79,6 +126,89 @@ pub fn render_task(
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+/// The longest run of backticks in `text`, so a fence can be longer.
+fn fence_for(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+fn human_bytes(bytes: usize) -> String {
+    if bytes >= 1024 {
+        format!("{} KiB", bytes.div_ceil(1024))
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// The artifacts the stage reads, by name, with small documents written out.
+fn inputs_section(inputs: &[InputView]) -> String {
+    if inputs.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["Input artifacts:".to_owned()];
+    for input in inputs {
+        let name = &input.name;
+        lines.push(match &input.state {
+            InputState::Missing => format!("- `{name}`: not saved yet."),
+            InputState::Text {
+                version,
+                bytes,
+                body: Some(body),
+            } => {
+                let fence = fence_for(body);
+                format!(
+                    "- `{name}` (text, version {version}, {}):\n{fence}\n{body}\n{fence}",
+                    human_bytes(*bytes)
+                )
+            }
+            InputState::Text { version, bytes, .. } => format!(
+                "- `{name}` (text, version {version}, {}): too long to write here. Read it with the Beehive tool `read_artifact`.",
+                human_bytes(*bytes)
+            ),
+            InputState::File {
+                version,
+                size,
+                media_type,
+                media_ref,
+            } => format!(
+                "- `{name}` (file, version {version}, {media_type}, {size} bytes): download it with `buzz media get {media_ref} -o <path>`."
+            ),
+        });
+    }
+    lines.join("\n")
+}
+
+/// The artifacts the stage must or may save, and how to save a document or a file.
+fn outputs_section(stage: &Stage, card: uuid::Uuid, channel: Option<uuid::Uuid>) -> String {
+    let plan = stage.repeat.as_ref().map(|r| r.plan.as_str()).unwrap_or("");
+    if stage.outputs.is_empty() && plan.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["Outputs to save before you report a result:".to_owned()];
+    for output in &stage.outputs {
+        let optional = if output.optional { " (optional)" } else { "" };
+        lines.push(format!("- `{}`{optional}", output.artifact));
+    }
+    if !plan.is_empty() {
+        lines.push(format!(
+            "- `{plan}`: the plan. Save it as a Markdown checklist, then check items off with the Beehive tool `update_plan`."
+        ));
+    }
+    lines.push(format!(
+        "Save a document with the Beehive tool `save_artifact`, with card_id `{card}`, the artifact's name and its full text as content. Each call saves a new version."
+    ));
+    let channel = channel.map_or_else(|| "<channel>".to_owned(), |c| c.to_string());
+    lines.push(format!(
+        "To save a file, such as an image or a PDF, upload it with `buzz upload file --file <path>`, post the file in your own thread with `buzz messages send --channel {channel} --reply-to <the id of the message that mentioned you> --file <path> --content <name>`, then call `save_artifact` with card_id `{card}`, the artifact's name, kind `file`, and the sha256, size and type the upload printed."
+    ));
+    lines.join("\n")
 }
 
 /// What the variable `name` renders as. An unknown variable stays as written.
@@ -188,7 +318,14 @@ mod tests {
     fn a_prompt_renders_the_card_variables_and_ends_with_the_report_instruction() {
         let mut s = stage("Fix {{ issue.title }}.\n{{issue.body}}\nPick {{stage.results}}.");
         s.results = vec!["blocked".into()];
-        let got = render_task(&package(&[]), &s, &card(), &params(&[])).unwrap();
+        let got = render_task(
+            &package(&[]),
+            &s,
+            &card(),
+            &params(&[]),
+            &Handoff::default(),
+        )
+        .unwrap();
         // `needs_work` has no route here, so the agent is not offered it.
         let want = "the bug\n\nIt breaks.\n\n\
             Fix the bug.\nIt breaks.\nPick passed, failed, needs_input, blocked.\n\n\
@@ -204,6 +341,7 @@ mod tests {
             &s,
             &card(),
             &params(&[("depth", "deep"), ("tone", "")]),
+            &Handoff::default(),
         )
         .unwrap();
         assert!(
@@ -227,7 +365,14 @@ mod tests {
         s.prompt = String::new();
         s.command = "review".into();
         s.args = "title {{issue.title}}".into();
-        let got = render_task(&package(&[]), &s, &card(), &params(&[])).unwrap();
+        let got = render_task(
+            &package(&[]),
+            &s,
+            &card(),
+            &params(&[]),
+            &Handoff::default(),
+        )
+        .unwrap();
         assert!(
             got.starts_with("/demo:review title the bug\n\nthe bug\n\nIt breaks.\n\n"),
             "rendered task:\n{got}"
@@ -241,7 +386,14 @@ mod tests {
     fn a_command_with_no_args_is_the_bare_command() {
         let mut s = stage("");
         s.command = "review".into();
-        let got = render_task(&package(&[]), &s, &card(), &params(&[])).unwrap();
+        let got = render_task(
+            &package(&[]),
+            &s,
+            &card(),
+            &params(&[]),
+            &Handoff::default(),
+        )
+        .unwrap();
         assert!(got.starts_with("/demo:review\n\nthe bug"), "{got}");
     }
 
@@ -250,14 +402,14 @@ mod tests {
         let mut s = stage("");
         s.prompt_file = "prompts/p.md".into();
         let pkg = package(&[("prompts/p.md", "Look at {{issue.title}}\n")]);
-        let got = render_task(&pkg, &s, &card(), &params(&[])).unwrap();
+        let got = render_task(&pkg, &s, &card(), &params(&[]), &Handoff::default()).unwrap();
         assert!(
             got.contains("\n\nLook at the bug\n\nWhen you are done"),
             "{got}"
         );
         let mut missing = stage("");
         missing.prompt_file = "prompts/none.md".into();
-        assert!(render_task(&pkg, &missing, &card(), &params(&[])).is_err());
+        assert!(render_task(&pkg, &missing, &card(), &params(&[]), &Handoff::default()).is_err());
     }
 
     #[test]
@@ -282,7 +434,142 @@ mod tests {
             title: "",
             description: "",
         };
-        let got = render_task(&package(&[]), &stage("Do it."), &none, &params(&[])).unwrap();
+        let got = render_task(
+            &package(&[]),
+            &stage("Do it."),
+            &none,
+            &params(&[]),
+            &Handoff::default(),
+        )
+        .unwrap();
         assert!(got.starts_with("Do it.\n\nWhen you are done"), "{got}");
+    }
+
+    fn render(stage: &Stage, handoff: &Handoff) -> String {
+        render_task(&package(&[]), stage, &card(), &params(&[]), handoff).unwrap()
+    }
+
+    fn inputs(inputs: Vec<InputView>) -> Handoff {
+        Handoff {
+            inputs,
+            ..Handoff::default()
+        }
+    }
+
+    #[test]
+    fn a_small_text_input_is_written_into_the_task_in_a_fence_longer_than_its_own() {
+        let got = render(
+            &stage("Review."),
+            &inputs(vec![InputView {
+                name: "plan".into(),
+                state: InputState::Text {
+                    version: 2,
+                    bytes: 14,
+                    body: Some("use ``` here\n".into()),
+                },
+            }]),
+        );
+        assert!(
+            got.contains("Input artifacts:\n- `plan` (text, version 2, 14 bytes):\n````\nuse ``` here\n\n````"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn a_large_text_input_is_named_and_a_file_input_says_how_to_download_it() {
+        let got = render(
+            &stage("Review."),
+            &inputs(vec![
+                InputView {
+                    name: "spec".into(),
+                    state: InputState::Text {
+                        version: 1,
+                        bytes: 20_000,
+                        body: None,
+                    },
+                },
+                InputView {
+                    name: "logo".into(),
+                    state: InputState::File {
+                        version: 3,
+                        size: 99,
+                        media_type: "image/png".into(),
+                        media_ref: "https://media.example.org/a.png".into(),
+                    },
+                },
+                InputView {
+                    name: "later".into(),
+                    state: InputState::Missing,
+                },
+            ]),
+        );
+        assert!(got.contains("- `spec` (text, version 1, 20 KiB): too long to write here. Read it with the Beehive tool `read_artifact`."), "{got}");
+        assert!(got.contains("- `logo` (file, version 3, image/png, 99 bytes): download it with `buzz media get https://media.example.org/a.png -o <path>`."), "{got}");
+        assert!(got.contains("- `later`: not saved yet."), "{got}");
+    }
+
+    #[test]
+    fn a_stage_with_outputs_says_how_to_save_a_document_and_a_file() {
+        let mut s = stage("Write.");
+        s.outputs = vec![
+            crate::domain::workflow::Output {
+                artifact: "plan".into(),
+                ..Default::default()
+            },
+            crate::domain::workflow::Output {
+                artifact: "logo".into(),
+                optional: true,
+                ..Default::default()
+            },
+        ];
+        let channel = uuid::Uuid::from_u128(7);
+        let got = render(
+            &s,
+            &Handoff {
+                channel: Some(channel),
+                ..Handoff::default()
+            },
+        );
+        assert!(
+            got.contains(
+                "Outputs to save before you report a result:\n- `plan`\n- `logo` (optional)\n"
+            ),
+            "{got}"
+        );
+        assert!(
+            got.contains(&format!("--channel {channel} --reply-to")),
+            "{got}"
+        );
+        assert!(got.contains("kind `file`"), "{got}");
+        // The outputs come before the report instruction.
+        assert!(got.find("Outputs to save").unwrap() < got.find("When you are done").unwrap());
+    }
+
+    #[test]
+    fn a_repeat_plan_is_named_as_an_output_and_the_brief_comes_before_the_inputs() {
+        let mut s = stage("Work.");
+        s.repeat = Some(crate::domain::workflow::Repeat {
+            plan: "todo".into(),
+            ..Default::default()
+        });
+        let got = render(
+            &s,
+            &Handoff {
+                brief: "Earlier sessions worked on this stage.".into(),
+                ..Handoff::default()
+            },
+        );
+        assert!(got.contains("- `todo`: the plan."), "{got}");
+        assert!(got.contains("`update_plan`"), "{got}");
+        assert!(got.find("Earlier sessions").unwrap() < got.find("Outputs to save").unwrap());
+    }
+
+    #[test]
+    fn a_stage_with_no_inputs_or_outputs_adds_neither_section() {
+        let got = render(&stage("Do it."), &Handoff::default());
+        assert!(
+            !got.contains("Input artifacts") && !got.contains("Outputs to save"),
+            "{got}"
+        );
     }
 }

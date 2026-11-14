@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::access::{ActorKind, Level, RelayRole};
+use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
 use crate::domain::run::{Run, RunState};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, CardsRepo, CommunityId, Directory, EventsRepo, OutboxRepo,
-    OutboxRow, Posting, Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
-    StoredPackage, Tx, WorkflowsRepo,
+    AccessRepo, AccessRow, AgentInfo, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId,
+    Directory, EventsRepo, OutboxRepo, OutboxRow, Posting, Pubkey, RunsRepo, SettingsRepo,
+    StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -28,6 +29,17 @@ struct State {
     /// In queue order.
     outbox: Vec<(CommunityId, OutboxRow)>,
     next_outbox_id: i64,
+    /// Each artifact with its handoff flag, and its versions in save order.
+    artifacts: Vec<MemArtifact>,
+}
+
+#[derive(Clone)]
+struct MemArtifact {
+    community: CommunityId,
+    card: uuid::Uuid,
+    name: String,
+    handoff: bool,
+    versions: Vec<ArtifactVersion>,
 }
 
 /// The committed event log, shared by every transaction. It sits outside `State` so
@@ -110,6 +122,9 @@ impl Tx for MemTx {
     fn outbox(&mut self) -> &mut dyn OutboxRepo {
         self
     }
+    fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
+        self
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let MemTx {
             community,
@@ -158,6 +173,170 @@ impl EventsRepo for MemTx {
             .rev()
             .find(|(community, _)| *community == self.community)
             .map_or(0, |(_, event)| event.seq))
+    }
+
+    async fn of_card(
+        &mut self,
+        card: uuid::Uuid,
+        kind: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let log = self.log.lock().unwrap();
+        Ok(log
+            .events
+            .iter()
+            .filter(|(community, event)| {
+                *community == self.community
+                    && event.seq > seq
+                    && event.kind == kind
+                    && event.card_id == Some(card)
+            })
+            .take(limit.max(0) as usize)
+            .map(|(_, event)| event.clone())
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl ArtifactsRepo for MemTx {
+    async fn save(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+        save: &ArtifactSave,
+    ) -> Result<ArtifactVersion, StoreError> {
+        let community = self.community;
+        let at = self
+            .work
+            .artifacts
+            .iter()
+            .position(|a| a.community == community && a.card == card && a.name == name);
+        let at = match at {
+            Some(at) => at,
+            None => {
+                self.work.artifacts.push(MemArtifact {
+                    community,
+                    card,
+                    name: name.to_owned(),
+                    handoff,
+                    versions: Vec::new(),
+                });
+                self.work.artifacts.len() - 1
+            }
+        };
+        let artifact = &mut self.work.artifacts[at];
+        if let Some(last) = artifact.versions.last() {
+            if last.content.kind() != save.content.kind() {
+                return Err(StoreError::Conflict(format!(
+                    "artifact {name} is a {} artifact",
+                    last.content.kind().as_str()
+                )));
+            }
+        }
+        let version = ArtifactVersion {
+            card_id: card,
+            name: name.to_owned(),
+            version: artifact.versions.len() as i32 + 1,
+            content: save.content.clone(),
+            stage: save.stage.clone(),
+            visit: save.visit,
+            created_by: save.created_by.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        artifact.versions.push(version.clone());
+        Ok(version)
+    }
+
+    async fn list(&mut self, card: uuid::Uuid) -> Result<Vec<ArtifactInfo>, StoreError> {
+        let mut out: Vec<ArtifactInfo> = self
+            .work
+            .artifacts
+            .iter()
+            .filter(|a| a.community == self.community && a.card == card)
+            .filter_map(|a| {
+                let last = a.versions.last()?;
+                Some(ArtifactInfo {
+                    name: a.name.clone(),
+                    kind: last.content.kind(),
+                    latest: last.version,
+                    handoff: a.handoff,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn versions(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+    ) -> Result<Vec<ArtifactVersion>, StoreError> {
+        Ok(self
+            .work
+            .artifacts
+            .iter()
+            .find(|a| a.community == self.community && a.card == card && a.name == name)
+            .map(|a| a.versions.clone())
+            .unwrap_or_default())
+    }
+
+    async fn version(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<ArtifactVersion>, StoreError> {
+        let versions = self.versions(card, name).await?;
+        Ok(match version {
+            Some(n) => versions.into_iter().find(|v| v.version == n),
+            None => versions.into_iter().last(),
+        })
+    }
+
+    async fn set_handoff(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        match self
+            .work
+            .artifacts
+            .iter_mut()
+            .find(|a| a.community == community && a.card == card && a.name == name)
+        {
+            Some(a) => {
+                a.handoff = handoff;
+                Ok(())
+            }
+            None => Err(StoreError::NotFound(format!("artifact {name}"))),
+        }
+    }
+
+    async fn saved_in(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut names: Vec<String> = self
+            .work
+            .artifacts
+            .iter()
+            .filter(|a| a.community == self.community && a.card == card)
+            .filter(|a| {
+                a.versions
+                    .iter()
+                    .any(|v| v.stage == stage && v.visit == visit)
+            })
+            .map(|a| a.name.clone())
+            .collect();
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -504,6 +683,9 @@ impl CardsRepo for MemTx {
         if self.work.cards.len() == before {
             return Err(StoreError::NotFound(format!("card {id}")));
         }
+        self.work
+            .artifacts
+            .retain(|a| !(a.community == community && a.card == id));
         Ok(())
     }
 }

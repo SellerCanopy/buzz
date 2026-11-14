@@ -5,6 +5,7 @@
 //! `engine.proto` is routed, dropped with a reason, or still pending.
 
 mod agents;
+mod artifacts;
 mod cards;
 pub mod poll;
 mod runs;
@@ -51,6 +52,17 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ResumeCard", Level::Run),
     ("SetCardWorkflow", Level::Run),
     ("MoveCard", Level::Run),
+    ("GetBrief", Level::Read),
+    ("ListArtifacts", Level::Read),
+    ("ListArtifactVersions", Level::Read),
+    ("ReadArtifact", Level::Read),
+    ("ListCardFiles", Level::Read),
+    ("SetHandoff", Level::Run),
+    ("SaveArtifact", Level::Run),
+    ("UpdatePlan", Level::Run),
+    ("LogWork", Level::Run),
+    ("RecordDecision", Level::Run),
+    ("ReadHistory", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -228,5 +240,65 @@ pub fn router(app: &App) -> Router<App> {
         .route(
             &path("MoveCard"),
             unary(app.clone(), needs("MoveCard"), stages::move_card),
+        )
+        .route(
+            &path("GetBrief"),
+            unary(app.clone(), needs("GetBrief"), artifacts::get_brief),
+        )
+        .route(
+            &path("ListArtifacts"),
+            unary(
+                app.clone(),
+                needs("ListArtifacts"),
+                artifacts::list_artifacts,
+            ),
+        )
+        .route(
+            &path("ListArtifactVersions"),
+            unary(
+                app.clone(),
+                needs("ListArtifactVersions"),
+                artifacts::list_artifact_versions,
+            ),
+        )
+        .route(
+            &path("ReadArtifact"),
+            unary(app.clone(), needs("ReadArtifact"), artifacts::read_artifact),
+        )
+        .route(
+            &path("ListCardFiles"),
+            unary(
+                app.clone(),
+                needs("ListCardFiles"),
+                artifacts::list_card_files,
+            ),
+        )
+        .route(
+            &path("SetHandoff"),
+            unary(app.clone(), needs("SetHandoff"), artifacts::set_handoff),
+        )
+        .route(
+            &path("SaveArtifact"),
+            unary(app.clone(), needs("SaveArtifact"), artifacts::save_artifact),
+        )
+        .route(
+            &path("UpdatePlan"),
+            unary(app.clone(), needs("UpdatePlan"), artifacts::update_plan),
+        )
+        .route(
+            &path("LogWork"),
+            unary(app.clone(), needs("LogWork"), artifacts::log_work),
+        )
+        .route(
+            &path("RecordDecision"),
+            unary(
+                app.clone(),
+                needs("RecordDecision"),
+                artifacts::record_decision,
+            ),
+        )
+        .route(
+            &path("ReadHistory"),
+            unary(app.clone(), needs("ReadHistory"), artifacts::read_history),
         )
 }

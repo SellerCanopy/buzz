@@ -1,12 +1,16 @@
 //! `Store` over Postgres: one `sqlx` transaction per community.
 
 use buzz_hive_core::access::{ActorKind, Level};
+use buzz_hive_core::domain::artifact::{
+    ArtifactContent, ArtifactInfo, ArtifactKind, ArtifactVersion,
+};
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, CardsRepo, CommunityId, EventsRepo, OutboxRepo, OutboxRow, Posting,
-    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
+    AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
+    OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
+    StoredPackage, Tx, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -69,6 +73,9 @@ impl Tx for PgTx {
         self
     }
     fn outbox(&mut self) -> &mut dyn OutboxRepo {
+        self
+    }
+    fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -448,6 +455,274 @@ impl EventsRepo for PgTx {
             .fetch_one(&mut *self.tx)
             .await
             .map_err(unavailable)
+    }
+
+    async fn of_card(
+        &mut self,
+        card: uuid::Uuid,
+        kind: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT seq, kind, card_id, run_id, actor_pubkey, actor_kind, payload, at \
+             FROM hive.events \
+             WHERE community_id = $1 AND card_id = $2 AND kind = $3 AND seq > $4 \
+             ORDER BY seq LIMIT $5",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(kind)
+        .bind(seq)
+        .bind(limit.max(0))
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter().map(decode_event).collect()
+    }
+}
+
+type VersionRow = (
+    String,
+    i32,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+    i32,
+    String,
+    chrono::DateTime<chrono::Utc>,
+);
+
+/// `SELECT` for [`VersionRow`] followed by `$tail`, as one literal so sqlx sees a static string.
+macro_rules! select_version {
+    ($tail:literal) => {
+        concat!(
+            "SELECT name, version, body, sha256, size, media_type, media_ref, stage, visit, \
+             created_by, created_at FROM hive.artifact_versions ",
+            $tail
+        )
+    };
+}
+
+fn decode_version(card: uuid::Uuid, row: VersionRow) -> Result<ArtifactVersion, StoreError> {
+    let (name, version, body, sha256, size, media_type, media_ref, stage, visit, created_by, at) =
+        row;
+    let bad =
+        |what: &str| StoreError::Conflict(format!("stored {what} for artifact {name} v{version}"));
+    let content = match (body, sha256) {
+        (Some(body), None) => ArtifactContent::Text(body),
+        (None, Some(sha256)) => ArtifactContent::File {
+            sha256: sha256.clone(),
+            size: size.ok_or_else(|| bad("size"))?,
+            media_type: media_type.unwrap_or_default(),
+            media_ref: media_ref.unwrap_or(sha256),
+        },
+        _ => return Err(bad("content")),
+    };
+    Ok(ArtifactVersion {
+        card_id: card,
+        name: name.clone(),
+        version,
+        content,
+        stage,
+        visit: u32::try_from(visit).map_err(|_| bad("visit"))?,
+        created_by,
+        created_at: at,
+    })
+}
+
+#[async_trait::async_trait]
+impl ArtifactsRepo for PgTx {
+    async fn save(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+        save: &ArtifactSave,
+    ) -> Result<ArtifactVersion, StoreError> {
+        let kind = save.content.kind();
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT kind FROM hive.artifacts WHERE community_id = $1 AND card_id = $2 AND name = $3",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(name)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        match existing {
+            Some(other) if other != kind.as_str() => {
+                return Err(StoreError::Conflict(format!(
+                    "artifact {name} is a {other} artifact"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                sqlx::query(
+                    "INSERT INTO hive.artifacts (community_id, card_id, name, kind, handoff) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(self.community)
+                .bind(card)
+                .bind(name)
+                .bind(kind.as_str())
+                .bind(handoff)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(unavailable)?;
+            }
+        }
+        let (body, sha256, size, media_type, media_ref) = match &save.content {
+            ArtifactContent::Text(body) => (Some(body.as_str()), None, None, None, None),
+            ArtifactContent::File {
+                sha256,
+                size,
+                media_type,
+                media_ref,
+            } => (
+                None,
+                Some(sha256.as_str()),
+                Some(*size),
+                Some(media_type.as_str()),
+                Some(media_ref.as_str()),
+            ),
+        };
+        let row: VersionRow = sqlx::query_as(
+            "INSERT INTO hive.artifact_versions \
+             (community_id, card_id, name, version, body, sha256, size, media_type, media_ref, \
+              stage, visit, created_by) \
+             SELECT $1::uuid, $2::uuid, $3::text, COALESCE(max(version), 0) + 1, $4::text, $5::text, \
+             $6::bigint, $7::text, $8::text, $9::text, $10::int, $11::text \
+             FROM hive.artifact_versions WHERE community_id = $1 AND card_id = $2 AND name = $3 \
+             RETURNING name, version, body, sha256, size, media_type, media_ref, stage, visit, \
+             created_by, created_at",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(name)
+        .bind(body)
+        .bind(sha256)
+        .bind(size)
+        .bind(media_type)
+        .bind(media_ref)
+        .bind(&save.stage)
+        .bind(save.visit as i32)
+        .bind(&save.created_by)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        decode_version(card, row)
+    }
+
+    async fn list(&mut self, card: uuid::Uuid) -> Result<Vec<ArtifactInfo>, StoreError> {
+        let rows: Vec<(String, String, bool, Option<i32>)> = sqlx::query_as(
+            "SELECT a.name, a.kind, a.handoff, \
+                    (SELECT max(v.version) FROM hive.artifact_versions v \
+                      WHERE v.community_id = a.community_id AND v.card_id = a.card_id \
+                        AND v.name = a.name) \
+             FROM hive.artifacts a WHERE a.community_id = $1 AND a.card_id = $2 ORDER BY a.name",
+        )
+        .bind(self.community)
+        .bind(card)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter()
+            .filter_map(|(name, kind, handoff, latest)| Some((name, kind, handoff, latest?)))
+            .map(|(name, kind, handoff, latest)| {
+                let kind = ArtifactKind::parse(&kind).ok_or_else(|| {
+                    StoreError::Conflict(format!("stored kind {kind} for artifact {name}"))
+                })?;
+                Ok(ArtifactInfo {
+                    name,
+                    kind,
+                    latest,
+                    handoff,
+                })
+            })
+            .collect()
+    }
+
+    async fn versions(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+    ) -> Result<Vec<ArtifactVersion>, StoreError> {
+        let rows: Vec<VersionRow> = sqlx::query_as(select_version!(
+            "WHERE community_id = $1 AND card_id = $2 AND name = $3 ORDER BY version"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .bind(name)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        rows.into_iter().map(|r| decode_version(card, r)).collect()
+    }
+
+    async fn version(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        version: Option<i32>,
+    ) -> Result<Option<ArtifactVersion>, StoreError> {
+        let row: Option<VersionRow> = sqlx::query_as(select_version!(
+            "WHERE community_id = $1 AND card_id = $2 AND name = $3 \
+             AND ($4::int IS NULL OR version = $4) ORDER BY version DESC LIMIT 1"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        row.map(|r| decode_version(card, r)).transpose()
+    }
+
+    async fn set_handoff(
+        &mut self,
+        card: uuid::Uuid,
+        name: &str,
+        handoff: bool,
+    ) -> Result<(), StoreError> {
+        let done = sqlx::query(
+            "UPDATE hive.artifacts SET handoff = $4 \
+             WHERE community_id = $1 AND card_id = $2 AND name = $3",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(name)
+        .bind(handoff)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(unavailable)?;
+        if done.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("artifact {name}")));
+        }
+        Ok(())
+    }
+
+    async fn saved_in(
+        &mut self,
+        card: uuid::Uuid,
+        stage: &str,
+        visit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT name FROM hive.artifact_versions \
+             WHERE community_id = $1 AND card_id = $2 AND stage = $3 AND visit = $4 ORDER BY name",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(stage)
+        .bind(visit as i32)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(unavailable)
     }
 }
 
