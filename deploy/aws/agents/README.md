@@ -151,9 +151,16 @@ Other install locations were not needed.
 - **File modes matter.** The container user is uid 1001 and the mount is read-only,
   so the staged config directory must be mode 0755 and `mcp.json` mode 0644. If the
   file is unreadable, the container exits with a message naming the path.
-- **Commands must exist in the image.** The image has Node 22, `git`, and `bash`.
-  A server that needs another program must install it at run time (for example
-  with `npx`) or wait for an image change.
+- **Commands must exist in the image.** The image has Node 22, `git`, `bash`, and
+  `buzz-hive-mcp`. A server that needs another program must install it at run time
+  (for example with `npx`) or wait for an image change.
+- **`buzz-hive` is the Beehive tool server.** The `buzz-hive` entry in each agent's
+  file runs `buzz-hive-mcp`, which gives the agent the Beehive tools (create and
+  start a card, report a stage result). It signs in with the agent's own key from
+  `BUZZ_PRIVATE_KEY` and finds Beehive at `BUZZ_RELAY_URL`'s host, so it needs no
+  entry in `env`. Set `BUZZ_HIVE_URL` only where Beehive is on another host. It
+  acts at the agent's Beehive level, which an admin sets and which is never above
+  the owner's. Remove the entry for an agent that should not see Beehive.
 - **Changes need a deploy.** The file is read when the container starts. The
   deploy recreates every agent container each time, so the entrypoint copies the
   new file in and the env file's secrets are read again. The deploy refuses a

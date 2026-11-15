@@ -1,0 +1,104 @@
+version: 2
+stages:
+  - id: propose
+    pause: true
+    name: Propose
+    kind: prompt
+    command: propose
+    args: "'{{issue.number}}' '{{issue.title}}' '{{issue.body}}' '{{issue.url}}' '{{sendback.comments}}'"
+    agent: builder
+    outputs: [{ artifact: proposal }]
+    execution: { timeout: 30m }
+  - id: proposal_review
+    name: Proposal review
+    kind: approval
+    approval: { artifacts: [proposal] }
+    on: { needs_work: propose }
+    loop_limit: 5
+  - id: specs
+    name: Specs
+    kind: prompt
+    command: specs
+    args: "'{{issue.number}}' '{{sendback.comments}}'"
+    agent: builder
+    outputs: [{ artifact: specs }]
+    execution: { timeout: 30m }
+  - id: design
+    name: Design
+    kind: prompt
+    command: design
+    args: "'{{issue.number}}' '{{sendback.comments}}'"
+    results: [skipped]
+    agent: builder
+    outputs: [{ artifact: design }]
+    on: { skipped: tasks }
+    execution: { timeout: 30m }
+  - id: tasks
+    name: Tasks
+    kind: prompt
+    command: tasks
+    args: "'{{issue.number}}' '{{sendback.comments}}'"
+    agent: builder
+    outputs: [{ artifact: tasks }]
+    execution: { timeout: 30m }
+  - id: spec_check
+    name: Spec check
+    kind: action
+    action: check_openspec
+    on: { failed: specs }
+    loop_limit: 3
+  - id: change_review
+    name: Change review
+    kind: approval
+    approval: { artifacts: [proposal, specs, design, tasks] }
+    on: { needs_work: specs }
+    loop_limit: 5
+  - id: apply
+    name: Apply
+    kind: prompt
+    command: apply
+    args: "'{{branch}}' '{{issue.number}}' '{{issue.title}}' '{{sendback.comments}}'"
+    agent: builder
+    execution: { timeout: 4h }
+  - id: verify
+    name: Verify
+    kind: prompt
+    command: verify
+    args: "'{{branch}}' '{{issue.number}}'"
+    agent: builder
+    outputs: [{ artifact: verify-report }]
+    on: { needs_work: apply }
+    loop_limit: 3
+    execution: { timeout: 30m }
+  - id: archive
+    name: Archive
+    kind: prompt
+    command: archive
+    args: "'{{branch}}' '{{issue.number}}'"
+    agent: builder
+    outputs: [{ artifact: pr_body }]
+    execution: { timeout: 30m }
+  - id: pull_request
+    name: Pull request
+    kind: action
+    action: open_pull_request
+    with: { body_artifact: pr_body, draft: "true" }
+  - id: validate
+    name: Validate
+    kind: action
+    action: wait_for_ci
+    on: { passed: cleanup, failed: fix_ci }
+  - id: fix_ci
+    name: Fix CI failures
+    kind: prompt
+    command: fix-ci
+    args: "'{{artifacts.ci-failure.path}}'"
+    agent: builder
+    on: { passed: pull_request }
+    loop_limit: 3
+    execution: { timeout: 2h }
+  - id: cleanup
+    pause: true
+    name: Cleanup
+    kind: action
+    action: cleanup_worktree

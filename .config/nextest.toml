@@ -53,3 +53,12 @@ fail-fast = false
 
 [profile.flake.junit]
 path = "junit.xml"
+
+[test-groups.hive-relay]
+# These integration tests share one community row and both set its engine-scope
+# `update_channel`, so they must not overlap.
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(e2e_start) or binary(e2e_one_stage) or binary(e2e_fresh_session) or binary(e2e_files)"
+test-group = "hive-relay"

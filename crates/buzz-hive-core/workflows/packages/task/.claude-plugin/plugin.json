@@ -1,0 +1,5 @@
+{
+  "name": "task",
+  "version": "0.1.0",
+  "description": "General work with no repo. One Claude Code stage does the task in its own folder and saves the result, then a person approves it or sends it back."
+}

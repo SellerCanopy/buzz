@@ -3,6 +3,9 @@
     "memory": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-memory@1.0.0"]
+    },
+    "buzz-hive": {
+      "command": "buzz-hive-mcp"
     }
   }
 }

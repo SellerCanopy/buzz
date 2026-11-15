@@ -1,0 +1,2808 @@
+syntax = "proto3";
+
+package kiln.engine.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/sellercanopy/kiln/engine/gen/kiln/engine/v1;enginev1";
+
+// EngineService is the engine API. Every call needs
+// "Authorization: Bearer <token>". With --signin token (the default) the
+// token is the one the client passed in KILN_ENGINE_TOKEN when it started the
+// engine. With --signin dev or auth-service it is the access token a person
+// signed in with.
+service EngineService {
+  // GetStatus returns the engine's version, data folder and newest event seq.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // WhoAmI returns the signed-in person, their company and role.
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  // ListPeople returns everyone in the company who has signed in.
+  rpc ListPeople(ListPeopleRequest) returns (ListPeopleResponse);
+  // WatchEvents streams every stored event after after_seq in order, then
+  // live events as they commit, with no gap and no repeat. card_id and
+  // types narrow the stream to matching events.
+  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
+  // PollEvents returns events with seq greater than after_seq, up to 500, in
+  // order. When there are none it waits up to wait_seconds (at most 25) for
+  // one to commit, then returns an empty list with next_seq unchanged.
+  // Beehive: this replaces WatchEvents.
+  rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
+  // CreateCard puts an issue on the board. With a workflow the card sits
+  // idle on the workflow's first stage, in To do. With none it goes to
+  // Backlog. An issue that already has a card on the same workflow returns
+  // that card, and one with a card on another workflow is AlreadyExists.
+  rpc CreateCard(CreateCardRequest) returns (Card);
+  // CreateTask opens an issue titled with the sentence, carrying the labels
+  // the first intake rule that names the workflow searches for, and puts its
+  // card on the board: on the workflow's first stage, or in Backlog when no
+  // workflow is named. When the issue cannot be opened it fails with the
+  // reason and makes no card.
+  rpc CreateTask(CreateTaskRequest) returns (Card);
+  // GetCard returns one card.
+  rpc GetCard(GetCardRequest) returns (Card);
+  // ListCards returns cards and the newest event seq from one snapshot, so
+  // watching from that seq misses no later change.
+  rpc ListCards(ListCardsRequest) returns (ListCardsResponse);
+  // StartStage starts a stage on a card. It fails with FailedPrecondition,
+  // naming the active run, when the card's issue already has one. Beehive:
+  // the run starts at stage_id, or at the workflow's first stage, and
+  // its agent is mentioned in a new top-level post in the update channel.
+  rpc StartStage(StartStageRequest) returns (Run);
+  // StageDone reports the result of the card's running stage. Beehive: new
+  // rpc. Only the Buzz agent the stage's task mentioned may call it, whatever
+  // level others hold. The result must be one the stage offers, else
+  // InvalidArgument lists them. A passed result from the last stage ends the
+  // run and moves the card to done. The report names the stage and visit the
+  // task gave: either one missing is InvalidArgument, and either one that is
+  // not where the run is now is FailedPrecondition, so an answer to an earlier
+  // visit cannot move the card on from a later one.
+  rpc StageDone(StageDoneRequest) returns (Run);
+  // StopRun stops a run: its turn is cancelled and its agent session
+  // closed, it ends with outcome stopped, its open items are resolved, and
+  // its card is stopped. It fails with FailedPrecondition for a run that has
+  // ended with nothing left open.
+  rpc StopRun(StopRunRequest) returns (Run);
+  // RetryRun starts the next attempt of a run's stage, with optional
+  // run-layer setting overrides. It fails with FailedPrecondition unless the
+  // run's card is failed or stopped, or an open item for the run offers
+  // retry, or the card waits at the route item of a stage that reported
+  // failed. That item is resolved as retry when the new attempt starts.
+  rpc RetryRun(RetryRunRequest) returns (Run);
+  // Approve approves the card's open approval stage, naming the version of
+  // each artifact, and moves the card on passed.
+  rpc Approve(ApproveRequest) returns (Card);
+  // SendBack answers the card's open approval stage with comments and moves
+  // the card on needs_work. The stage it goes to gets the comments.
+  rpc SendBack(SendBackRequest) returns (Card);
+  // SendMessage queues text for the card's running agent, which reads it as
+  // its next turn. It fails with FailedPrecondition when the card has no
+  // running agent session, and InvalidArgument for empty text or text over
+  // 32 KiB.
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  // GetRun returns one run.
+  rpc GetRun(GetRunRequest) returns (Run);
+  // ListRuns returns runs and the newest event seq from one snapshot.
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  // ListAutoDecisions returns the answers auto mode gave on a card, oldest
+  // first.
+  rpc ListAutoDecisions(ListAutoDecisionsRequest) returns (ListAutoDecisionsResponse);
+  // ListActivity returns a card's activity entries, oldest first, and the
+  // newest event seq from one snapshot. It fails with InvalidArgument for
+  // a missing card_id or a limit over 1000.
+  rpc ListActivity(ListActivityRequest) returns (ListActivityResponse);
+  // AddNote stores a person's note on the card's current stage. It fails
+  // with FailedPrecondition when the card is at no stage, and with
+  // InvalidArgument when the summary breaks the writing rules.
+  rpc AddNote(AddNoteRequest) returns (AddNoteResponse);
+  // GetBrief returns the text the next fresh session on the stage reads,
+  // or "" when nothing carries over.
+  rpc GetBrief(GetBriefRequest) returns (GetBriefResponse);
+  // GetFullPayload returns the uncut payload of a cut event, which names
+  // it by full_ref. It fails with NotFound when the run, its log or the
+  // ref is missing, and with InvalidArgument for a malformed ref.
+  rpc GetFullPayload(GetFullPayloadRequest) returns (GetFullPayloadResponse);
+  // ListInbox returns Needs you items and the newest event seq from one
+  // snapshot.
+  rpc ListInbox(ListInboxRequest) returns (ListInboxResponse);
+  // AnswerInbox answers an open Needs you item and returns it resolved. It
+  // fails with InvalidArgument for an answer the item's kind does not
+  // allow, and with FailedPrecondition when the item is already answered.
+  rpc AnswerInbox(AnswerInboxRequest) returns (InboxItem);
+  // ListWorkflows returns every loaded workflow by package name, with the
+  // cards that run it and whether it passes its checks.
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
+  // CheckWorkflow runs the workflow checks and returns every finding, never
+  // only the first.
+  rpc CheckWorkflow(CheckWorkflowRequest) returns (CheckWorkflowResponse);
+  // ListTemplateVariables returns the template variables a stage of the
+  // draft may use: the fixed ones, then its declared params.<name>, then
+  // artifacts.<name>.path for each artifact a stage outputs. A draft that
+  // does not decode is InvalidArgument.
+  rpc ListTemplateVariables(ListTemplateVariablesRequest) returns (ListTemplateVariablesResponse);
+  // ListStageTemplates returns the stages the builder can add, each as the
+  // JSON a draft's workflow.yaml holds for a stage, sorted by id.
+  rpc ListStageTemplates(ListStageTemplatesRequest) returns (ListStageTemplatesResponse);
+  // GetWorkflowDraft opens a loaded workflow as a draft the app can edit,
+  // with the hash of the package as loaded. It fails with NotFound for an
+  // unknown name, and with FailedPrecondition when a package file does not
+  // read as YAML or the package is past the draft limits.
+  rpc GetWorkflowDraft(GetWorkflowDraftRequest) returns (GetWorkflowDraftResponse);
+  // SaveWorkflow writes a draft as a package in the data folder's workflows
+  // folder and returns it with the hash of the files written. An empty
+  // base_hash makes a new package, and fails with AlreadyExists when a
+  // loaded workflow or a folder has the name. Otherwise base_hash is the
+  // hash GetWorkflowDraft gave, and a package changed since then fails with
+  // FailedPrecondition. A built-in or a package in another folder fails
+  // with PermissionDenied. A draft whose checks find an error fails with
+  // FailedPrecondition carrying a CheckWorkflowResponse detail with every
+  // finding. A folder holding an entry the app does not manage, such as a
+  // symlink or a .git folder, fails with FailedPrecondition. A bad draft
+  // fails with InvalidArgument, as CheckWorkflow does.
+  rpc SaveWorkflow(SaveWorkflowRequest) returns (SaveWorkflowResponse);
+  // DuplicateWorkflow copies a workflow package into the data folder's
+  // workflows folder under a new name, changing nothing else. The new name
+  // is 1 to 32 lower-case letters, digits, - and _, starting with a letter
+  // or digit, and fails with AlreadyExists when a workflow or folder has it.
+  rpc DuplicateWorkflow(DuplicateWorkflowRequest) returns (Workflow);
+  // DeleteWorkflow deletes the workflow's folder in the person's workflows
+  // folder. A workflow with no copy there is PermissionDenied. When it is
+  // the last copy loaded and a card or an intake rule uses it, it is
+  // FailedPrecondition saying which. Runs already started keep their saved
+  // version.
+  rpc DeleteWorkflow(DeleteWorkflowRequest) returns (DeleteWorkflowResponse);
+  // SetWorkflowOptions replaces a workflow's pauses, next workflow and
+  // suggesting labels, and returns the workflow. It works on built-in
+  // workflows too. NotFound for an unknown workflow; InvalidArgument for an
+  // unknown stage or next workflow, or a next workflow whose hand-offs lead
+  // back to this one.
+  rpc SetWorkflowOptions(SetWorkflowOptionsRequest) returns (Workflow);
+  // ExportWorkflow returns the loaded workflow as one zip of its files, as
+  // last saved. NotFound for an unknown name; FailedPrecondition when its
+  // files could not import.
+  rpc ExportWorkflow(ExportWorkflowRequest) returns (ExportWorkflowResponse);
+  // ImportWorkflow saves the package in a zip as a new workflow, named
+  // name when set. A bad zip or name is InvalidArgument, a name already
+  // loaded is AlreadyExists carrying a NameTaken detail, and contents with
+  // errors are FailedPrecondition with the CheckWorkflowResponse detail
+  // SaveWorkflow gives.
+  rpc ImportWorkflow(ImportWorkflowRequest) returns (Workflow);
+  // ImportPlugin saves the Claude Code plugin folder in a zip as a package
+  // with one stage per command. A new package is named name when set, else
+  // by the plugin manifest's name; neither is InvalidArgument carrying a
+  // NameNeeded detail, and a name already loaded is AlreadyExists carrying
+  // a NameTaken detail. With update_of set it replaces the plugin files of that package of the
+  // person's own and keeps its stages and settings: NotFound for an unknown
+  // name, FailedPrecondition for a built-in package or a base_hash that no
+  // longer matches. Contents with errors are FailedPrecondition with the
+  // CheckWorkflowResponse detail SaveWorkflow gives.
+  rpc ImportPlugin(ImportPluginRequest) returns (Workflow);
+  // ImportSkill adds the skill folder in zip to the draft's files as skills/<name>/ and
+  // returns the new files. It saves nothing: the builder holds the result as an unsaved
+  // draft, and SaveWorkflow checks it. A zip the engine refuses, a folder with no SKILL.md
+  // at its top, or a name that is not kebab-case is InvalidArgument. A SKILL.md that names
+  // no skill, with no name in the request, is InvalidArgument carrying a NameNeeded detail.
+  // A name the files already hold under skills/ is AlreadyExists with a NameTaken detail,
+  // unless replace is set. A replace removes every old file of that skill first.
+  rpc ImportSkill(ImportSkillRequest) returns (ImportSkillResponse);
+  // StartTestRun runs one stage of a draft on a real issue without writing
+  // to it, and returns the run. The draft is stored as a workflow version,
+  // and its card is a test card that ListCards and
+  // GetStatus leave out; GetCard and GetRun find it. The run reads the
+  // issue, its repo and its pull requests as any run does, but records
+  // each write it would make, such as a comment, a label, a push or a pull
+  // request, as a run.write_skipped event instead of making it. It works on
+  // a copy of the issue's artifacts and in a scratch worktree that is
+  // removed when the test ends. A draft whose checks find an error fails
+  // with FailedPrecondition carrying a CheckWorkflowResponse detail, as
+  // SaveWorkflow does. A stage the draft lacks fails with NotFound, an
+  // issue with an unfinished run with FailedPrecondition, and an engine
+  // over a local folder, which has no code host, with FailedPrecondition.
+  rpc StartTestRun(StartTestRunRequest) returns (Run);
+  // ProposeWorkflowEdit asks an agent to change a draft as the request
+  // says, in a scratch copy, and streams progress, then the proposed draft
+  // and its findings. Nothing is saved. The proposal is always the last
+  // message; findings on it are part of the proposal, not an error. A bad
+  // draft or an empty request fails with InvalidArgument, no agent profile
+  // to run with or a change that cannot be read back with
+  // FailedPrecondition, and an agent that does not finish in time with
+  // DeadlineExceeded. Closing the stream stops the agent.
+  rpc ProposeWorkflowEdit(ProposeWorkflowEditRequest) returns (stream ProposeWorkflowEditUpdate);
+  // ListSkills returns the stored skill list for the agent profile a draft
+  // stage resolves to, in one repo. It starts no agent.
+  rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  // ListSkillRepos returns the repos the skill picker offers, and the one
+  // it starts on for a workflow.
+  rpc ListSkillRepos(ListSkillReposRequest) returns (ListSkillReposResponse);
+  // RefreshSkills starts, or joins, a short agent session that lists the
+  // stage's skills fresh, stores the list, and returns it with the draft's
+  // own skills. It fails after 30 seconds.
+  rpc RefreshSkills(ListSkillsRequest) returns (ListSkillsResponse);
+  // PlanBundle lists the personal skills a draft calls and what Bundle
+  // would copy for each. It changes nothing.
+  rpc PlanBundle(PlanBundleRequest) returns (BundlePlan);
+  // BundleSkills copies the chosen personal skills, and the subagents they
+  // name, into the draft and rewrites their calls. It returns the new draft
+  // and saves nothing.
+  rpc BundleSkills(BundleSkillsRequest) returns (WorkflowDraft);
+  // AdaptSkills runs one agent call that rewrites the chosen bundled skills
+  // to use Kiln's tools. It streams progress lines, then one proposal whose
+  // draft differs from the request's only in those skills' files and the
+  // subagents they name. Closing the stream stops the agent.
+  rpc AdaptSkills(AdaptSkillsRequest) returns (stream AdaptSkillsUpdate);
+  // GetCostReport adds up what the runs and chats of a period cost, grouped by
+  // workflow, stage, card, model, day or month. Each row counts the runs
+  // that were estimated and the runs with no cost, so an agent that reports
+  // none never reads as free.
+  rpc GetCostReport(GetCostReportRequest) returns (GetCostReportResponse);
+  // GetCardCost returns one row per stage the card ran, with what each cost.
+  rpc GetCardCost(GetCardCostRequest) returns (GetCardCostResponse);
+  // GetSettings resolves every setting as it applies at one scope, each
+  // with the layer that set it. A stored value that is no longer valid is
+  // skipped and listed in invalid, beside the rest.
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+  // SetSetting stores one user setting, or one workflow or card override, and
+  // fails with InvalidArgument for an unknown key or a value of the wrong
+  // type.
+  rpc SetSetting(SetSettingRequest) returns (Setting);
+  // ListAgentProfiles lists the agent profiles this engine can launch, with
+  // whether each program is found on this machine, the profile the
+  // agent.profile user setting names (empty when unset) and the one used
+  // when it is unset. It starts no agent. The choice itself is saved with
+  // SetSetting and the key agent.profile.
+  rpc ListAgentProfiles(ListAgentProfilesRequest) returns (ListAgentProfilesResponse);
+  // Beehive addition, in place of ListAgentProfiles: the Buzz agents a stage
+  // can name, by display name, with the pubkey of each and of its owner.
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  // ListHosts returns every host signed in now or before, with the person's login and whether it has a
+  // usable token, and the hosts where StartSignIn can start a browser sign-in.
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+  // StartSignIn starts a browser sign-in on a host and returns the code to
+  // enter at the verification URL. It fails with FailedPrecondition when
+  // browser sign-in is not set up for the host.
+  rpc StartSignIn(StartSignInRequest) returns (DeviceCode);
+  // FinishSignIn waits until the person approves the code, denies it, or
+  // it expires, and returns the signed-in host. A denial or expiry fails
+  // with FailedPrecondition.
+  rpc FinishSignIn(FinishSignInRequest) returns (HostAccount);
+  // ImportCLIToken signs a host in with the token `gh` holds for it.
+  rpc ImportCLIToken(ImportCLITokenRequest) returns (HostAccount);
+  // SetHostToken signs a host in with a pasted token. The token is checked
+  // with the host, kept in the OS keychain, and never returned.
+  rpc SetHostToken(SetHostTokenRequest) returns (HostAccount);
+  // SignOut forgets a host's token.
+  rpc SignOut(SignOutRequest) returns (SignOutResponse);
+  // SaveIntakeRule stores an intake rule, a search that sends each new
+  // issue to a workflow, or to Backlog, and restarts its refresh loop. A rule
+  // with id 0 is new.
+  // It fails with InvalidArgument for an interval under one minute, an
+  // unknown assignee filter, a query the host would not run (such as one
+  // that names no repo:, org: or user:), and with NotFound for an unknown
+  // rule or workflow.
+  rpc SaveIntakeRule(SaveIntakeRuleRequest) returns (IntakeRule);
+  // DeleteIntakeRule stops a rule and deletes it. The cards it brought stay
+  // where they are. It fails with NotFound for an unknown rule.
+  rpc DeleteIntakeRule(DeleteIntakeRuleRequest) returns (DeleteIntakeRuleResponse);
+  // ListIntakeRules returns every intake rule with the head event seq read
+  // in the same transaction.
+  rpc ListIntakeRules(ListIntakeRulesRequest) returns (ListIntakeRulesResponse);
+  // RefreshIntake runs every intake search now, or one rule's when rule_id
+  // is set. It fails with FailedPrecondition when there is no intake rule or
+  // the host is signed out, and waits out a rate limit.
+  rpc RefreshIntake(RefreshIntakeRequest) returns (RefreshIntakeResponse);
+  // PreviewIntake runs the first page of an intake rule's search and
+  // returns the issues the rule would take. It stores nothing and adds no
+  // cards. It fails with InvalidArgument for a rule SaveIntakeRule would
+  // refuse, with FailedPrecondition when the host is signed out, and
+  // with ResourceExhausted at once on a rate limit.
+  rpc PreviewIntake(PreviewIntakeRequest) returns (PreviewIntakeResponse);
+  // ListRepos returns the repos the signed-in token reaches on a host, as
+  // "owner/name", for the repo picker. With owner set it returns only that
+  // account's repos, most recently pushed first. The engine keeps the answer
+  // for a few minutes and drops it when the host is signed in again. It fails
+  // with InvalidArgument for a host that is not a bare host name, with
+  // FailedPrecondition when the host is signed out, and with
+  // ResourceExhausted at once on a rate limit.
+  rpc ListRepos(ListReposRequest) returns (ListReposResponse);
+  // ListOwners returns the signed-in person's login and the login of each
+  // organization they belong to on a host, the person first, so the repo
+  // picker can list one account's repos at a time. It is kept and fails the
+  // way ListRepos does.
+  rpc ListOwners(ListOwnersRequest) returns (ListOwnersResponse);
+  // SearchIssues runs one page of a search on a host for the browse
+  // drawer. It stores nothing and adds no cards: CreateCard takes a hit.
+  // Each filter field narrows the result. It fails with InvalidArgument for
+  // no repo, more than five, a repo that is not "owner/name", a state other
+  // than open or closed, an assignee or label the search cannot carry, or a
+  // cursor it did not hand out; with FailedPrecondition when the host is
+  // signed out; and with ResourceExhausted at once on a rate limit.
+  rpc SearchIssues(SearchIssuesRequest) returns (SearchIssuesResponse);
+  // MergeCard merges every open pull request of the card in merge order, then
+  // starts the workflow's cleanup stage, or marks the card done when it has
+  // none. It reads the
+  // checks of each pull request from the host and merges nothing unless every
+  // one has finished and passed. It fails with FailedPrecondition when no code
+  // host is configured, the card has no open pull request, card.dont_merge is
+  // set, a pull request is a draft or has failing or unfinished checks, a stage
+  // is running, or a host refuses a merge (the message names the repos merged
+  // and not merged, and the card stays where it was), or the card is in
+  // Backlog. A pull request already merged is skipped, so trying again after
+  // a failure merges nothing twice.
+  rpc MergeCard(MergeCardRequest) returns (Card);
+  // SkipStage moves the card on as if its current stage had reported
+  // passed, with no run, and records card.skipped. A card with an
+  // unfinished run fails with FailedPrecondition "Stop the current stage
+  // first"; a card with no stage is InvalidArgument. Beehive: the card's
+  // run must be waiting or paused, and the stage is marked skipped. A card
+  // with no run, or whose run is running, is FailedPrecondition.
+  rpc SkipStage(SkipStageRequest) returns (Card);
+  // PauseCard holds the card so nothing starts it, across restarts too. Its
+  // live run is halted and paused, the way quitting pauses it. Pausing a
+  // held card changes nothing. Beehive: only a running run can be paused.
+  // The stage's agent is told nothing, and its report is refused until the
+  // card is resumed. A card with no run, or whose run is not running, is
+  // FailedPrecondition.
+  rpc PauseCard(PauseCardRequest) returns (Card);
+  // ResumeCard clears the hold and reruns what it stopped: a paused run
+  // gets its stage's next attempt, and an idle card owed a start
+  // starts. With nothing to run the Run is empty, with id 0. A card that is
+  // not held fails with FailedPrecondition. Beehive: a paused run goes back
+  // to running, and a stage held before it started posts its task. The Run
+  // is the run that was resumed.
+  rpc ResumeCard(ResumeCardRequest) returns (Run);
+  // PauseAll pauses every live run that holds an agent session, the way
+  // quitting does, while the engine keeps running. Each paused run gets an
+  // interrupted item offering Resume (when the session can be resumed), Retry
+  // and Stop; Resume continues the agent session. No card is held. Runs
+  // waiting with no session, such as an approval or a wait stage, keep
+  // waiting.
+  rpc PauseAll(PauseAllRequest) returns (PauseAllResponse);
+  // ResetCard stops the card's run, closes its issue's open pull request,
+  // removes the worktree keeping the branch, and puts the card idle on the
+  // first stage, in that order. A step that fails leaves
+  // the card where it is with a reset_failed item, and fails the call.
+  // Artifacts are kept.
+  rpc ResetCard(ResetCardRequest) returns (Card);
+  // RemoveCard takes the card off the board for good. A card with a run that
+  // has not ended is FailedPrecondition until the run is stopped, and a test
+  // card is NotFound. The card's runs, costs, comments, artifacts, pull
+  // requests and worktrees stay, its open items are resolved, and intake
+  // does not add its issue again. It publishes card.removed.
+  rpc RemoveCard(RemoveCardRequest) returns (RemoveCardResponse);
+  // SetCardWorkflow sorts cards, as a person did by dragging or the Move
+  // menu. It is all or nothing: one refused card refuses the batch. A card
+  // that has run, is not idle, is archived or is a test card is refused, and
+  // an unknown workflow is NotFound. An empty workflow sends a card back to
+  // Backlog. It publishes card.workflow_changed for each card that changed.
+  // Beehive: it publishes card.moved, and a card that has a run is refused.
+  rpc SetCardWorkflow(SetCardWorkflowRequest) returns (SetCardWorkflowResponse);
+  // MoveCard is the stage's agent moving its own card to another stage, in
+  // place of the route its result would give. Beehive: new rpc. Only the
+  // Buzz agent the stage task mentioned may call it, and only when the
+  // workflow sets side_effects.agent_moves_cards. An unknown stage is
+  // InvalidArgument. Like StageDone, the call names the stage and visit the
+  // task gave, and they must be where the run is now.
+  rpc MoveCard(MoveCardRequest) returns (Run);
+  // ArchiveCards sets cards aside, all or nothing. A card with an unfinished
+  // run is FailedPrecondition until the run is stopped, and a test card is
+  // NotFound. An archived card leaves the board, keeps its runs and costs,
+  // has its open items resolved, and is left alone by intake. A card already
+  // archived is left as it is. It publishes card.archived for each card set
+  // aside.
+  rpc ArchiveCards(ArchiveCardsRequest) returns (ArchiveCardsResponse);
+  // RestoreCard brings an archived card back: to Backlog when it never ran,
+  // else to To do on its own workflow. A card that is not archived, or whose
+  // issue has another card on the board, is FailedPrecondition. It publishes
+  // card.restored.
+  rpc RestoreCard(RestoreCardRequest) returns (Card);
+  // ListArtifacts lists the card's artifacts by name.
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  // ListArtifactVersions lists every version of one artifact, oldest first
+  // and without content, and its approvals, oldest first. An unknown
+  // artifact is NotFound.
+  rpc ListArtifactVersions(ListArtifactVersionsRequest) returns (ListArtifactVersionsResponse);
+  // ReadArtifact returns one version of one artifact with its content. A
+  // file's content is empty: its media_ref says where to download it.
+  rpc ReadArtifact(ReadArtifactRequest) returns (ArtifactVersion);
+  // ListCardFiles lists the card's file artifacts, each at its latest
+  // version. A file lives in the Buzz media store, so every file here is
+  // saved.
+  rpc ListCardFiles(ListCardFilesRequest) returns (ListCardFilesResponse);
+  // GetCardFilePath returns where a saved file of the card's issue is on
+  // disk. Only the desktop shell calls it, to open the file.
+  rpc GetCardFilePath(GetCardFilePathRequest) returns (GetCardFilePathResponse);
+  // SetHandoff sets whether the card's later stages get the artifact, and
+  // records artifact.handoff.
+  rpc SetHandoff(SetHandoffRequest) returns (ArtifactInfo);
+  // SaveArtifact saves the next version of one of the running stage's
+  // artifacts, as a document (content) or a file (kind "file" with sha256,
+  // size, media_type and media_ref). Only the agent the stage task mentioned
+  // may. A name the stage does not declare, a kind that differs from the
+  // artifact's, or a document over 1 MiB is InvalidArgument.
+  rpc SaveArtifact(SaveArtifactRequest) returns (ArtifactVersion);
+  // UpdatePlan checks or unchecks one item of the repeat plan of the running
+  // stage, which saves a new version of the plan.
+  rpc UpdatePlan(UpdatePlanRequest) returns (UpdatePlanResponse);
+  // LogWork records one piece of finished work in the card's activity.
+  rpc LogWork(LogWorkRequest) returns (LogWorkResponse);
+  // RecordDecision records a choice, why, and the options turned down.
+  rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
+  // ReadHistory returns the card's work and decision entries after after_seq,
+  // oldest first. A limit over 500 is InvalidArgument; 0 means 100.
+  rpc ReadHistory(ReadHistoryRequest) returns (ReadHistoryResponse);
+  // ReportUsage records that a person opened a screen or took an action,
+  // for the anonymous usage report. It stores nothing and returns OK
+  // whether or not reporting is on. It fails with InvalidArgument for
+  // UNSPECIFIED or a number the enum does not define.
+  rpc ReportUsage(ReportUsageRequest) returns (ReportUsageResponse);
+  // AddIssueRepo adds a repo on the issue's host to the card's issue, after
+  // checking the person's token can read it. A repo name that is not
+  // owner/name, or a base that is not a branch name, is InvalidArgument. A
+  // local issue is FailedPrecondition, a repo already on the issue is
+  // AlreadyExists, a repo that does not exist or cannot be read is NotFound,
+  // and a card with an active run is FailedPrecondition.
+  rpc AddIssueRepo(AddIssueRepoRequest) returns (Card);
+  // RemoveIssueRepo takes an extra repo off the card's issue and removes
+  // its worktree. It is FailedPrecondition for the main repo, a repo with
+  // an open pull request, a repo the issue's front matter still lists, and
+  // a card with an active run. A repo that is not on the issue is NotFound.
+  rpc RemoveIssueRepo(RemoveIssueRepoRequest) returns (Card);
+  // SetMergeOrder records the order the card's repos merge in. repos must
+  // name every repo on the card exactly once, in the new order. It is
+  // InvalidArgument for any other list and FailedPrecondition while a run
+  // is active. Kiln follows the order when it merges and does not enforce
+  // it on a merge made by hand.
+  rpc SetMergeOrder(SetMergeOrderRequest) returns (Card);
+
+  // Chat sends one message to the assistant and streams its turn: progress
+  // lines, reply text, then done. Closing the stream stops the turn and
+  // keeps the reply so far. A second Chat while a turn runs is
+  // FailedPrecondition, and so is a Chat with no agent chosen.
+  rpc Chat(ChatRequest) returns (stream ChatUpdate);
+  // ListConversations lists saved conversations, newest first, and says
+  // whether an agent is ready to answer.
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+  // GetConversation returns one conversation and its messages, oldest first.
+  rpc GetConversation(GetConversationRequest) returns (GetConversationResponse);
+  // DeleteConversation forgets a conversation, its messages and its folder.
+  rpc DeleteConversation(DeleteConversationRequest) returns (DeleteConversationResponse);
+  // ResolveProposal records what the person did with a proposal. It acts on
+  // nothing: the app already ran the action through its own call.
+  rpc ResolveProposal(ResolveProposalRequest) returns (ResolveProposalResponse);
+  // AcceptTicketProposal files a ticket proposal: it opens the issue or
+  // writes the Kiln task, adds the card, and records the card on the
+  // proposal. A repeat returns the same card and opens nothing new.
+  rpc AcceptTicketProposal(AcceptTicketProposalRequest) returns (AcceptTicketProposalResponse);
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string version = 1;
+  string data_dir = 2;
+  // The newest event seq, the cursor to watch from for live events only.
+  int64 head_seq = 3;
+  // The cards in state running.
+  int64 running = 4;
+  // The open Needs you items. Beehive has none yet, so this stays 0.
+  int64 needs_you = 5;
+  // Beehive: the Buzz community this service serves.
+  string community_id = 6;
+  // Beehive: posts to the relay not sent yet, failed ones included.
+  int64 outbox_pending = 7;
+  // Beehive: the pending posts whose last attempt failed. Stays above 0 while the relay
+  // refuses them, so an operator can see a drain that is stuck.
+  int64 outbox_failed = 8;
+}
+
+// A person in the company. user_id is "" in token mode before --owner is set.
+message Person {
+  string user_id = 1;
+  string name = 2;
+  string email = 3;
+}
+
+message ListPeopleRequest {}
+
+message ListPeopleResponse {
+  repeated Person people = 1;
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  Person me = 1;
+  string company_id = 2;
+  string role = 3;
+  // The caller's effective permissions: the role's set plus granted
+  // carrier:* overrides, minus every carrier:* key the token's policy denies.
+  repeated string permissions = 4;
+  // The engine's API version, for the page to compare with its own.
+  int32 api_version = 5;
+  // Beehive: person or agent.
+  string kind = 6;
+  // Beehive: the owner's pubkey when the caller is an agent, else empty.
+  string owner = 7;
+}
+
+message PollEventsRequest {
+  // Return events with seq greater than this; 0 starts from the beginning.
+  int64 after_seq = 1;
+  // How long to wait for an event when none is ready. Clamped to 0 to 25.
+  int32 wait_seconds = 2;
+}
+
+message PollEventsResponse {
+  repeated Event events = 1;
+  // The seq to pass as after_seq on the next call.
+  int64 next_seq = 2;
+}
+
+message WatchEventsRequest {
+  // Stream events with seq greater than this; 0 streams from the start.
+  int64 after_seq = 1;
+  // When set, only this card's events.
+  int64 card_id = 2;
+  // When set, only events of these types. An unknown type fails with
+  // InvalidArgument.
+  repeated string types = 3;
+  // When set, only this run's events. Pair it with card_id: a run_id without
+  // one fails with InvalidArgument.
+  int64 run_id = 4;
+}
+
+// Event is one row of the engine's event log.
+message Event {
+  // Global order across all events, and the WatchEvents cursor.
+  int64 seq = 1;
+  // One of the event types the engine registers, such as "engine.started".
+  string type = 2;
+  // Beehive: the run's UUID, empty when the event belongs to no run.
+  string run_id = 3;
+  // Beehive: the card's UUID, empty when the event belongs to no card.
+  string card_id = 4;
+  // The type's payload as JSON.
+  string payload_json = 5;
+  google.protobuf.Timestamp at = 6;
+  // Beehive: the pubkey of the person or agent that caused the event.
+  string actor_pubkey = 7;
+  // Beehive: person or agent.
+  string actor_kind = 8;
+}
+
+// IssueRef names one issue on one host. Local issues use host and owner
+// "local" and the repo folder's name.
+message IssueRef {
+  string host = 1;
+  string owner = 2;
+  string repo = 3;
+  int32 number = 4;
+}
+
+// Card is one issue on the board.
+message Card {
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string id = 1;
+  reserved 2, 9;
+  reserved "view_id", "lane_id";
+  // The workflow package name; empty for a card in Backlog.
+  string workflow = 3;
+  IssueRef issue = 4;
+  // The card's current stage id; empty before its first stage.
+  string stage_id = 5;
+  // idle, running, waiting, failed, done or stopped.
+  string state = 6;
+  // Why the card's issue left its intake rule's search after the card
+  // ran: closed, reassigned or unmatched. Empty while it is in the search.
+  // A repos-and-label rule keeps a held issue in its search, so there
+  // reassigned marks a card whose issue someone else holds.
+  string intake_status = 7;
+  // The newest pull request Kiln opened for the card's issue, unset when
+  // there is none.
+  PullRequest pull_request = 8;
+  // Why the idle card will not start its current stage, such as "Merging
+  // is turned off for this card". Empty when nothing blocks it.
+  string blocked_reason = 10;
+  // The folder of the issue's worktree; empty when it has none.
+  string worktree_path = 11;
+  // Set while a person holds the card with Pause, so nothing starts it.
+  google.protobuf.Timestamp paused_at = 12;
+  // The issue's title.
+  string title = 13;
+  // Every repo on the issue in merge order. Empty for a one-repo card.
+  repeated CardRepo repos = 14;
+  // The issue's body, with Kiln's hidden marker removed. Only GetCard sets
+  // it. It is empty in ListCards, MoveCard and every other card reply,
+  // because a body can be 64 KiB.
+  string body = 15;
+  // True when the engine holds the idle card at its current stage only
+  // because it has no repo, so adding a repo lets it start. It is false for
+  // every other reason in blocked_reason, such as a merge setting or a stage
+  // that needs an issue host, which a repo cannot fix.
+  bool needs_repo = 16;
+  // The intake rule that brought the card, 0 for a card a person added or
+  // whose rule was deleted.
+  int64 intake_rule_id = 17;
+  // The source's own name for the issue, such as "PROJ-123". Empty for
+  // GitHub and local issues, which the UI names owner/repo#number.
+  string issue_key = 18;
+  // The issue's web page as its source reported it. The shell opens it
+  // only when it is https on the issue's own host.
+  string issue_url = 19;
+  // True when the issue's host keeps no code, as for a Kiln task. Such a card
+  // has no repo of its own: its repos are the ones a person adds.
+  bool issue_without_repo = 20;
+  // True when card.auto_mode is set on the card, so the engine answers
+  // its inbox items on its own.
+  bool auto_mode = 21;
+  // True once the card has any run. A card that has run keeps its workflow.
+  bool has_run = 22;
+  // True while the card is in the archive.
+  bool archived = 23;
+  // suggested_workflows lists, sorted, the workflows a Backlog card's issue
+  // labels suggest. Empty for any card with a workflow.
+  repeated string suggested_workflows = 24;
+  // Beehive: the thread each stage visit opened, in the order they were posted. Only
+  // GetCard sets it. stage_id is then the stage the card's latest run is in.
+  repeated StageThread stages = 25;
+}
+
+// Beehive: the relay thread one visit to a stage opened. Its root is the top-level
+// message that mentions the stage's agent, in the channel the task was posted in.
+message StageThread {
+  string stage = 1;
+  int32 visit = 2;
+  // 64 hex characters.
+  string root_event_id = 3;
+  // 64 hex characters.
+  string agent_pubkey = 4;
+  // The channel's UUID.
+  string channel_id = 5;
+}
+
+// One repo on a card. worktree_path and branch are empty until a stage
+// prepares the repo.
+message CardRepo {
+  // owner, repo and host. number is unused.
+  IssueRef repo = 1;
+  bool main = 2;
+  // 1 merges first.
+  int32 merge_order = 3;
+  string base = 4;
+  string branch = 5;
+  string worktree_path = 6;
+  PullRequest pull_request = 7;
+  // passing, failing, pending or empty.
+  string checks = 8;
+  // False when the agent said no work is needed in the repo.
+  bool active = 9;
+  reserved 10;
+  reserved "from_front_matter";
+  // Why RemoveIssueRepo will refuse to remove the repo now, in plain words,
+  // or empty when nothing the card holds is in the way: the issue's own repo
+  // and an open pull request. The issue's front matter and a running stage
+  // are checked by RemoveIssueRepo itself, which reads the issue again.
+  string remove_refusal = 11;
+}
+
+message MergeCardRequest {
+  int64 card_id = 1;
+}
+
+// A pull request Kiln opened for an issue.
+message PullRequest {
+  int32 number = 1;
+  string url = 2;
+  // open, closed or merged.
+  string state = 3;
+  bool draft = 4;
+  // True when the repo did not allow the kiln label.
+  bool label_skipped = 5;
+  // The last check summary a wait stage stored: passing, failing, pending, or
+  // empty when never read. Set for a one-repo card's pull request. A
+  // multi-repo card carries it on CardRepo.checks too.
+  string checks = 6;
+}
+
+// Run is one attempt at one stage for one card.
+message Run {
+  // Beehive: the run's UUID. The Go engine used an int64.
+  string id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 2;
+  string stage_id = 3;
+  // running, waiting, paused or ended.
+  string state = 4;
+  int32 attempt = 5;
+  string outcome = 6;
+  // The last result the agent reported, empty when none.
+  string result = 7;
+  // Unset when the run has no cost, reported or estimated.
+  optional double cost_usd = 8;
+  bool cost_reported = 9;
+  // The latest agent session id the run opened.
+  string session_id = 10;
+  google.protobuf.Timestamp started_at = 11;
+  google.protobuf.Timestamp ended_at = 12;
+  // The summary sent with the last result.
+  string summary = 13;
+  // True when some of the cost is an estimate from tokens, not what the
+  // agent reported.
+  bool cost_estimated = 14;
+  // The call that started the run, unset when no route called its stage.
+  RunCall call = 15;
+  // The engine that holds the run, unset when none does.
+  RunHolder holder = 16;
+  // Which visit to its stage this run belongs to, from 1. Retries keep it.
+  int32 visit = 17;
+  // The model of the run's newest stage session. Empty before one opens.
+  string model = 18;
+  // Beehive: the stages the run has entered, oldest first. A stage entered
+  // again is a new entry. The rounds of a repeating stage share one entry.
+  repeated RunStep steps = 19;
+}
+
+// RunStep is one stage a run entered.
+message RunStep {
+  string stage = 1;
+  // The thread the stage's task was posted under, from 1.
+  int32 visit = 2;
+  // The round of a repeating stage, from 1.
+  int32 round = 3;
+  // The last result the stage's agent reported. Empty while none has.
+  string result = 4;
+  string summary = 5;
+  // Where the stage sent the card: a stage id, done or stop. Empty while the
+  // card is still in the stage.
+  string routed_to = 6;
+  // True when routed_to is this stage or an earlier one.
+  bool backward = 7;
+  // True when the workflow holds the card before this stage until it is
+  // resumed.
+  bool held = 8;
+  // True when the stage never ran: its conditions were not met or a person
+  // skipped it.
+  bool skipped = 9;
+  // Times the card was resumed while the stage was running.
+  int32 resumes = 10;
+}
+
+// RunHolder is the engine process that holds a run.
+message RunHolder {
+  string engine_id = 1;
+  string host = 2;
+  int64 pid = 3;
+  google.protobuf.Timestamp last_heartbeat = 4;
+  // True when it is the engine this API belongs to.
+  bool is_local = 5;
+}
+
+// RunCall is a route that called a stage and gave it documents.
+message RunCall {
+  // The stage whose route made the call, and the run of it.
+  string by_stage = 1;
+  int64 by_run = 2;
+  // The documents given, sorted by input name.
+  repeated RunInput inputs = 3;
+  // Where the card goes once the called stage passes, empty when it follows the
+  // stage's own route.
+  string then = 4;
+}
+
+// RunInput is a document a call gave one input of the called stage.
+message RunInput {
+  // The input of the called stage.
+  string name = 1;
+  // The saved document the input read.
+  string artifact = 2;
+  // The version of it the stage started with, 0 when it had none.
+  int32 version = 3;
+}
+
+// InboxItem is one Needs you item.
+message InboxItem {
+  int64 id = 1;
+  string kind = 2;
+  int64 run_id = 3;
+  int64 card_id = 4;
+  // open or resolved.
+  string state = 5;
+  string title = 6;
+  // Kind-specific detail as JSON.
+  string detail_json = 7;
+  // The answers the item accepts.
+  repeated string choices = 8;
+  // The answer it was resolved with: a choice, or field values or answers
+  // as JSON. Empty while open.
+  string answer_json = 9;
+  google.protobuf.Timestamp created_at = 10;
+  // Unset while open.
+  google.protobuf.Timestamp resolved_at = 11;
+  // The title of the item's card, set by ListInbox. Empty when the item has
+  // no card or the card has no title.
+  string card_title = 12;
+}
+
+message CreateCardRequest {
+  // The card's workflow; empty puts the card in Backlog. The issue's
+  // existing card on the same workflow is returned instead of a new one.
+  string workflow = 1;
+  IssueRef issue = 2;
+  reserved 3;
+  reserved "view_id";
+  // Beehive: the card's title, 1 to 200 characters. A Beehive card has no
+  // issue until intake exists, so `issue` is refused when set.
+  string title = 4;
+  // Beehive: the card's description, up to 65536 characters.
+  string description = 5;
+}
+
+message CreateTaskRequest {
+  reserved 1;
+  reserved "view_id";
+  // "owner/name" on the host of the first intake rule that sends issues to
+  // the workflow, or "host/owner/name". Empty is the default_repo setting,
+  // else the repo named by the first intake rule that sends issues to the
+  // workflow, else a Kiln task. "local/local/tasks" is always a Kiln task: written on
+  // this computer with no sign-in. A Kiln task on a workflow that needs a
+  // code host or an issue host is FAILED_PRECONDITION.
+  string repo = 2;
+  // The issue's title.
+  string sentence = 3;
+  // Parameter values by the name the workflow's package declares. They
+  // become the new card's own settings (params.<name>). An undeclared name
+  // or a value its type refuses is INVALID_ARGUMENT, and no issue is opened.
+  map<string, string> parameters = 4;
+  // The issue's body, optional. Over 65536 characters is INVALID_ARGUMENT.
+  string description = 5;
+  // The task's workflow; empty lands the card in Backlog.
+  string workflow = 6;
+}
+
+message GetCardRequest {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+}
+
+message ListCardsRequest {
+  reserved 1;
+  reserved "view_id";
+  // Lists the archive instead of the board.
+  bool archived = 2;
+}
+
+message ListCardsResponse {
+  repeated Card cards = 1;
+  int64 seq = 2;
+}
+
+message StartStageRequest {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+  // Empty starts the card's current stage, or the first stage when the card
+  // has none. Beehive: empty starts at the workflow's first stage, and a
+  // stage the workflow does not have is INVALID_ARGUMENT.
+  string stage_id = 2;
+  // Parameter values by the name the workflow's package declares. They
+  // are the new run's own settings (params.<name>). An undeclared name or a
+  // value its type refuses is INVALID_ARGUMENT.
+  map<string, string> parameters = 3;
+}
+
+message StageDoneRequest {
+  // The card's UUID, which the stage task names.
+  string card_id = 1;
+  // One of the results the stage task lists, such as passed or failed.
+  string result = 2;
+  // What the agent says about the result, up to 10,000 characters. Optional.
+  string summary = 3;
+  // The stage the task named. Required: it must be the stage the run is at.
+  string stage = 4;
+  // The visit the task named, from 1. Required: it must be the run's current
+  // visit to that stage.
+  int32 visit = 5;
+}
+
+message StopRunRequest {
+  int64 run_id = 1;
+}
+
+message RetryRunRequest {
+  int64 run_id = 1;
+  // Run-layer setting overrides: a JSON value by setting key, such as the
+  // JSON string "opus" for agent.model. They replace the old run's
+  // overrides; with none, the old run's carry over.
+  map<string, string> overrides_json = 2;
+}
+
+// ArtifactVersion names one version of one artifact. Approve reads only
+// name and version. ReadArtifact fills content; ListArtifactVersions
+// leaves it empty.
+message ArtifactVersion {
+  string name = 1;
+  int32 version = 2;
+  // The document's text. Empty for a file.
+  string content = 3;
+  // The SHA-256 of the document's bytes, or of the file.
+  string sha256 = 4;
+  // The pubkey that saved the version.
+  string by = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // "text" or "file".
+  string kind = 7;
+  // A file's size in bytes, and for a document the length of its text.
+  int64 size = 8;
+  // A file's media type. Empty for a document.
+  string media_type = 9;
+  // What `buzz media get` takes for a file: the blob's URL, else its hash.
+  string media_ref = 10;
+  // The stage that saved the version, and which visit of it.
+  string stage_id = 11;
+  int32 visit = 12;
+}
+
+// ArtifactInfo is one artifact of an issue.
+message ArtifactInfo {
+  string name = 1;
+  // The newest version; 0 when none is saved yet.
+  int32 latest = 2;
+  // Whether later stages get the artifact.
+  bool handoff = 3;
+  // "text" or "file".
+  string kind = 4;
+}
+
+// Approval is one person's approval of one version, by its hash.
+message Approval {
+  string name = 1;
+  int32 version = 2;
+  string sha256 = 3;
+  string by = 4;
+  google.protobuf.Timestamp at = 5;
+}
+
+message SkipStageRequest {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+}
+
+message PauseCardRequest {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+}
+
+message PauseAllRequest {}
+
+message PauseAllResponse {
+  // How many runs were paused.
+  int32 paused = 1;
+}
+
+message ResumeCardRequest {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+}
+
+message ResetCardRequest {
+  int64 card_id = 1;
+}
+
+message RemoveCardRequest {
+  string card_id = 1;
+}
+
+message RemoveCardResponse {}
+
+// CardWorkflow is one card's new workflow. An empty workflow sends the card
+// back to Backlog.
+message CardWorkflow {
+  // Beehive: the card's UUID.
+  string card_id = 1;
+  string workflow = 2;
+}
+
+message SetCardWorkflowRequest {
+  repeated CardWorkflow moves = 1;
+}
+
+// SetCardWorkflowResponse holds the cards after the move, in request order.
+message SetCardWorkflowResponse {
+  repeated Card cards = 1;
+}
+
+message MoveCardRequest {
+  // The card's UUID, which the stage task names.
+  string card_id = 1;
+  // The stage to move the card to.
+  string stage_id = 2;
+  // The stage the task named, which the card is moved from. Required: it must
+  // be the stage the run is at.
+  string stage = 3;
+  // The visit the task named, from 1. Required: it must be the run's current
+  // visit to that stage.
+  int32 visit = 4;
+}
+
+message ArchiveCardsRequest {
+  repeated string card_ids = 1;
+}
+
+message ArchiveCardsResponse {}
+
+message RestoreCardRequest {
+  string card_id = 1;
+}
+
+message AddIssueRepoRequest {
+  int64 card_id = 1;
+  // owner/name on the issue's host.
+  string repo = 2;
+  // The branch a new branch starts from. Empty for the repo's default branch.
+  string base = 3;
+}
+
+message RemoveIssueRepoRequest {
+  int64 card_id = 1;
+  // owner/name.
+  string repo = 2;
+}
+
+message SetMergeOrderRequest {
+  int64 card_id = 1;
+  // owner/name, first to merge first.
+  repeated string repos = 2;
+}
+
+message ListArtifactsRequest {
+  string card_id = 1;
+}
+
+message ListArtifactsResponse {
+  repeated ArtifactInfo artifacts = 1;
+}
+
+message ListArtifactVersionsRequest {
+  string card_id = 1;
+  string name = 2;
+}
+
+message ListArtifactVersionsResponse {
+  repeated ArtifactVersion versions = 1;
+  repeated Approval approvals = 2;
+}
+
+message ReadArtifactRequest {
+  string card_id = 1;
+  string name = 2;
+  // 0 reads the latest version.
+  int32 version = 3;
+}
+
+message ListCardFilesRequest {
+  string card_id = 1;
+}
+
+message ListCardFilesResponse {
+  repeated CardFile files = 1;
+}
+
+// CardFile is one file artifact of a card at its latest version.
+message CardFile {
+  // Always 0: a file is named by its artifact.
+  int64 id = 1;
+  // name is the artifact's name.
+  string name = 2;
+  int64 size = 3;
+  // What `buzz media get` takes: the blob's URL, else its hash.
+  string url = 4;
+  // state is always saved.
+  string state = 5;
+  // reason says why a refused or failed file was not saved.
+  string reason = 6;
+  // Always false: the app downloads a file through the media store.
+  bool opens_in_app = 7;
+  string media_type = 8;
+  string sha256 = 9;
+  int32 version = 10;
+  // The stage that saved this version.
+  string stage_id = 11;
+}
+
+message GetCardFilePathRequest {
+  int64 card_id = 1;
+  int64 file_id = 2;
+}
+
+message GetCardFilePathResponse {
+  string path = 1;
+  // opens_in_app is true when the file may be opened in the computer's
+  // default app, and false when it is only to be shown in its folder.
+  bool opens_in_app = 2;
+}
+
+message SetHandoffRequest {
+  string card_id = 1;
+  string name = 2;
+  bool handoff = 3;
+}
+
+message ApproveRequest {
+  int64 card_id = 1;
+  // The versions approved. An artifact the stage lists but this leaves out
+  // is approved at the version the approval item showed.
+  repeated ArtifactVersion artifacts = 2;
+}
+
+message SendBackRequest {
+  int64 card_id = 1;
+  // Required. The stage the card goes back to gets them as
+  // {{sendback.comments}}.
+  string comments = 2;
+}
+
+message SendMessageRequest {
+  int64 card_id = 1;
+  // Required, at most 32 KiB.
+  string text = 2;
+}
+
+message SendMessageResponse {
+  // 16 hex characters, named by the message.* events.
+  string message_id = 1;
+}
+
+message GetRunRequest {
+  // Beehive: the run's UUID.
+  string run_id = 1;
+}
+
+message ListRunsRequest {
+  // Beehive: the card's UUID. Empty lists every run.
+  string card_id = 1;
+}
+
+message ListRunsResponse {
+  repeated Run runs = 1;
+  int64 seq = 2;
+}
+
+message ListAutoDecisionsRequest {
+  int64 card_id = 1;
+}
+
+// AutoDecision is one answer auto mode gave on a card.
+message AutoDecision {
+  int64 item_id = 1;
+  // The answered item's kind, such as ask or approval.
+  string kind = 2;
+  // The answered item's title.
+  string title = 3;
+  string answer = 4;
+  // Why auto mode chose the answer.
+  string reason = 5;
+  google.protobuf.Timestamp at = 6;
+}
+
+message ListAutoDecisionsResponse {
+  repeated AutoDecision decisions = 1;
+  // The event sequence the list was read at.
+  int64 seq = 2;
+}
+
+message ListInboxRequest {
+  // Resolved items are left out unless this is set.
+  bool include_resolved = 1;
+  // 0 lists the items of every card.
+  int64 card_id = 2;
+}
+
+message ListInboxResponse {
+  repeated InboxItem items = 1;
+  int64 seq = 2;
+}
+
+message AnswerInboxRequest {
+  int64 item_id = 1;
+  // One of the item's choices, such as "allow_once" or "decline". Empty
+  // when answering a question with values or an ask with answers.
+  string choice = 2;
+  // A question item's field values, as a JSON object.
+  string values_json = 3;
+  // An ask item's answers, one per question, in order.
+  repeated string answers = 4;
+}
+
+message ListWorkflowsRequest {}
+
+// Workflow is one workflow, named by its package.
+message Workflow {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+  // Every package folder loaded with this name. More than one is a clash,
+  // and the workflow cannot start until one is renamed.
+  repeated string paths = 4;
+  reserved 5;
+  reserved "view_ids";
+  // False when the checks found an error.
+  bool ok = 6;
+  // True for a package every build ships. It is read-only, and version is
+  // the engine's.
+  bool builtin = 7;
+  // True when a copy sits in the person's workflows folder, the one copy
+  // the app can change or delete.
+  bool own = 8;
+  // True when the workflow has a stage that changes the issue on its
+  // tracker, such as a comment or a label. A Kiln task cannot run it.
+  bool needs_issue_host = 9;
+  // True when the workflow has a stage that needs a code host: a pull
+  // request, CI, a merge or a git branch.
+  bool needs_code_host = 10;
+  // paused_stages lists the stages a card waits before, in stage order:
+  // the person's list, or the package's pause: true stages when they set none.
+  repeated string paused_stages = 11;
+  // next_workflow is where a finished card moves, "" for nowhere.
+  string next_workflow = 12;
+  // labels are the issue labels a person added that suggest the workflow.
+  // Its own name always suggests it too.
+  repeated string labels = 13;
+  // The stages in file order, so the page can show what the workflow does.
+  // Beehive addition: the Go engine's list left stages to GetWorkflowDraft.
+  repeated WorkflowStage stages = 14;
+}
+
+// WorkflowStage is one stage of a listed workflow, in short.
+message WorkflowStage {
+  string id = 1;
+  // The name the board shows; the id when the file sets none.
+  string name = 2;
+  // prompt, approval, wait or action.
+  string kind = 3;
+  // The Buzz agent a prompt stage runs on. Empty for other kinds.
+  string agent = 4;
+  // True when a card waits before this stage until a person starts it.
+  bool pause = 5;
+}
+
+message SetWorkflowOptionsRequest {
+  string workflow = 1;
+  repeated string paused_stages = 2;
+  string next_workflow = 3;
+  repeated string labels = 4;
+}
+
+message DeleteWorkflowRequest {
+  string name = 1;
+}
+
+message DeleteWorkflowResponse {}
+
+message DuplicateWorkflowRequest {
+  string name = 1;
+  string new_name = 2;
+}
+
+message ListWorkflowsResponse {
+  repeated Workflow workflows = 1;
+}
+
+message CheckWorkflowRequest {
+  // The workflow to check; empty checks every package, and every folder
+  // that failed to load. Ignored when draft is set.
+  string name = 1;
+  // Unsaved package contents to check in place of a loaded package. The
+  // response then holds one package. A bad file name or a draft name that
+  // differs from its kiln-package.yaml fails with InvalidArgument.
+  WorkflowDraft draft = 2;
+}
+
+// WorkflowDraft is a workflow package's contents as the app edits them.
+// kiln-package.yaml and workflow.yaml hold JSON text; every other file,
+// such as a prompt, holds its bytes as they are.
+message WorkflowDraft {
+  // The package name, the same as the name in kiln-package.yaml.
+  string name = 1;
+  // Every file in the package, by slash path inside it.
+  map<string, bytes> files = 2;
+}
+
+message ProposeWorkflowEditRequest {
+  // The draft as the builder holds it now.
+  WorkflowDraft draft = 1;
+  // The change, in the person's words.
+  string request = 2;
+}
+
+message ProposeWorkflowEditUpdate {
+  oneof update {
+    // One line of what the agent is doing, to show while it works.
+    string progress = 1;
+    // The proposed draft and its findings; always the last message.
+    Proposal proposal = 2;
+  }
+}
+
+// ListSkillsRequest names a draft stage and a repo.
+message ListSkillsRequest {
+  WorkflowDraft draft = 1;
+  string stage_id = 2;
+  // repo is host/owner/repo, or empty for no repo.
+  string repo = 3;
+}
+
+// ListSkillsResponse is the picker's list and the profile it is for.
+message ListSkillsResponse {
+  repeated Skill skills = 1;
+  string profile = 2;
+}
+
+// Skill is one row of the skill picker.
+message Skill {
+  // name is the call name, such as qrspi-mine:02-create-research.
+  string name = 1;
+  string description = 2;
+  // source is personal, repo, package, plugin or builtin.
+  string source = 3;
+  // path is the folder the skill loads from, empty for built-ins.
+  string path = 4;
+}
+
+// ListSkillReposRequest names the workflow being edited.
+message ListSkillReposRequest {
+  string workflow = 1;
+}
+
+// ListSkillReposResponse lists repos as host/owner/repo. start is empty
+// for no repo.
+message ListSkillReposResponse {
+  repeated string repos = 1;
+  string start = 2;
+}
+
+message PlanBundleRequest {
+  WorkflowDraft draft = 1;
+}
+
+message BundlePlan {
+  repeated BundleSkill skills = 1;
+}
+
+// BundleSkill is one personal skill a draft calls.
+message BundleSkill {
+  // name is the skill as called today, such as 02-create-research.
+  string name = 1;
+  // call is the name after Bundle, such as qrspi-mine:02-create-research.
+  // Empty when the skill cannot be bundled.
+  string call = 2;
+  repeated string stage_ids = 3;
+  // state is new, or differs when the package already has another copy.
+  // Empty when the skill cannot be bundled.
+  string state = 4;
+  repeated BundleFile files = 5;
+  repeated string notes = 6;
+}
+
+// BundleFile is one file Bundle copies or skips.
+message BundleFile {
+  // path is the package path, such as skills/x/SKILL.md.
+  string path = 1;
+  bool skipped = 2;
+  string reason = 3;
+}
+
+message BundleSkillsRequest {
+  WorkflowDraft draft = 1;
+  // skills are the names to bundle, as called today.
+  repeated string skills = 2;
+}
+
+message AdaptSkillsRequest {
+  WorkflowDraft draft = 1;
+  // skills are the bundled skill folder names to adapt, such as
+  // 02-create-research.
+  repeated string skills = 2;
+}
+
+// AdaptSkillsUpdate is one progress line, or the final proposal.
+message AdaptSkillsUpdate {
+  oneof update {
+    string progress = 1;
+    // The adapted draft and its findings; always the last message.
+    Proposal proposal = 2;
+  }
+}
+
+// Proposal is a draft an agent proposed, with the findings the workflow
+// checks give it. It is not saved.
+message Proposal {
+  WorkflowDraft draft = 1;
+  repeated Finding findings = 2;
+  // The agent's own short reply: why it made the change, or why it made
+  // none. Empty when the agent said nothing, and always empty for an
+  // AdaptSkills proposal.
+  string explanation = 3;
+}
+
+message GetWorkflowDraftRequest {
+  string name = 1;
+}
+
+message GetWorkflowDraftResponse {
+  WorkflowDraft draft = 1;
+  // The hash of the package as loaded, which a save names as its base.
+  string hash = 2;
+  // The parameters the package declares, in declaration order.
+  repeated PackageParameter parameters = 3;
+  // What the package's files carry, grouped for the builder's Package
+  // contents list.
+  PackageContents contents = 4;
+}
+
+// PackageContents is what a package's files carry. Each list is in file
+// name order. A file the engine could not read is under other, with a note.
+message PackageContents {
+  // Every slash command: each commands/*.md and each callable skill.
+  repeated PackageItem commands = 1;
+  repeated PackageSkill skills = 2;
+  repeated PackageItem subagents = 3;
+  repeated PackageHook hooks = 4;
+  repeated PackageProgram programs = 5;
+  repeated PackageServer servers = 6;
+  // Files none of the groups claims.
+  repeated string other = 7;
+  repeated string notes = 8;
+}
+
+// PackageItem is one named package file.
+message PackageItem {
+  string name = 1;
+  string file = 2;
+}
+
+// PackageSkill is one skill folder and its files, SKILL.md first.
+message PackageSkill {
+  string name = 1;
+  repeated string files = 2;
+}
+
+// PackageHook is one hook entry and the file that declares it.
+message PackageHook {
+  string event = 1;
+  string matcher = 2;
+  string command = 3;
+  string file = 4;
+}
+
+// PackageProgram is one file under bin/. The kind is "script" or "binary".
+message PackageProgram {
+  string name = 1;
+  string file = 2;
+  string kind = 3;
+}
+
+// PackageServer is one tool server and the command that starts it.
+message PackageServer {
+  string name = 1;
+  string starts = 2;
+  string file = 3;
+}
+
+// PackageParameter is one typed parameter a package declares in
+// kiln-package.yaml. Its value is the setting params.<name>.
+message PackageParameter {
+  string name = 1;
+  // One of text, number, bool, choice, branch.
+  string type = 2;
+  // Always text, even for a number. Named default_value because default is
+  // reserved in JavaScript.
+  string default_value = 3;
+  string description = 4;
+  // The values a choice parameter accepts.
+  repeated string choices = 5;
+}
+
+message SaveWorkflowRequest {
+  WorkflowDraft draft = 1;
+  // The hash the draft was opened with; empty for a new package.
+  string base_hash = 2;
+  // The package the draft was copied from. When set and different from the
+  // draft's name, calls to the package's own skills are rewritten to the
+  // new name.
+  string copied_from = 3;
+}
+
+message StartTestRunRequest {
+  WorkflowDraft draft = 1;
+  // The issue to run on, which the run reads and never writes.
+  IssueRef issue = 2;
+  string stage_id = 3;
+  // Parameter values by the name the draft's package declares. They are the
+  // test run's own settings (params.<name>). An undeclared name or a value
+  // its type refuses is INVALID_ARGUMENT.
+  map<string, string> parameters = 4;
+}
+
+message SaveWorkflowResponse {
+  // The saved workflow, as ListWorkflows reports it.
+  Workflow workflow = 1;
+  // The hash of the files written, which the next save names as its base.
+  string hash = 2;
+}
+
+// Finding is one problem the workflow checks found.
+message Finding {
+  // Where the problem is inside the package, such as
+  // "workflow.yaml:stages[1].on.passed".
+  string path = 1;
+  // A stable code, such as "route_target_unknown".
+  string code = 2;
+  // error, warning or note. An error keeps the workflow from starting. A
+  // note is worth knowing and is not a problem.
+  string severity = 3;
+  string message = 4;
+}
+
+// PackageCheck is the findings for one package folder.
+message PackageCheck {
+  // The package name; empty for a folder that failed to load.
+  string name = 1;
+  // The package folder.
+  string path = 2;
+  repeated Finding findings = 3;
+}
+
+message CheckWorkflowResponse {
+  repeated PackageCheck packages = 1;
+  // False when any finding is an error.
+  bool ok = 2;
+  // The skill calls of each prompt stage. Set only for a draft check.
+  repeated StageSkillCalls stage_calls = 3;
+  // What the draft's files carry. Set only for a draft check, so the builder's list
+  // follows each edit.
+  PackageContents contents = 4;
+}
+
+// ViewContext is what the person sees when they send a message: the route,
+// the drawer chip's label and a few short lines of on-screen text.
+message ViewContext {
+  string route = 1;
+  string label = 2;
+  repeated string facts = 3;
+  // What is selected on screen. Unset for screens with nothing selected.
+  oneof screen {
+    CardView card = 4;
+    NeedsYouView needs_you = 5;
+    BuilderView builder = 6;
+  }
+}
+
+// BuilderView is the workflow open in the builder, as on screen.
+message BuilderView {
+  string workflow = 1;
+  // The draft with unsaved edits. It counts toward the 16 MiB request cap.
+  WorkflowDraft draft = 2;
+  repeated Finding findings = 3;
+}
+
+// CardView is a card on screen.
+message CardView {
+  int64 card_id = 1;
+  int64 run_id = 2;
+  // steps, live, issue, activity, cost, artifacts, repos or details.
+  string tab = 3;
+  string state = 4;
+  string stage_id = 5;
+}
+
+// NeedsYouView is the Needs you list on screen.
+message NeedsYouView {
+  repeated int64 item_ids = 1;
+}
+
+enum ChatIntent {
+  CHAT_INTENT_UNSPECIFIED = 0;
+  // Free chat. Unspecified means this too.
+  CHAT_INTENT_CHAT = 1;
+  // Debug this: explain run_id's failure. The turn must end with a checked diagnosis.
+  CHAT_INTENT_DEBUG_RUN = 2;
+  // Explore an idea: talk an idea through and draft a ticket for a workflow, or for Backlog.
+  CHAT_INTENT_EXPLORE = 3;
+}
+
+// Attachment is one file sent with a message.
+message Attachment {
+  // The file's base name, such as "skills.zip".
+  string name = 1;
+  bytes data = 2;
+}
+
+message ChatRequest {
+  // 0 starts a new conversation.
+  int64 conversation_id = 1;
+  string text = 2;
+  ViewContext context = 3;
+  ChatIntent intent = 4;
+  // The run to debug; required when intent is CHAT_INTENT_DEBUG_RUN. The
+  // engine finds the run's conversation, or starts one, and ignores
+  // conversation_id.
+  int64 run_id = 5;
+  // At most 20 files and 10 MiB in total. A zip unpacks to at most 1000
+  // entries and 32 MiB.
+  repeated Attachment attachments = 6;
+  reserved 7;
+  reserved "view_id";
+  // The repos an Explore chat reads, as host/owner/name: at most 5, each
+  // linked to an intake rule or the default repo. Used when intent is
+  // CHAT_INTENT_EXPLORE.
+  repeated string repos = 8;
+  // The workflow an Explore chat files tickets to; empty is Backlog. Used
+  // when intent is CHAT_INTENT_EXPLORE.
+  string workflow = 9;
+}
+
+message ChatUpdate {
+  oneof update {
+    // A short line about what the assistant is doing, such as a tool title.
+    string progress = 1;
+    // The next piece of the reply, already redacted.
+    string text = 2;
+    ChatDone done = 3;
+    // The checked diagnosis of a Debug this turn.
+    Diagnosis diagnosis = 4;
+    // A next step the assistant offers. The person decides.
+    AssistantProposal proposal = 5;
+  }
+}
+
+// AssistantProposal is something the assistant offers and the person
+// confirms. Named so because Proposal is the plain-words edit's message.
+message AssistantProposal {
+  int64 id = 1;
+  // open, accepted or discarded.
+  string state = 2;
+  oneof body {
+    RunActionProposal run_action = 3;
+    NavigationProposal navigation = 4;
+    WorkflowProposal workflow = 6;
+    TakeIssuesProposal take_issues = 7;
+    RemovalProposal removal = 8;
+    TicketProposal ticket = 9;
+  }
+  // The person's message whose turn made it.
+  int64 message_id = 5;
+}
+
+// TicketProposal is a ticket draft the person may edit and file.
+message TicketProposal {
+  string title = 1;
+  string body = 2;
+  // The main repo as host/owner/name, or empty for a Kiln task.
+  string repo = 3;
+  // More repos to attach, as host/owner/name.
+  repeated string other_repos = 4;
+  reserved 5;
+  reserved "view_id";
+  // The card Create made, or 0 before Create succeeds.
+  int64 card_id = 6;
+  // The workflow the ticket is filed to; empty is Backlog.
+  string workflow = 7;
+}
+
+// RemovalProposal is the assistant's offer to remove a card, or
+// delete a workflow, with the steps that clear what would refuse it.
+// Nothing runs until the person accepts, and the app runs the steps in
+// order through the same calls as its buttons.
+message RemovalProposal {
+  // card or workflow.
+  string target = 1;
+  int64 card_id = 2;
+  reserved 3;
+  reserved "view_id";
+  string workflow = 4;
+  // One line on why, for the person.
+  string reason = 5;
+  // In order. The last step removes the target.
+  repeated RemovalStep steps = 6;
+}
+
+// RemovalStep is one call of a removal proposal.
+message RemovalStep {
+  // stop_run, remove_card or delete_workflow.
+  string action = 1;
+  int64 run_id = 2;
+  int64 card_id = 3;
+  reserved 4;
+  reserved "view_id";
+  string workflow = 5;
+}
+
+// TakeIssuesProposal is a list of issues the person may add to the board. Each
+// has its own Take button, which calls CreateCard.
+message TakeIssuesProposal {
+  repeated TakeIssue issues = 1;
+}
+
+message TakeIssue {
+  IssueRef ref = 1;
+  string title = 2;
+  reserved 3;
+  reserved "view_id";
+  // One line on why the issue fits.
+  string reason = 4;
+  // The workflow the issue would join; empty is Backlog.
+  string workflow = 5;
+}
+
+// WorkflowProposal is a checked draft. Nothing is saved: the builder opens
+// it and Save is the person's.
+message WorkflowProposal {
+  string name = 1;
+  WorkflowDraft draft = 2;
+  // Warnings and notes only: a draft with an error is never proposed.
+  repeated Finding findings = 3;
+  // For an edit, the draft the builder held when the person asked. Unset
+  // for a new workflow. A workflow proposal under the open draft's name is an
+  // edit, and its base is the draft the builder sent.
+  WorkflowDraft base = 4;
+  // What the draft's files carry, as the builder's Package contents list
+  // shows it. The card warns when it holds hooks, programs or tool servers.
+  // The engine fills it from the files each time it maps the proposal.
+  PackageContents contents = 5;
+}
+
+enum RunAction {
+  RUN_ACTION_UNSPECIFIED = 0;
+  RUN_ACTION_STOP = 1;
+  RUN_ACTION_RETRY = 2;
+  RUN_ACTION_SEND_MESSAGE = 3;
+}
+
+message RunActionProposal {
+  RunAction action = 1;
+  int64 run_id = 2;
+  int64 card_id = 3;
+  // The message for RUN_ACTION_SEND_MESSAGE; the person may edit it.
+  string text = 4;
+  // One line on why, shown on the card.
+  string reason = 5;
+}
+
+message NavigationProposal {
+  // card, needs_you, workflows, builder or sources.
+  string target = 1;
+  int64 card_id = 2;
+  // A card tab: steps, live, issue, activity, cost, artifacts, repos or details.
+  string tab = 3;
+  // The workflow for target builder.
+  string workflow = 4;
+  // The button's words, such as "Open the Activity tab".
+  string label = 5;
+}
+
+message AcceptTicketProposalRequest {
+  int64 proposal_id = 1;
+  // The edited title and body. Empty keeps the draft's own.
+  string title = 2;
+  string body = 3;
+}
+
+message AcceptTicketProposalResponse {
+  Card card = 1;
+  AssistantProposal proposal = 2;
+}
+
+message ResolveProposalRequest {
+  int64 proposal_id = 1;
+  // accepted or discarded.
+  bool accepted = 2;
+}
+
+message ResolveProposalResponse {
+  AssistantProposal proposal = 1;
+}
+
+// Diagnosis is the first answer of a Debug this turn. Every quote was found
+// in a tool result the assistant read in that turn.
+message Diagnosis {
+  // One sentence naming the likely cause.
+  string cause = 1;
+  string stage_id = 2;
+  repeated Evidence evidence = 3;
+  // What the assistant could not see.
+  repeated string gaps = 4;
+}
+
+message Evidence {
+  // Where the quote came from, such as "run 41 log" or "event 8812".
+  string source = 1;
+  string quote = 2;
+}
+
+// ChatDone ends a turn. It names the conversation, which is new when the
+// request's conversation_id was 0, and the saved reply.
+message ChatDone {
+  int64 conversation_id = 1;
+  int64 message_id = 2;
+}
+
+message Conversation {
+  int64 id = 1;
+  string title = 2;
+  // Set for a conversation "Debug this" started on a run.
+  int64 run_id = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  reserved 6;
+  reserved "explore_view_id";
+  // The repos an Explore conversation reads, as host/owner/name.
+  repeated string explore_repos = 7;
+  // The workflow an Explore conversation files to; empty is Backlog.
+  string explore_workflow = 8;
+  // True for an Explore conversation, so an empty explore_workflow reads as
+  // Backlog and not as a plain chat.
+  bool explore = 9;
+}
+
+message ChatMessage {
+  int64 id = 1;
+  // person, assistant or diagnosis.
+  string role = 2;
+  string text = 3;
+  // Set on a person's message.
+  ViewContext context = 4;
+  google.protobuf.Timestamp at = 5;
+  // Set when role is diagnosis.
+  Diagnosis diagnosis = 6;
+  // The names of the files sent with a person's message.
+  repeated string attachments = 7;
+}
+
+message ListConversationsRequest {}
+
+message ListConversationsResponse {
+  repeated Conversation conversations = 1;
+  // False when no agent is chosen or the chosen one cannot start.
+  bool agent_ready = 2;
+  // Why agent_ready is false, in plain words. It does not point at a
+  // settings screen, since the app has none.
+  string agent_problem = 3;
+}
+
+message GetConversationRequest {
+  int64 id = 1;
+}
+
+message GetConversationResponse {
+  Conversation conversation = 1;
+  repeated ChatMessage messages = 2;
+  // Every proposal in the conversation, oldest first. Each names the
+  // message it follows.
+  repeated AssistantProposal proposals = 3;
+}
+
+message DeleteConversationRequest {
+  int64 id = 1;
+}
+
+message DeleteConversationResponse {}
+
+// StageSkillCalls is the skill calls one stage's prompt makes, such as
+// "02-create-research" for "/02-create-research".
+message StageSkillCalls {
+  string stage_id = 1;
+  repeated string calls = 2;
+}
+
+// NameTaken is the error detail on an AlreadyExists refusal of a new
+// workflow: the name a loaded workflow already has.
+message NameTaken { string name = 1; }
+
+// NameNeeded is the error detail on the InvalidArgument refusal of an
+// ImportPlugin or ImportSkill whose folder gives no name (no plugin
+// manifest name, or a SKILL.md with no name) when the request carried
+// none. A client asks the person for a name and sends the call again with
+// it. No other InvalidArgument refusal carries it.
+message NameNeeded {}
+
+// TemplateVariable is one variable a stage's text may use.
+message TemplateVariable {
+  // The name as written between the braces, such as issue.title or params.target.
+  string name = 1;
+  // What the variable renders as.
+  string description = 2;
+}
+message ListTemplateVariablesRequest { WorkflowDraft draft = 1; }
+message ListTemplateVariablesResponse { repeated TemplateVariable variables = 1; }
+
+// StageTemplate is one stage the builder can add.
+message StageTemplate {
+  // The template's id, its file name without .yaml.
+  string id = 1;
+  // The stage as JSON, in the form workflow.yaml's stages hold.
+  string stage_json = 2;
+}
+message ListStageTemplatesRequest {}
+message ListStageTemplatesResponse { repeated StageTemplate templates = 1; }
+
+message ExportWorkflowRequest { string name = 1; }
+message ExportWorkflowResponse { bytes zip = 1; }
+message ImportWorkflowRequest {
+  bytes zip = 1;
+  // Overrides the name in the zip's kiln-package.yaml when set.
+  string name = 2;
+}
+message ImportPluginRequest {
+  bytes zip = 1;
+  // The new package's name. Empty uses the plugin manifest's name.
+  string name = 2;
+  // The name of one of the person's own packages to update. Empty makes a
+  // new package.
+  string update_of = 3;
+  // With update_of: the hash the builder opened. Empty skips the check.
+  string base_hash = 4;
+}
+
+// ImportSkillRequest is a skill folder to add to a draft.
+message ImportSkillRequest {
+  // The picked folder, zipped. SKILL.md sits at its top.
+  bytes zip = 1;
+  // The draft's files as the builder holds them.
+  map<string, bytes> files = 2;
+  // The skill's folder name. Empty uses the name in SKILL.md's frontmatter.
+  string name = 3;
+  // Replace a skill of the same name instead of refusing it.
+  bool replace = 4;
+}
+
+// ImportSkillResponse is the draft's files with the skill added.
+message ImportSkillResponse {
+  map<string, bytes> files = 1;
+  // The folder name used, for the dialogs.
+  string name = 2;
+}
+
+// Source is the settings layer that set a value.
+message Source {
+  // defaults, user, package, workflow, card or run.
+  string layer = 1;
+  // Where in that layer, such as "workflow engineering".
+  string where = 2;
+}
+
+// Setting is one setting value with its source.
+message Setting {
+  string key = 1;
+  // The value as JSON; null when the setting is not set.
+  string value_json = 2;
+  Source source = 3;
+}
+
+message GetSettingsRequest {
+  // user, workflow, card or run.
+  string scope = 1;
+  // Beehive: the card's or run's UUID; empty for user and workflow.
+  string scope_id = 2;
+  // With a stage, stage settings include its workflow package values and
+  // its stage overrides. A card defaults to its current stage; a run always
+  // uses its own.
+  string stage_id = 3;
+  // The workflow name for scope "workflow".
+  string workflow = 4;
+}
+
+message GetSettingsResponse {
+  repeated Setting settings = 1;
+  // Stored values that are no longer valid for their key. Each is skipped,
+  // so the layer below it sets the value in settings, and listed here so
+  // the person can fix it.
+  repeated InvalidSetting invalid = 2;
+}
+
+// InvalidSetting is one stored setting value that is not valid for its key.
+message InvalidSetting {
+  string key = 1;
+  // The layer that holds the value.
+  Source source = 2;
+  // Why the value is not valid.
+  string message = 3;
+}
+
+message SetSettingRequest {
+  // user, workflow or card.
+  string scope = 1;
+  // Beehive: the card's UUID; empty for user and workflow.
+  string scope_id = 2;
+  // A setting key, such as "agent.model_tier". A workflow or card key may name
+  // one stage: "stage.<id>.<key>".
+  string key = 3;
+  // The value as JSON. Empty or null removes the setting.
+  string value_json = 4;
+  // The workflow name for scope "workflow".
+  string workflow = 5;
+}
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  // Sorted by name.
+  repeated AgentInfo agents = 1;
+}
+
+// AgentInfo is one Buzz agent as the relay lists it.
+message AgentInfo {
+  // The agent's display name, which a workflow stage names in agent.
+  string name = 1;
+  // 64 hex characters.
+  string pubkey = 2;
+  // The pubkey of the person who owns the agent, 64 hex characters.
+  string owner_pubkey = 3;
+}
+
+message ListAgentProfilesRequest {}
+
+message ListAgentProfilesResponse {
+  // Every installed profile, sorted by name.
+  repeated AgentProfileInfo profiles = 1;
+  // The agent.profile user setting. Empty when it is unset. It may name a
+  // profile that is not in profiles.
+  string chosen = 2;
+  // The profile the assistant uses while agent.profile is unset.
+  string default_profile = 3;
+}
+
+// AgentProfileInfo is one installed agent profile as the chooser shows it.
+message AgentProfileInfo {
+  string name = 1;
+  // One line about the agent. Empty when the profile has none.
+  string description = 2;
+  // True for a profile every build offers.
+  bool builtin = 3;
+  // True when the program that starts the agent, as launched now (the
+  // agents.<name>.command setting included), is found on this machine.
+  bool found = 4;
+}
+
+message GetCostReportRequest {
+  // RFC 3339 times. From is inclusive and to is exclusive. An empty value
+  // leaves that side of the period open.
+  string from = 1;
+  string to = 2;
+  // IANA zone name that cuts the day and month groups, for example
+  // "Europe/Paris". Empty means the engine's local zone.
+  string tz = 3;
+  // What the rows are grouped by: one of workflow, stage, ticket, card,
+  // model, models, repo, day, month or run. A run row is one run, or one
+  // chat session, so the rows of a run grouping add up to the same totals as
+  // any other grouping. model groups a run under its main model, the real
+  // model that used the most tokens. models splits each run across every
+  // model it used: the tokens by each model's own counts, and the dollars in
+  // proportion to what each model's tokens cost at the list price, since the
+  // agent reports a session's dollars as one total. A run counts once, under
+  // its main model, and the parts add up to the totals. The split of dollars
+  // is an approximation, and falls back to the main model alone when a model
+  // has no list price.
+  string group_by = 4;
+  // The filters below are all optional and combine, so a report can be cut to
+  // one workflow's stage, or one model's runs on one ticket. A workflow is the
+  // one each run recorded, so a ticket that moved workflows still adds up.
+  // A workflow or stage filter drops the chats, which have neither.
+  string workflow = 5;
+  // Keep only the runs of this stage. Name the workflow too, since two
+  // workflows can share a stage id.
+  string stage = 6;
+  // Keep only this card's runs and chats. 0 keeps every card.
+  int64 card_id = 7;
+  // A second grouping inside each row of group_by: stage within ticket,
+  // model within stage, day within workflow. Empty for none. Same values as
+  // group_by, and not the same as it. The rows of the second level are in
+  // each row's children and add up to their parent.
+  string then_by = 8;
+  // Keep only this ticket, named as in a ticket row's key:
+  // host/owner/repo#number. A ticket is the issue behind a card.
+  string ticket = 9;
+  // Keep only the tickets of this repo, named as in a repo row's key:
+  // host/owner/repo.
+  string repo = 10;
+  // Keep only the runs and chats on this model, as a model row's key names it.
+  string model = 11;
+  reserved 12;
+  reserved "view_id";
+}
+
+message GetCostReportResponse {
+  repeated CostReportRow rows = 1;
+  // Every row of the period added up. Its key and workflow are empty, and its
+  // share is 1 when the period has any cost.
+  CostReportRow totals = 2;
+  // The newest event seq, read with the rows.
+  int64 seq = 3;
+  // The period's pull requests. Unset when the request carries any filter,
+  // since a pull request belongs to no workflow, stage, card or model.
+  PullRequestTotals pull_requests = 4;
+  // The period's finished cards and waits. Unset when the request carries any
+  // filter, for the same reason.
+  FlowTotals flow = 5;
+}
+
+// FlowTotals is what the Flow section of the Costs screen shows for a period.
+message FlowTotals {
+  // Cards that became done in the period and have not been reset since.
+  int32 cards_finished = 1;
+  // Medians. Zero when the period has no sample, which the screen reads as
+  // "None yet" and never as an instant.
+  // Card creation to the last merge, over the cards that merged in the period.
+  int64 time_to_merged_ms = 2;
+  // A Needs you item opening to its being resolved, over the items resolved
+  // in the period.
+  int64 needs_you_wait_ms = 3;
+}
+
+// PullRequestTotals is what the Pull requests section of the Costs screen
+// shows for a period. A pull request counts as opened on GitHub's opened time
+// and merged on GitHub's merged time, so a merge made on GitHub counts on the
+// day it happened.
+message PullRequestTotals {
+  int32 opened = 1;
+  int32 merged = 2;
+  // Cards whose pull requests are all merged, each dated by its last merge.
+  int32 merged_cards = 3;
+  // What those cards cost in all, over merged_cards. Wasted spend and spend
+  // outside the period count. Unset when no card merged or none has a cost.
+  optional double cost_per_merged_card = 4;
+  // Opened and merged per day or month, oldest first. Empty unless the
+  // report is grouped by day or month.
+  repeated PullRequestBucket by_bucket = 5;
+}
+
+// PullRequestBucket is the pull requests opened and merged on one day
+// (2026-10-06) or in one month (2026-10) of the person's time zone.
+message PullRequestBucket {
+  string key = 1;
+  int32 opened = 2;
+  int32 merged = 3;
+}
+
+// CostReportRow is the cost of the runs in one group.
+message CostReportRow {
+  // What the row is, by the grouping it came from: the workflow name, the
+  // stage id, the ticket (host/owner/repo#number), the card id, the model, the
+  // repo (host/owner/repo), the day (2026-10-06), the month
+  // (2026-10), or the run id (session-<id> for a chat session). Empty for what
+  // has none: a chat with no stage, workflow or card, a run with no
+  // model.
+  string key = 1;
+  // The workflow a workflow, stage or run row belongs to, as each run
+  // recorded it. A stage is grouped within its workflow. Empty for any other
+  // row, which can span workflows.
+  string workflow = 2;
+  // The sum over the runs that carry a cost, reported or estimated, in USD.
+  double cost_usd = 3;
+  // This row's cost over the report's total cost. 0 when that is 0.
+  double share = 4;
+  // The part of cost_usd that is not useful: a failed run, an earlier pass
+  // the stage did again, a run still going, and every run of a reset card.
+  double wasted_usd = 5;
+  // Runs, plus chat sessions.
+  int32 runs = 6;
+  // Of those, the ones whose cost is an estimate made from tokens.
+  int32 estimated_runs = 7;
+  // Of those, the ones with no cost of either kind: none reported, no
+  // estimate, or a cost in another currency.
+  int32 unpriced_runs = 8;
+  // What the row is, when it is a run row. Unset on any other row. Such a row
+  // counts one run, so unpriced_runs is 1 for a run with no price, and its
+  // cost_usd then means nothing.
+  CostRunDetail run = 9;
+  // The tokens of the row's runs and chat sessions. Input leaves out the
+  // tokens read from the prompt cache, as the agent reports them.
+  int64 input_tokens = 10;
+  int64 output_tokens = 11;
+  // Tokens read from the prompt cache (cache read).
+  int64 cached_tokens = 12;
+  // Tokens written to the prompt cache (cache write). Runs from before
+  // cache writes were stored show what their stored turn events held, or 0.
+  int64 cache_write_tokens = 13;
+  // The issue behind a ticket, card or run row, and the card to open for it.
+  // Unset for a row with no card.
+  CostTicketRef ticket = 14;
+  // The rows of the then_by grouping. They add up to this row.
+  repeated CostReportRow children = 15;
+  reserved 16;
+  reserved "view_name";
+}
+
+// CostTicketRef names the ticket (the issue behind a card) of a row.
+message CostTicketRef {
+  // host/owner/repo#number, which the ticket filter takes.
+  string key = 1;
+  // repo#number, for showing.
+  string ref = 2;
+  string title = 3;
+  // The card a click opens: the row's own card, or for a ticket row its
+  // newest card.
+  int64 card_id = 4;
+  // True when the card was removed. Its runs and costs still count, and
+  // the app does not link to it.
+  bool removed = 5;
+}
+
+// CostRunDetail says which run, or which chat session, a run row is.
+message CostRunDetail {
+  // stage for a run, debug or assistant for a chat session.
+  string kind = 1;
+  // 0 for a chat session.
+  int64 run_id = 2;
+  // Empty for a chat session.
+  string stage_id = 4;
+  // The stage's attempt number. 0 for a chat session.
+  int32 attempt = 5;
+  // running, waiting, paused or ended. Empty for a chat session.
+  string state = 6;
+  // The last result the run reported, empty when none.
+  string result = 7;
+  google.protobuf.Timestamp started_at = 8;
+  // False when the row's cost is wasted (see CostReportRow.wasted_usd). A run
+  // with no price can still be wasted.
+  bool useful = 9;
+  // The models the run or chat session used, as ids, the one with the most
+  // tokens first. Empty when the agent reported none per model, which is every
+  // session stored before per-model counts.
+  repeated string models = 10;
+}
+
+message GetCardCostRequest {
+  int64 card_id = 1;
+}
+
+message GetCardCostResponse {
+  repeated CostRow rows = 1;
+  // The sum of the rows that carry a cost, in USD.
+  double total_usd = 2;
+  // The newest event seq, read with the rows.
+  int64 seq = 3;
+  // The cost of the sessions that count toward the card's result: a chat, and
+  // the newest passed run of each stage that no reset cleared.
+  double useful_usd = 4;
+  // The cost of every other session: a failed run, an earlier pass the stage
+  // did again after a send-back, a run still going, and every run of a card
+  // that was reset. Useful plus wasted is the sum of the rows with a cost.
+  double wasted_usd = 5;
+  // What the card is expected to cost: the median of the person's last
+  // finished cards on its workflow. Present only for a card with no runs and no
+  // chats, when the workflow has at least 3 finished cards with a cost.
+  optional double forecast_usd = 6;
+  // True when the card has no runs and the workflow has fewer than 3 finished
+  // cards with a cost, so there is nothing to forecast from.
+  bool forecast_needs_history = 7;
+}
+
+// CostRow is what one stage of a card cost.
+message CostRow {
+  string stage_id = 1;
+  // stage, debug or assistant.
+  string kind = 2;
+  // Unset when no session of the row reported a cost.
+  optional double cost_usd = 3;
+  bool estimated = 4;
+  int32 runs = 5;
+  int32 retries = 6;
+  int64 duration_ms = 7;
+  int64 input_tokens = 8;
+  int64 output_tokens = 9;
+  // Tokens read from the prompt cache (cache read).
+  int64 cached_tokens = 10;
+  int32 turns = 11;
+  string model = 12;
+  // The part of cost_usd that is wasted, 0 when the row has no cost.
+  double wasted_usd = 13;
+  // One row per run of a stage row, oldest first, and every run adds up to
+  // the stage row. Empty for a chat row, which is one row for all the
+  // sessions of its kind.
+  repeated CostRunRow run_rows = 14;
+  // Tokens written to the prompt cache (cache write). 0 for a session from
+  // before they were stored, unless its stored turn events held them.
+  int64 cache_write_tokens = 15;
+  // The models the row's sessions used, ids, the one with the most tokens
+  // first. Empty when the agent reported none per model.
+  repeated string models = 16;
+}
+
+// CostRunRow is what one run, or attempt, of a stage cost: the sessions the
+// run opened added up.
+message CostRunRow {
+  int64 run_id = 1;
+  int32 attempt = 2;
+  // running, waiting, paused or ended.
+  string state = 3;
+  // The last result the run reported, empty when none.
+  string result = 4;
+  google.protobuf.Timestamp started_at = 5;
+  // The time of the run's closed sessions added up.
+  int64 duration_ms = 6;
+  // Unset when no session of the run reported or was priced.
+  optional double cost_usd = 7;
+  bool estimated = 8;
+  int64 input_tokens = 9;
+  int64 output_tokens = 10;
+  // Tokens read from the prompt cache (cache read).
+  int64 cached_tokens = 11;
+  int32 turns = 12;
+  string model = 13;
+  // True when the run's cost is wasted: a failed run, an earlier pass the
+  // stage did again, a run still going, or a run of a card that was reset.
+  // A run with no cost can still be wasted.
+  bool wasted = 14;
+  // Tokens written to the prompt cache (cache write).
+  int64 cache_write_tokens = 15;
+  // The models the run used, ids, the one with the most tokens first. Empty
+  // when the agent reported none per model.
+  repeated string models = 16;
+}
+
+// HostAccount is one code host a person signed in to. It never carries a
+// token.
+message HostAccount {
+  // The host name, lowercased, such as "github.com".
+  string host = 1;
+  // The person's login on the host.
+  string login = 2;
+  // signed_in or signed_out.
+  string state = 3;
+  // Unset while signed out.
+  google.protobuf.Timestamp signed_in_at = 4;
+  // The adapter that serves the host: "github".
+  string kind = 5;
+}
+
+// DeviceCode is a started browser sign-in.
+message DeviceCode {
+  string host = 1;
+  // The code the person enters at verification_uri.
+  string user_code = 2;
+  string verification_uri = 3;
+  // The opaque handle FinishSignIn takes. It is not a token.
+  string device_code = 4;
+  // How often the host may be polled, in seconds.
+  int32 interval_s = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+message ListHostsRequest {}
+
+message ListHostsResponse {
+  repeated HostAccount hosts = 1;
+  // The hosts, sorted, where StartSignIn can start a browser sign-in: those
+  // with a client ID for Kiln's OAuth App. Any other host signs in with
+  // ImportCLIToken or SetHostToken.
+  repeated string code_sign_in_hosts = 2;
+}
+
+message StartSignInRequest {
+  string host = 1;
+}
+
+message FinishSignInRequest {
+  string host = 1;
+  string device_code = 2;
+}
+
+message ImportCLITokenRequest {
+  string host = 1;
+}
+
+message SetHostTokenRequest {
+  string host = 1;
+  string token = 2;
+}
+
+message SignOutRequest {
+  string host = 1;
+}
+
+message SignOutResponse {}
+
+// Intake is the search an intake rule runs.
+message Intake {
+  // The one host the search runs against, such as "github.com".
+  string host = 1;
+  // A search in the host's own syntax, such as
+  // "repo:acme/api is:open label:kiln".
+  string query = 2;
+  // How often the search runs, in seconds; 0 is five minutes, and the
+  // least is 60.
+  int32 interval_s = 3;
+  // unassigned_or_me (the default) takes issues no one, or the person, is
+  // assigned; anyone takes them all.
+  string assignees = 4;
+  // When set, only issues these logins opened.
+  repeated string authors = 5;
+  // A structured rule: open issues in these repos ("owner/name") that have
+  // the label, are assigned to the person, or both. It replaces query, and
+  // ignores assignees and authors.
+  repeated string repos = 6;
+  // The label a structured rule takes issues by.
+  string label = 7;
+  // Takes issues assigned to the signed-in person. With a label, an issue
+  // needs one or the other.
+  bool assigned_to_me = 8;
+}
+
+// IntakeRule is a search that brings issues onto the board.
+message IntakeRule {
+  int64 id = 1;
+  // Shown on the Sources screen; empty is the search.
+  string name = 2;
+  Intake intake = 3;
+  reserved 4, 5;
+  reserved "target_lane_id", "target_view_id";
+  // Where the rule's issues go: empty fills Backlog, a name lands them on
+  // that workflow's first stage.
+  string workflow = 6;
+}
+
+message SaveIntakeRuleRequest {
+  IntakeRule rule = 1;
+}
+
+message DeleteIntakeRuleRequest {
+  int64 id = 1;
+}
+
+message DeleteIntakeRuleResponse {}
+
+message ListIntakeRulesRequest {}
+
+message ListIntakeRulesResponse {
+  repeated IntakeRule rules = 1;
+  // The head event seq when the rules were read.
+  int64 seq = 2;
+}
+
+message PreviewIntakeRequest {
+  reserved 1;
+  // The rule to try. It is not stored.
+  Intake rule = 2;
+}
+
+message PreviewIntakeResponse {
+  // The issues on the first page of the search that the rule takes.
+  repeated PreviewIssue issues = 1;
+  // The search has more matches than the first page.
+  bool truncated = 2;
+}
+
+// PreviewIssue is one issue a preview found.
+message PreviewIssue {
+  IssueRef ref = 1;
+  string title = 2;
+  // The source's own name for the issue, such as "PROJ-123". Empty for
+  // GitHub issues, which the UI names owner/repo#number.
+  string key = 3;
+  // The issue's web page as its source reported it.
+  string url = 4;
+}
+
+message ListReposRequest {
+  string host = 1;
+  // An account whose repos to list: the signed-in person or one of their
+  // organizations. Empty lists every repo the token reaches.
+  string owner = 2;
+}
+
+message ListOwnersRequest {
+  string host = 1;
+}
+
+message ListOwnersResponse {
+  // The signed-in person's login, then each organization's.
+  repeated string owners = 1;
+}
+
+message ListReposResponse {
+  // The repos the token reaches, as "owner/name".
+  repeated string repos = 1;
+  // The host had more repos than the engine reads, so a repo missing from
+  // the list may still exist.
+  bool truncated = 2;
+}
+
+// IssueFilter is what the browse drawer searches for. Every field narrows
+// the result.
+message IssueFilter {
+  // One to five repos, as "owner/name".
+  repeated string repos = 1;
+  // Free text matched against the issue.
+  string text = 2;
+  string label = 3;
+  // "" for any, "none" for unassigned, "@me", or a login.
+  string assignee = 4;
+  // "open", "closed", or "" for both.
+  string state = 5;
+}
+
+message SearchIssuesRequest {
+  string host = 1;
+  IssueFilter filter = 2;
+  // The next_cursor of the page before; empty for the first page.
+  string cursor = 3;
+}
+
+// IssueHit is one issue a search found.
+message IssueHit {
+  IssueRef ref = 1;
+  string title = 2;
+  // open or closed.
+  string state = 3;
+  repeated string labels = 4;
+  repeated string assignees = 5;
+}
+
+message SearchIssuesResponse {
+  repeated IssueHit issues = 1;
+  // Empty on the last page. Send it back as cursor for the next.
+  string next_cursor = 2;
+  // The host has more matches than it returns, so a match may be missing.
+  bool truncated = 3;
+}
+
+message RefreshIntakeRequest {
+  reserved 1;
+  reserved "view_id";
+  // When set, only this rule is refreshed; 0 refreshes every rule.
+  int64 rule_id = 2;
+}
+
+message RefreshIntakeResponse {
+  // Open issues the search matched that the filters took.
+  int32 matched = 1;
+  // The cards this refresh added.
+  repeated int64 added_card_ids = 2;
+  // Cards that never ran, taken off the board because their issue left
+  // the search.
+  int32 removed = 3;
+  // Cards that ran, marked with why their issue left the search.
+  int32 marked = 4;
+  // The host returned only part of the matches, so nothing was removed
+  // or marked.
+  bool truncated = 5;
+}
+
+message ReportUsageRequest {
+  UsageFeature feature = 1;
+}
+
+message ReportUsageResponse {}
+
+// UsageFeature names one screen a person opens or one action a person takes.
+// It is the only thing the app can put in a usage report, so no free text
+// reaches the report.
+enum UsageFeature {
+  USAGE_FEATURE_UNSPECIFIED = 0;
+  USAGE_FEATURE_SCREEN_HOME = 1;
+  USAGE_FEATURE_SCREEN_BOARD = 2;
+  USAGE_FEATURE_SCREEN_CARD = 3;
+  USAGE_FEATURE_SCREEN_NEEDS_YOU = 4;
+  USAGE_FEATURE_ACTION_START_STAGE = 5;
+  USAGE_FEATURE_ACTION_STOP_RUN = 6;
+  USAGE_FEATURE_ACTION_RETRY_STAGE = 7;
+  USAGE_FEATURE_ACTION_SKIP_STAGE = 8;
+  USAGE_FEATURE_ACTION_PAUSE_CARD = 9;
+  USAGE_FEATURE_ACTION_RESUME_CARD = 10;
+  USAGE_FEATURE_ACTION_RESET_CARD = 11;
+  USAGE_FEATURE_ACTION_OPEN_ISSUE = 12;
+  USAGE_FEATURE_ACTION_OPEN_PULL_REQUEST = 13;
+  USAGE_FEATURE_ACTION_OPEN_WORKTREE = 14;
+  USAGE_FEATURE_ACTION_SEND_MESSAGE = 15;
+  USAGE_FEATURE_ACTION_SET_HANDOFF = 16;
+  USAGE_FEATURE_ACTION_APPROVE = 17;
+  USAGE_FEATURE_ACTION_SAVE_CARD_SETTINGS = 18;
+  USAGE_FEATURE_ACTION_TOGGLE_DONT_MERGE = 19;
+  USAGE_FEATURE_ACTION_MOVE_CARD = 20;
+  USAGE_FEATURE_ACTION_REFRESH_INTAKE = 21;
+  USAGE_FEATURE_ACTION_CREATE_TASK = 22;
+  USAGE_FEATURE_ACTION_CREATE_VIEW = 23;
+  USAGE_FEATURE_ACTION_SIGN_IN_GH_LOGIN = 24;
+  USAGE_FEATURE_ACTION_SIGN_IN_CODE = 25;
+  USAGE_FEATURE_ACTION_SIGN_IN_TOKEN = 26;
+  USAGE_FEATURE_ACTION_ANSWER_CHOICE = 27;
+  USAGE_FEATURE_ACTION_ANSWER_QUESTION = 28;
+  USAGE_FEATURE_ACTION_ANSWER_ASK = 29;
+  USAGE_FEATURE_ACTION_SEND_BACK = 30;
+  USAGE_FEATURE_ACTION_OPEN_KILN = 31;
+  USAGE_FEATURE_ACTION_PAUSE_ALL = 32;
+  USAGE_FEATURE_ACTION_ADD_REPO = 33;
+  USAGE_FEATURE_ACTION_REMOVE_REPO = 34;
+  USAGE_FEATURE_ACTION_SET_MERGE_ORDER = 35;
+  // The assistant drawer opened, from the sidebar or an entry point.
+  USAGE_FEATURE_ASSISTANT_OPENED = 36;
+  // Debug this pressed on a card or a Needs you item.
+  USAGE_FEATURE_ASSISTANT_DEBUG_THIS = 37;
+  // Open in builder clicked on a workflow proposal.
+  USAGE_FEATURE_ASSISTANT_OPEN_IN_BUILDER = 38;
+  // The first Save of a builder opened from a proposal.
+  USAGE_FEATURE_ASSISTANT_SAVED_PROPOSAL = 39;
+  // Stop, Retry, Send or Remove clicked on a proposal.
+  USAGE_FEATURE_ASSISTANT_RUN_ACTION = 40;
+  // A workflow proposal passed the check and streamed. Engine only.
+  USAGE_FEATURE_ASSISTANT_PROPOSAL_SHOWN = 41;
+  // A card reached done after a Debug this on one of its runs. Engine only.
+  USAGE_FEATURE_ASSISTANT_DEBUG_CARD_DONE = 42;
+  // The Costs screen opened.
+  USAGE_FEATURE_SCREEN_COSTS = 43;
+  // The Cost tab of a card opened. The name starts SCREEN_ because the
+  // usage_test naming rule allows only SCREEN_, ACTION_ and ASSISTANT_.
+  USAGE_FEATURE_SCREEN_CARD_COST_TAB = 44;
+  // A Debug this conversation started. Engine only.
+  USAGE_FEATURE_ASSISTANT_DEBUG_THIS_USE = 45;
+  // A chat that is not a Debug this started. Engine only.
+  USAGE_FEATURE_ASSISTANT_USE = 46;
+  // Remove card confirmed on a card.
+  USAGE_FEATURE_ACTION_REMOVE_CARD = 47;
+  // Remove view confirmed in view settings.
+  USAGE_FEATURE_ACTION_REMOVE_VIEW = 48;
+  // Delete confirmed on a workflow in the builder.
+  USAGE_FEATURE_ACTION_DELETE_WORKFLOW = 49;
+  // Merge pull request confirmed on a card or a drag to Done.
+  USAGE_FEATURE_ACTION_MERGE_CARD = 50;
+  // Auto mode switched on or off for a card.
+  USAGE_FEATURE_ACTION_TOGGLE_AUTO_MODE = 51;
+}
+
+message ListActivityRequest {
+  int64 card_id = 1;
+  optional string stage_id = 2;
+  optional int32 visit = 3;
+  // progress, decision, blocker, answer, note or event. Empty: every type.
+  repeated string types = 4;
+  // agent, person or kiln.
+  optional string author_kind = 5;
+  // Entries after this activity seq, for paging.
+  int64 after_seq = 6;
+  // 0 means 500. At most 1000.
+  int32 limit = 7;
+}
+
+message ListActivityResponse {
+  repeated ActivityEntry entries = 1;
+  // The newest run_events seq, to watch from.
+  int64 seq = 2;
+}
+
+message AddNoteRequest {
+  string card_id = 1;
+  string summary = 2;
+  string detail = 3;
+}
+
+message AddNoteResponse {
+  ActivityEntry entry = 1;
+}
+
+message GetBriefRequest {
+  string card_id = 1;
+  string stage_id = 2;
+}
+
+message GetBriefResponse {
+  string text = 1;
+}
+
+message SaveArtifactRequest {
+  string card_id = 1;
+  string name = 2;
+  // "text" (the default) or "file".
+  string kind = 3;
+  // The document's text, for kind "text".
+  string content = 4;
+  // For kind "file": what `buzz upload file` printed.
+  string sha256 = 5;
+  int64 size = 6;
+  string media_type = 7;
+  // The blob's URL, or its hash when the upload printed no URL.
+  string media_ref = 8;
+}
+
+message UpdatePlanRequest {
+  string card_id = 1;
+  // The item's text, as written after the checkbox.
+  string item = 2;
+  // true checks the item, false unchecks it.
+  bool done = 3;
+}
+
+message UpdatePlanResponse {
+  // The artifact that holds the plan.
+  string plan = 1;
+  int32 checked = 2;
+  int32 total = 3;
+}
+
+message LogWorkRequest {
+  string card_id = 1;
+  // One line, 1 to 120 characters.
+  string summary = 2;
+  // Up to 2000 characters.
+  string detail = 3;
+  // The plan item this work finished. Optional.
+  string plan_item = 4;
+}
+
+message LogWorkResponse {
+  ActivityEntry entry = 1;
+}
+
+message RejectedOption {
+  string option = 1;
+  string reason = 2;
+}
+
+message RecordDecisionRequest {
+  string card_id = 1;
+  // One line, 1 to 120 characters.
+  string summary = 2;
+  // Up to 300 characters. Required.
+  string why = 3;
+  // At most 10.
+  repeated RejectedOption rejected = 4;
+  string detail = 5;
+  // The seq of an earlier decision this one replaces. 0 for none.
+  int64 supersedes = 6;
+}
+
+message RecordDecisionResponse {
+  ActivityEntry entry = 1;
+}
+
+message ReadHistoryRequest {
+  string card_id = 1;
+  int64 after_seq = 2;
+  int32 limit = 3;
+}
+
+message ReadHistoryResponse {
+  repeated ActivityEntry entries = 1;
+}
+
+message GetFullPayloadRequest {
+  int64 run_id = 1;
+  string full_ref = 2;
+}
+
+message GetFullPayloadResponse {
+  // The event's payload as JSON, uncut.
+  string payload_json = 1;
+}
+
+// ActivityAuthor is who wrote an entry: kind is agent, person or kiln, and
+// id is a model ID, a person's user ID ("" before an owner is set on a
+// token-mode engine), or kiln.
+message ActivityAuthor {
+  string kind = 1;
+  string id = 2;
+}
+
+message ActivityRef {
+  string kind = 1;
+  string value = 2;
+}
+
+// ActivityEntry is one entry of a card's activity log.
+message ActivityEntry {
+  int64 seq = 1;
+  string key = 2;
+  string card_id = 3;
+  string stage_id = 4;
+  int32 visit = 5;
+  // Empty for a note between runs.
+  string run_id = 6;
+  // The run_events seq of the entry's activity.added event.
+  int64 event_seq = 7;
+  google.protobuf.Timestamp at = 8;
+  string type = 9;
+  ActivityAuthor author = 10;
+  string summary = 11;
+  string detail = 12;
+  repeated ActivityRef refs = 13;
+  // The type's own fields as JSON.
+  string fields_json = 14;
+  int32 v = 15;
+}

@@ -193,6 +193,18 @@ run_unit_tests() {
   run_test_step "buzz-push-gateway personal development tests" \
     cargo test -p buzz-push-gateway --features personal-dev-app-attest -- --nocapture
 
+  # Beehive workflow engine (infra-free). Mirrors `just test-unit`.
+  run_test_step "buzz-hive-core tests" \
+    cargo test -p buzz-hive-core -- --nocapture
+  run_test_step "buzz-hive-api tests" \
+    cargo test -p buzz-hive-api -- --nocapture
+  run_test_step "buzz-hive-store tests" \
+    cargo test -p buzz-hive-store -- --nocapture
+  run_test_step "buzz-hive tests" \
+    cargo test -p buzz-hive -- --nocapture
+  run_test_step "buzz-hive-mcp tests" \
+    cargo test -p buzz-hive-mcp -- --nocapture
+
   # Kubernetes backend provider: pure decision layers driven by a fake
   # substrate, no cluster. Mirrors the nextest path in `just test-unit` —
   # the two lists must stay in step or the fallback silently covers less.

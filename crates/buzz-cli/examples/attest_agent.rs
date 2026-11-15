@@ -13,7 +13,7 @@
 //! Stdout carries only the auth tag JSON.
 
 use buzz_sdk::nip_oa;
-use buzz_ws_client::publish_event;
+use buzz_ws_client::{publish_event, HeaderMap};
 use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag};
 
 const KIND_MANAGED_AGENT: u16 = 30177;
@@ -85,9 +85,16 @@ async fn run() -> Result<(), String> {
         .sign_with_keys(&owner)
         .map_err(|e| format!("signing failed: {e}"))?;
 
-    let ok = publish_event(&relay_url, event, &owner, None, PUBLISH_TIMEOUT_SECS)
-        .await
-        .map_err(|e| format!("publish failed: {e}"))?;
+    let ok = publish_event(
+        &relay_url,
+        event,
+        &owner,
+        None,
+        HeaderMap::new(),
+        PUBLISH_TIMEOUT_SECS,
+    )
+    .await
+    .map_err(|e| format!("publish failed: {e}"))?;
     if !ok.accepted {
         return Err(format!("relay rejected the agent record: {}", ok.message));
     }

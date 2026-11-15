@@ -1,0 +1,6 @@
+id: pull_request
+name: Pull request
+description: Opens a draft pull request for the issue's branch.
+kind: action
+action: open_pull_request
+with: { draft: "true" }

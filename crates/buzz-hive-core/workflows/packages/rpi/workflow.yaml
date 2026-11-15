@@ -1,0 +1,91 @@
+version: 2
+stages:
+  - id: research
+    pause: true
+    name: Research
+    kind: prompt
+    command: 02-create-research
+    args: "GH-{{issue.number}}: {{issue.title}}\n\n{{issue.body}}"
+    agent: builder
+    outputs:
+      - artifact: research
+        file: ".claude/tasks/GH-{{issue.number}}-*/GH-{{issue.number}}-02-research.md"
+    execution: { timeout: 45m }
+  - id: plan
+    name: Plan
+    kind: prompt
+    command: 05-create-plan
+    args: "{{artifacts.research.file}}"
+    agent: builder
+    outputs:
+      - artifact: plan
+        file: ".claude/tasks/GH-{{issue.number}}-*/GH-{{issue.number}}-05-plan.md"
+    execution: { timeout: 30m }
+  - id: plan_review
+    name: Plan review
+    kind: approval
+    approval: { artifacts: [plan] }
+    on: { needs_work: plan }
+    loop_limit: 5
+  - id: implement
+    name: Implement
+    kind: prompt
+    command: 06-implement-plan
+    args: "{{inputs.plan.file}}"
+    inputs:
+      - { name: plan, required: true }
+    agent: builder
+    execution: { timeout: 4h }
+  - id: code_review
+    name: Code review
+    kind: prompt
+    command: 07-code-review
+    args: ".claude/tasks/GH-{{issue.number}}-*"
+    agent: builder
+    outputs:
+      - artifact: review
+        file: ".claude/tasks/GH-{{issue.number}}-*/GH-{{issue.number}}-07-qa-plan.md"
+        optional: true # a clean review writes no fix plan
+    on:
+      passed: describe_pr
+      needs_work: { to: implement, give: { plan: review }, then: describe_pr }
+    loop_limit: 3
+    execution: { timeout: 30m }
+  - id: describe_pr
+    name: Describe pull request
+    kind: prompt
+    command: 06-describe-pr
+    args: ".claude/tasks/GH-{{issue.number}}-*"
+    agent: builder
+    outputs:
+      - artifact: pr_body
+        file: ".claude/tasks/GH-{{issue.number}}-*/GH-{{issue.number}}-08-pr-body.md"
+    execution: { timeout: 15m }
+  - id: pull_request
+    name: Pull request
+    kind: action
+    action: open_pull_request
+    with: { body_artifact: pr_body, draft: "true" }
+  - id: validate
+    name: Validate
+    kind: action
+    action: wait_for_ci
+    on: { passed: mark_ready, failed: fix_ci }
+  - id: fix_ci
+    name: Fix CI failures
+    kind: prompt
+    command: 06-fix-ci
+    args: "{{artifacts.ci-failure.path}}"
+    agent: builder
+    on: { passed: pull_request }
+    loop_limit: 3
+    execution: { timeout: 2h }
+  - id: mark_ready
+    name: Mark ready for review
+    kind: action
+    action: mark_ready
+  - id: cleanup
+    pause: true
+    name: Cleanup
+    kind: action
+    action: cleanup_worktree

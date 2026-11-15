@@ -1,0 +1,10 @@
+# Used instead of deploy/compose/Caddyfile when compose.hive.yml is added. Beehive
+# paths go to buzz-hive and everything else goes to the relay.
+{$BUZZ_DOMAIN} {
+	encode zstd gzip
+
+	@hive path /kiln.engine.v1.EngineService/* /auth/token /hive/* /.well-known/jwks.json
+	reverse_proxy @hive hive:3100
+
+	reverse_proxy relay:3000
+}

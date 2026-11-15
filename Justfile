@@ -481,6 +481,14 @@ test-unit:
         # contract/race tests run in the dedicated CI job below.
         cargo nextest run -p buzz-push-gateway
         cargo nextest run -p buzz-push-gateway --features personal-dev-app-attest
+        # Beehive workflow engine: pure core, routes and token auth, config parsing,
+        # and the store's infra-free checks. Its Postgres tests run in the
+        # PostgreSQL lane.
+        cargo nextest run -p buzz-hive-core
+        cargo nextest run -p buzz-hive-api
+        cargo nextest run -p buzz-hive-store
+        cargo nextest run -p buzz-hive
+        cargo nextest run -p buzz-hive-mcp
         # Kubernetes backend provider: the decision layers (state machine, GC
         # planner, env precedence, naming, wire) are pure functions with a fake
         # substrate, so they belong in the unit job. Enumerated explicitly

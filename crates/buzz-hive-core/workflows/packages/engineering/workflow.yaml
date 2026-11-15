@@ -1,0 +1,58 @@
+version: 2
+stages:
+  - id: research
+    pause: true
+    name: Research
+    kind: prompt
+    agent: builder
+    command: research
+    args: '''{{issue.title}}'' ''{{issue.body}}'' ''{{issue.url}}'' ''{{sendback.comments}}'''
+    outputs: [{artifact: research}]
+    execution: {timeout: 30m}
+  - id: plan
+    name: Plan
+    kind: prompt
+    agent: builder
+    command: plan
+    args: '''{{issue.title}}'' ''{{issue.body}}'' ''{{sendback.comments}}'''
+    outputs: [{artifact: plan}]
+    execution: {timeout: 30m}
+  - id: plan_review
+    name: Plan review
+    kind: approval
+    approval: {artifacts: [plan]}
+    on: {needs_work: plan}
+    loop_limit: 3
+  - id: implement
+    name: Implement
+    kind: prompt
+    agent: builder
+    command: implement
+    args: '''{{branch}}'' ''{{issue.title}}'' ''{{issue.body}}'' ''{{sendback.comments}}'''
+    execution: {timeout: 4h}
+  - id: code_review
+    name: Code review
+    kind: prompt
+    agent: builder
+    command: code_review
+    args: '''{{branch}}'' ''{{issue.title}}'' ''{{issue.body}}'''
+    outputs: [{artifact: review}]
+    on: {needs_work: implement}
+    loop_limit: 3
+    execution: {timeout: 30m}
+  - id: pull_request
+    name: Pull request
+    kind: action
+    action: open_pull_request
+    with: {draft: "true"}
+  - id: validate
+    name: Validate
+    kind: action
+    action: wait_for_ci
+    on: {failed: implement}
+    loop_limit: 3
+  - id: cleanup
+    pause: true
+    name: Cleanup
+    kind: action
+    action: cleanup_worktree

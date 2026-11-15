@@ -1,0 +1,126 @@
+//! Connection and migrator for the `hive` schema.
+
+use std::str::FromStr;
+use std::time::Duration;
+
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::PgPool;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+const SCHEMA_LOCK: i64 = 0x0062_6565_6869_7665; // "beehive"
+
+/// How a pool is sized and bounded.
+///
+/// The default matches a plain `connect`: ten connections, sqlx's 30 second acquire
+/// timeout and no server-side timeouts. The service sets all of them.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Most connections the pool opens.
+    pub max_connections: u32,
+    /// How long a caller waits for a free connection before the call fails.
+    pub acquire_timeout: Duration,
+    /// Server-side `statement_timeout` for every connection, when set.
+    pub statement_timeout: Option<Duration>,
+    /// Server-side `lock_timeout` for every connection, when set. A lock wait that long
+    /// fails the statement instead of queueing behind a stuck writer.
+    pub lock_timeout: Option<Duration>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            acquire_timeout: Duration::from_secs(30),
+            statement_timeout: None,
+            lock_timeout: None,
+        }
+    }
+}
+
+/// Connect with a search path of `hive`. That puts sqlx's default
+/// `_sqlx_migrations` table in `hive`, so no table-name override is needed and
+/// the relay's `public._sqlx_migrations` is untouched.
+pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
+    connect_with(url, &PoolConfig::default()).await
+}
+
+/// [`connect`] with an explicit size and timeouts.
+pub async fn connect_with(url: &str, config: &PoolConfig) -> Result<PgPool, sqlx::Error> {
+    let mut settings = vec![("search_path", "hive".to_owned())];
+    if let Some(timeout) = config.statement_timeout {
+        settings.push(("statement_timeout", timeout.as_millis().to_string()));
+    }
+    if let Some(timeout) = config.lock_timeout {
+        settings.push(("lock_timeout", timeout.as_millis().to_string()));
+    }
+    let options = PgConnectOptions::from_str(url)?.options(settings);
+    PgPoolOptions::new()
+        .max_connections(config.max_connections)
+        .acquire_timeout(config.acquire_timeout)
+        .connect_with(options)
+        .await
+}
+
+/// Create the schema only when it is missing, then apply pending migrations.
+///
+/// `CREATE SCHEMA IF NOT EXISTS` needs CREATE on the database even when the
+/// schema exists, and the `buzz_hive` role has no such grant.
+pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCHEMA_LOCK)
+        .execute(&mut *conn)
+        .await?;
+    let created = ensure_schema(&mut conn).await;
+    // Release on every path: a lock left on a pooled connection would outlive this call.
+    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SCHEMA_LOCK)
+        .execute(&mut *conn)
+        .await;
+    if created.is_err() || unlocked.is_err() {
+        // The session may still hold the lock, so close it rather than return it to the pool.
+        drop(conn.detach());
+    } else {
+        drop(conn);
+    }
+    created?;
+    unlocked?;
+    MIGRATOR.run(pool).await?;
+    Ok(())
+}
+
+async fn ensure_schema(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'hive')")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        sqlx::query("CREATE SCHEMA hive").execute(conn).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Migration numbers run 0001, 0002, ... with no duplicate and no gap.
+    #[test]
+    fn migration_numbers_are_dense() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+        let mut numbers: Vec<u32> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                assert!(name.ends_with(".sql"), "{name} is not a .sql file");
+                name[..4]
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{name} must start with a four digit number"))
+            })
+            .collect();
+        numbers.sort_unstable();
+        let want: Vec<u32> = (1..=numbers.len() as u32).collect();
+        assert_eq!(
+            numbers, want,
+            "migration numbers must be 0001.. with no gap or duplicate"
+        );
+    }
+}

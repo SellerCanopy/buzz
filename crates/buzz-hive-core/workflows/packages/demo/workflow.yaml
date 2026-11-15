@@ -1,0 +1,17 @@
+version: 2
+stages:
+  - id: notes
+    pause: true
+    name: Notes
+    kind: prompt
+    agent: builder
+    command: notes
+    args: '''{{issue.title}}'' ''{{issue.body}}'' ''{{artifacts.notes.path}}'' ''{{sendback.comments}}'''
+    outputs: [{artifact: notes}]
+    execution: {timeout: 20m}
+  - id: review
+    name: Review
+    kind: approval
+    approval: {artifacts: [notes]}
+    on: {needs_work: notes}
+    loop_limit: 3

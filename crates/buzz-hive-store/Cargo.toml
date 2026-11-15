@@ -1,0 +1,25 @@
+[package]
+name = "buzz-hive-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Postgres storage for the Beehive workflow engine"
+
+[dependencies]
+buzz-hive-core = { path = "../buzz-hive-core" }
+async-trait = "0.1"
+chrono = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `test_support` in buzz-db is crate-private, so tests/support/mod.rs carries
+# its own scratch-database helper and uses buzz-db only to build the relay schema.
+buzz-db = { workspace = true }
+buzz-hive-core = { path = "../buzz-hive-core", features = ["testing"] }

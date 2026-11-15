@@ -1,0 +1,37 @@
+[package]
+name = "buzz-hive-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stdio MCP server that gives a Buzz agent the Beehive tools"
+
+[lib]
+name = "buzz_hive_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-hive-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# The tool table is the one the routes read, so the two cannot disagree.
+buzz-hive-api = { path = "../buzz-hive-api" }
+base64 = { workspace = true }
+nostr = { workspace = true }
+# Same pin as buzz-dev-mcp. deny.toml bans rmcp below 3.9.0 and the lockfile holds 3.9.0.
+rmcp = { version = "3.4.1", features = ["server", "transport-io", "macros"] }
+reqwest = { workspace = true }
+# https calls need a rustls provider. The workspace pulls ring and aws-lc-rs both, so main
+# installs ring explicitly, as buzz-dev-mcp does.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
