@@ -28,6 +28,17 @@ impl Level {
         }
     }
 
+    /// The inverse of [`Level::as_str`]. `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "none" => Some(Self::None),
+            "read" => Some(Self::Read),
+            "run" => Some(Self::Run),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
     /// The inverse of [`Level::as_i16`]. `None` for a value outside 0 to 3.
     pub fn from_i16(value: i16) -> Option<Self> {
         match value {
@@ -132,6 +143,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_level_parses_from_the_name_it_shows() {
+        for level in ALL {
+            assert_eq!(Level::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(Level::parse("Admin"), None);
+        assert_eq!(Level::parse(""), None);
     }
 
     #[test]

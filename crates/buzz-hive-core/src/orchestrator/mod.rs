@@ -3,6 +3,7 @@
 //! Each operation returns the events it committed. The caller publishes them on the
 //! [`crate::bus::Bus`], so a rolled-back operation wakes nobody.
 
+pub mod access;
 pub mod activity;
 pub mod artifacts;
 pub mod auto;

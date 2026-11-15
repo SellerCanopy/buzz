@@ -5,10 +5,12 @@
 
 mod common;
 
-use buzz_hive_core::access::ActorKind;
+use buzz_hive_core::access::Level;
+use buzz_hive_core::access::{ActorKind, RelayRole};
 use buzz_hive_core::domain::artifact::ArtifactContent;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::EVENT_KINDS;
+use buzz_hive_core::orchestrator::access::set_level;
 use buzz_hive_core::orchestrator::activity::log_work;
 use buzz_hive_core::orchestrator::artifacts::{save_artifact, set_handoff};
 use buzz_hive_core::orchestrator::cards::{
@@ -19,12 +21,13 @@ use buzz_hive_core::orchestrator::inbox::{approve, send_back};
 use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::timers;
+use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::testing::ManualClock;
-use buzz_hive_core::testing::MemStore;
+use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 12;
+const CURRENT_PHASE: u8 = 14;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -239,6 +242,18 @@ async fn approval_scenarios(f: &Fixture) {
     }
 }
 
+/// Phase 14: an admin sets a level.
+async fn access_scenarios(f: &Fixture) {
+    let directory = FakeDirectory::new().with_role(BUILDER, RelayRole::Member);
+    let env = Env {
+        directory: &directory,
+        ..f.env()
+    };
+    set_level(&env, &person(), BUILDER, Level::Run)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let (f, clock) = Fixture::timed();
@@ -250,6 +265,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     artifact_scenarios(&f).await;
     retry_scenarios(&f, &clock).await;
     approval_scenarios(&f).await;
+    access_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

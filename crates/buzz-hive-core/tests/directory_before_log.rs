@@ -17,8 +17,8 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::store::{
     AccessRepo, AgentInfo, AgentLink, ArtifactsRepo, CardsRepo, CommunityId, Directory, EventsRepo,
-    InboxRepo, OutboxRepo, RunsRepo, SettingsRepo, Store, StoreError, TimersRepo, Tx, UsageRepo,
-    WorkflowsRepo,
+    InboxRepo, OutboxRepo, PersonInfo, RunsRepo, SettingsRepo, Store, StoreError, TimersRepo, Tx,
+    UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
@@ -177,6 +177,10 @@ impl Directory for SpyDirectory {
     async fn list_agents(&self, community: CommunityId) -> Result<Vec<AgentInfo>, StoreError> {
         self.spy.lookup("list_agents");
         self.inner.list_agents(community).await
+    }
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        self.spy.lookup("people");
+        self.inner.people(community).await
     }
     async fn channel_exists(
         &self,

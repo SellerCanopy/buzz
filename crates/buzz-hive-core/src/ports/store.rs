@@ -472,6 +472,8 @@ pub trait Directory: Send + Sync {
     ) -> Result<Vec<AgentInfo>, StoreError>;
     /// Every agent in the community, by name.
     async fn list_agents(&self, community: CommunityId) -> Result<Vec<AgentInfo>, StoreError>;
+    /// Every person the relay counts as a member, by name. Agents are not listed.
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError>;
     /// Whether the channel exists and is not deleted.
     async fn channel_exists(
         &self,
@@ -493,6 +495,15 @@ pub struct AgentLink {
     pub owner: Pubkey,
     /// The agent was switched off in Buzz. It keeps its owner but must not act.
     pub deactivated: bool,
+}
+
+/// A person the relay lists as a member of the community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonInfo {
+    pub pubkey: Pubkey,
+    /// The display name the person set, when they set one.
+    pub name: Option<String>,
+    pub role: RelayRole,
 }
 
 /// A Buzz agent as the relay lists it.

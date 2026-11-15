@@ -2,6 +2,7 @@
 
 mod support;
 
+use buzz_hive_core::access::RelayRole;
 use buzz_hive_core::ports::store::Directory;
 use buzz_hive_store::relay_read::RelayRead;
 use uuid::Uuid;
@@ -108,6 +109,53 @@ async fn agents_are_found_by_name_without_regard_to_case() {
     let all = directory.list_agents(community).await.unwrap();
     let names: Vec<_> = all.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, ["Builder", "Reviewer"]);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn people_are_the_relay_members_that_are_not_agents() {
+    let (pool, _guard) = support::scratch_relay_db("hive_dir_people").await;
+    let (community, _, _) = seed(&pool).await;
+    for (key, role) in [
+        (hex::encode(OWNER), "owner"),
+        (hex::encode(BUILDER), "member"),
+        (hex::encode([9u8; 32]), "admin"),
+    ] {
+        sqlx::query(
+            "INSERT INTO public.relay_members (community_id, pubkey, role) VALUES ($1, $2, $3)",
+        )
+        .bind(community)
+        .bind(key)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let directory = RelayRead::new(pool);
+
+    let people = directory.people(community).await.unwrap();
+    let found: Vec<_> = people
+        .iter()
+        .map(|p| (p.pubkey.clone(), p.name.clone(), p.role))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            // Named people come first, by name; a member with no profile row follows.
+            (
+                hex::encode(OWNER),
+                Some("Owner".to_owned()),
+                RelayRole::Owner
+            ),
+            (hex::encode([9u8; 32]), None, RelayRole::Admin),
+        ],
+        "an agent that is a relay member is not a person"
+    );
+    assert!(directory
+        .people(Uuid::from_u128(5))
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

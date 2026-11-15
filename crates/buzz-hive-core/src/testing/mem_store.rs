@@ -12,9 +12,9 @@ use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
-    Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
-    UsageRepo, WorkflowsRepo,
+    CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow,
+    PersonInfo, Posting, Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
+    StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -1174,6 +1174,7 @@ impl MemTx {
 #[derive(Default, Clone)]
 pub struct FakeDirectory {
     roles: HashMap<Pubkey, RelayRole>,
+    names: HashMap<Pubkey, String>,
     owners: HashMap<Pubkey, Pubkey>,
     deactivated: Vec<Pubkey>,
     agents: Vec<AgentInfo>,
@@ -1187,6 +1188,12 @@ impl FakeDirectory {
 
     pub fn with_role(mut self, pubkey: &str, role: RelayRole) -> Self {
         self.roles.insert(pubkey.to_owned(), role);
+        self
+    }
+
+    /// The display name a person set.
+    pub fn with_name(mut self, pubkey: &str, name: &str) -> Self {
+        self.names.insert(pubkey.to_owned(), name.to_owned());
         self
     }
 
@@ -1258,6 +1265,21 @@ impl Directory for FakeDirectory {
         let mut agents = self.agents.clone();
         agents.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.pubkey.cmp(&b.pubkey)));
         Ok(agents)
+    }
+
+    async fn people(&self, _community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        let mut people: Vec<PersonInfo> = self
+            .roles
+            .iter()
+            .filter(|(pubkey, _)| !self.owners.contains_key(*pubkey))
+            .map(|(pubkey, role)| PersonInfo {
+                pubkey: pubkey.clone(),
+                name: self.names.get(pubkey).cloned(),
+                role: *role,
+            })
+            .collect();
+        people.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+        Ok(people)
     }
 
     async fn channel_exists(

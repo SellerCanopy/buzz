@@ -303,6 +303,13 @@ service EngineService {
   // Beehive addition, in place of ListAgentProfiles: the Buzz agents a stage
   // can name, by display name, with the pubkey of each and of its owner.
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  // Beehive addition: every person and agent in the community with the level
+  // each acts at (none, read, run or admin). Needs Read.
+  rpc ListAccess(ListAccessRequest) returns (ListAccessResponse);
+  // Beehive addition: sets the level of one person or agent and returns its
+  // entry. Needs Admin. An agent may not be set above its owner, and a person
+  // may not lower their own level. Appends an access.changed event.
+  rpc SetAccessLevel(SetAccessLevelRequest) returns (AccessEntry);
   // ListHosts returns every host signed in now or before, with the person's login and whether it has a
   // usable token, and the hosts where StartSignIn can start a browser sign-in.
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
@@ -556,6 +563,8 @@ message Person {
   string user_id = 1;
   string name = 2;
   string email = 3;
+  // Beehive: the level the person acts at, as ListPeople reports it. Empty elsewhere.
+  string level = 4;
 }
 
 message ListPeopleRequest {}
@@ -2152,6 +2161,33 @@ message ListAgentsRequest {}
 message ListAgentsResponse {
   // Sorted by name.
   repeated AgentInfo agents = 1;
+}
+
+message ListAccessRequest {}
+
+message ListAccessResponse {
+  // People first, then agents, each by name.
+  repeated AccessEntry entries = 1;
+}
+
+message SetAccessLevelRequest {
+  // The person's or agent's pubkey, 64 hex characters.
+  string pubkey = 1;
+  // none, read, run or admin.
+  string level = 2;
+}
+
+// AccessEntry is a person or an agent and the level it acts at.
+message AccessEntry {
+  string pubkey = 1;
+  // The display name, empty when the relay holds none.
+  string name = 2;
+  // person or agent.
+  string kind = 3;
+  // The owner's pubkey for an agent, else empty.
+  string owner_pubkey = 4;
+  // none, read, run or admin, after the owner's cap.
+  string level = 5;
 }
 
 // AgentInfo is one Buzz agent as the relay lists it.

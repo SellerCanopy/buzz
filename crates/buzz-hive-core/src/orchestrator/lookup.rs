@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::access::RelayRole;
-use crate::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, StoreError};
+use crate::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, StoreError};
 
 /// A [`Directory`] that keeps the answers to the lookups a step repeats.
 pub(super) struct Memo<'a> {
@@ -65,6 +65,10 @@ impl Directory for Memo<'_> {
 
     async fn list_agents(&self, community: CommunityId) -> Result<Vec<AgentInfo>, StoreError> {
         self.inner.list_agents(community).await
+    }
+
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        self.inner.people(community).await
     }
 
     async fn channel_exists(

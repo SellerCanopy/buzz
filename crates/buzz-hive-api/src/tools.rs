@@ -168,6 +168,13 @@ pub const TOOLS: &[Tool] = &[
         schema: set_auto_mode,
     },
     Tool {
+        name: "set_access_level",
+        route: "SetAccessLevel",
+        needs: Level::Admin,
+        description: "Set the level of a person or an agent in Beehive: none, read, run or admin. An agent can never hold a level above its owner's, and you cannot lower your own. You may call it only for a person at Admin; with none named the call is refused.",
+        schema: set_access_level,
+    },
+    Tool {
         name: SAVE_ARTIFACT,
         route: "SaveArtifact",
         needs: Level::Run,
@@ -338,6 +345,14 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "GetUsage",
         "the Usage page's counts; an agent has no use for them",
+    ),
+    (
+        "ListAccess",
+        "the access page lists everyone with their level; an agent reads list_agents for the agents it may name",
+    ),
+    (
+        "ListPeople",
+        "the access page lists the community's members with their levels; an agent has no use for them",
     ),
     (
         "SetHandoff",
@@ -772,6 +787,26 @@ fn get_settings() -> Value {
             ),
         ],
         &["scope"],
+    )
+}
+
+fn set_access_level() -> Value {
+    object(
+        vec![
+            (
+                "pubkey",
+                string("The person's or agent's pubkey, 64 hex characters."),
+            ),
+            (
+                "level",
+                json!({
+                    "type": "string",
+                    "enum": ["none", "read", "run", "admin"],
+                    "description": "The level to give.",
+                }),
+            ),
+        ],
+        &["pubkey", "level"],
     )
 }
 

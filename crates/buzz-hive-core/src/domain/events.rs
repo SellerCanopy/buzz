@@ -101,6 +101,9 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     ("approval.recorded", 12),
     // A person sent an approval stage back. The payload has the stage and the comments.
     ("card.sent_back", 12),
+    // An admin set a person's or an agent's access level. The payload has the pubkey, its
+    // kind, the level it had and the level it has now.
+    ("access.changed", 14),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

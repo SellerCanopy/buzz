@@ -4,7 +4,9 @@
 //! `bytea` in `users`, so this module converts both ways.
 
 use buzz_hive_core::access::RelayRole;
-use buzz_hive_core::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, StoreError};
+use buzz_hive_core::ports::store::{
+    AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, StoreError,
+};
 
 use crate::db_error::store_error;
 
@@ -103,6 +105,37 @@ impl Directory for RelayRead {
         .await
         .map_err(store_error)?;
         Ok(rows.into_iter().map(agent).collect())
+    }
+
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        // An agent is a relay member too, and is listed by `list_agents`, not here.
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT m.pubkey, u.display_name, m.role FROM public.relay_members m \
+             LEFT JOIN public.users u \
+               ON u.community_id = m.community_id AND encode(u.pubkey, 'hex') = m.pubkey \
+             WHERE m.community_id = $1 AND u.agent_owner_pubkey IS NULL \
+             ORDER BY lower(u.display_name), m.pubkey",
+        )
+        .bind(community)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(pubkey, name, role)| {
+                let role = match role.as_str() {
+                    "owner" => RelayRole::Owner,
+                    "admin" => RelayRole::Admin,
+                    "member" => RelayRole::Member,
+                    _ => return None,
+                };
+                Some(PersonInfo {
+                    pubkey,
+                    name: name.filter(|n| !n.is_empty()),
+                    role,
+                })
+            })
+            .collect())
     }
 
     async fn channel_exists(

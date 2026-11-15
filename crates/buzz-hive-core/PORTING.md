@@ -129,7 +129,7 @@ spec's title and are confirmed when that phase starts.
 | `newtask` | pending | 16 |
 | `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is Phase 16) | 16 |
 | `paused-turn` | changed (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; Phase 12 opens the Needs you item that a reply finishes, in `tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`) | 12 |
-| `permissions` | pending | 14 |
+| `permissions` | changed (Phase 14 ports the contract against Beehive levels: an admin sets a person's or an agent's level, the engine then allows and refuses to match, and Settings lists the same levels. Kiln's permission asks are dropped, Buzz owns permissions. Covered by buzz-app `e2e/permissions.spec.mjs`) | 14 |
 | `pick-repo` | pending | 21 |
 | `plugin-command` | dropped (plugins) | 1 |
 | `plugin-contents` | dropped (plugins) | 1 |
@@ -413,3 +413,21 @@ spec's title and are confirmed when that phase starts.
 - Tests: core `tests/auto_mode.rs` and `tests/directory_before_log.rs`, api `tests/inbox.rs`,
   store `tests/postgres_savepoint.rs` and `buzz-hive/tests/e2e_auto_mode.rs` (needs a local
   relay).
+
+## Phase 14 deliverables
+
+- Routes: `ListAccess` (Read) lists every person and agent with the level each acts at,
+  `ListPeople` (Read) lists the relay's people with their level, and `SetAccessLevel` (Admin)
+  sets one. Each change appends an `access.changed` event with the actor, holding the pubkey,
+  kind, new level and previous level.
+- Rules in `orchestrator/access.rs`: an agent is capped at its owner's level, and a change that
+  would put it above is `failed_precondition` naming the agent, the cap and the owner. An
+  admin may not lower their own level. A pubkey that is not in the community is `not_found`
+  and a switched-off agent is `failed_precondition`. An agent holding Admin may set a level
+  only for a requester at Admin, so until Phase 15 supplies the requester an agent is refused.
+  The `set_access_level` tool is the one call an agent has.
+- Directory: `Directory::people()` reads the relay's members with their display names. As in
+  Phase 12 it is asked before the first append of a transaction.
+- `Person.level` is a new field of the proto message, so `WhoAmI` and `ListPeople` carry it.
+- Tests: core `tests/access.rs`, `tests/event_coverage.rs` and `tests/directory_before_log.rs`,
+  api `tests/access.rs` and `tests/procedures.rs`, store `tests/postgres_directory.rs`.

@@ -4,6 +4,7 @@
 //! and generated types carry over. `tests/procedures.rs` checks that every rpc in
 //! `engine.proto` is routed, dropped with a reason, or still pending.
 
+mod access;
 mod activity;
 mod agents;
 mod artifacts;
@@ -50,6 +51,9 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("SetSetting", Level::Run),
     ("SetAutoMode", Level::Run),
     ("ListAgents", Level::Read),
+    ("ListAccess", Level::Read),
+    ("ListPeople", Level::Read),
+    ("SetAccessLevel", Level::Admin),
     ("SkipStage", Level::Run),
     ("PauseCard", Level::Run),
     ("ResumeCard", Level::Run),
@@ -168,6 +172,9 @@ pub fn router() -> Router<App> {
     let r = route(r, "SetSetting", settings::set_setting);
     let r = route(r, "SetAutoMode", settings::set_auto_mode);
     let r = route(r, "ListAgents", agents::list_agents);
+    let r = route(r, "ListAccess", access::list_access);
+    let r = route(r, "ListPeople", access::list_people);
+    let r = route(r, "SetAccessLevel", access::set_access_level);
     let r = route(r, "SkipStage", stages::skip_stage);
     let r = route(r, "PauseCard", stages::pause_card);
     let r = route(r, "ResumeCard", stages::resume_card);
