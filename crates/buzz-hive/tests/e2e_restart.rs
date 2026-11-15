@@ -335,20 +335,22 @@ fn times_out_after_a_kill<'a>(
         );
 
         process.start().await;
+        // The stage has no retries and its agent reported nothing, so the timeout asks a
+        // person (a "no result" item) instead of failing the card.
         let mut got = Value::Null;
         for _ in 0..60 {
             (_, got) = call(app, "GetCard", &owner, json!({"cardId": card})).await;
-            if got["state"] == "failed" {
+            if got["state"] == "waiting" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        assert_eq!(got["state"], "failed", "{got}");
-        let (_, runs) = call(app, "ListRuns", &owner, json!({"cardId": card})).await;
-        let failure = runs["runs"][0]["steps"][0]["failure"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(failure.contains("timed out"), "{runs}");
+        assert_eq!(got["state"], "waiting", "{got}");
+        let (_, inbox) = call(app, "ListInbox", &owner, json!({"cardId": card})).await;
+        let items = inbox["items"].as_array().cloned().unwrap_or_default();
+        assert_eq!(items.len(), 1, "{inbox}");
+        assert_eq!(items[0]["kind"], "no_result", "{inbox}");
+        assert_eq!(items[0]["stage"], "research", "{inbox}");
         wait_for_drained(app).await;
         assert_eq!(stage_posts(world).await, 1);
         script.finish().await;

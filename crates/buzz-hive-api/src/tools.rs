@@ -217,6 +217,27 @@ pub const TOOLS: &[Tool] = &[
         schema: run_id_only,
     },
     Tool {
+        name: "ask_gate",
+        route: "AskGate",
+        needs: Level::Run,
+        description: "Ask a person a question and wait for the reply. It opens an item in Needs you and the card waits; the reply arrives in this stage's thread. Pass the card_id, stage and visit from the task. Only the agent the stage task mentioned may call it.",
+        schema: ask_gate,
+    },
+    Tool {
+        name: "approve_gate",
+        route: "Approve",
+        needs: Level::Run,
+        description: "Approve the approval stage the card waits at. Each artifact the stage lists is approved at its latest version, or at the version you name. A listed artifact with no saved version is refused.",
+        schema: approve_gate,
+    },
+    Tool {
+        name: "get_inbox",
+        route: "ListInbox",
+        needs: Level::Read,
+        description: "List what waits for a person in Needs you, open items first. Give a card id to list one card's items.",
+        schema: get_inbox,
+    },
+    Tool {
         name: "get_hive_health",
         route: "GetStatus",
         needs: Level::Read,
@@ -282,6 +303,30 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "ResetCard",
         "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "AnswerInbox",
+        "a person's call from Needs you; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "SendBack",
+        "a person's call on an approval gate; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "SendMessage",
+        "a person's way to write to a stage's agent; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "ListActivity",
+        "the Activity tab filters a card's entries; an agent reads them with read_history",
+    ),
+    (
+        "GetFullPayload",
+        "the Activity tab opens one event; an agent has no use for it",
+    ),
+    (
+        "GetUsage",
+        "the Usage page's counts; an agent has no use for them",
     ),
     (
         "SetHandoff",
@@ -425,6 +470,63 @@ fn stage_done() -> Value {
 /// The visit a stage task names, which a report passes back.
 fn visit_field() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "The visit the task named, from 1." })
+}
+
+fn ask_gate() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            ("stage", string("The stage the task named.")),
+            ("visit", visit_field()),
+            (
+                "question",
+                string("What you need a person to decide. Up to 10000 characters."),
+            ),
+        ],
+        &["cardId", "stage", "visit", "question"],
+    )
+}
+
+fn approve_gate() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card waiting at an approval stage.")),
+            (
+                "artifacts",
+                json!({
+                    "type": "array",
+                    "description": "Versions to approve. An artifact left out is approved at its latest.",
+                    "items": object(
+                        vec![
+                            ("name", string("The artifact's name.")),
+                            (
+                                "version",
+                                json!({ "type": "integer", "minimum": 1, "description": "The version to approve." }),
+                            ),
+                        ],
+                        &["name", "version"],
+                    ),
+                }),
+            ),
+        ],
+        &["cardId"],
+    )
+}
+
+fn get_inbox() -> Value {
+    object(
+        vec![
+            (
+                "cardId",
+                string("The card's id. Empty lists every card's items."),
+            ),
+            (
+                "includeResolved",
+                json!({ "type": "boolean", "description": "Also list the items already answered." }),
+            ),
+        ],
+        &[],
+    )
 }
 
 fn list_cards() -> Value {

@@ -18,6 +18,7 @@ use super::{Ctx, Env, OpError};
 use crate::config::{self, Layer, Layers, Resolution};
 use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
+use crate::domain::inbox::{InboxItem, ANSWER_SUPERSEDED};
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::TimerKind;
 use crate::domain::workflow::Duration as SettingDuration;
@@ -261,9 +262,64 @@ pub(super) async fn apply(
             append(tx, ctx, "card.state", &run, payload).await?;
         }
     }
+    // A step that changes a run closes the items that waited on it, and the effects below open
+    // the ones the new state needs. An item a person answered is closed already.
+    if mode == Mode::Insert || !effects.is_empty() {
+        let closed = tx
+            .inbox()
+            .resolve_card(card.id, ANSWER_SUPERSEDED, &ctx.actor.pubkey)
+            .await?;
+        for item in closed {
+            append(
+                tx,
+                ctx,
+                "inbox.resolved",
+                &run,
+                resolved_payload(&item, ANSWER_SUPERSEDED, &ctx.actor.pubkey),
+            )
+            .await?;
+        }
+    }
     for effect in effects {
         match effect {
             Effect::Emit { kind, payload } => append(tx, ctx, kind, &run, payload).await?,
+            Effect::OpenInbox {
+                stage,
+                visit,
+                kind,
+                reason,
+                artifacts,
+            } => {
+                let mut listed = Vec::new();
+                for name in artifacts {
+                    let version = tx.artifacts().version(card.id, &name, None).await?;
+                    listed.push(json!({ "name": name, "version": version.map(|v| v.version) }));
+                }
+                let item = InboxItem::open(
+                    card.id,
+                    run.id,
+                    &stage,
+                    visit,
+                    kind,
+                    &reason,
+                    json!({ "artifacts": listed }),
+                );
+                tx.inbox().insert(&item).await?;
+                append(
+                    tx,
+                    ctx,
+                    "inbox.opened",
+                    &run,
+                    json!({
+                        "id": item.id,
+                        "kind": kind.as_str(),
+                        "stage": stage,
+                        "visit": visit,
+                        "title": reason,
+                    }),
+                )
+                .await?;
+            }
             Effect::PostStatus {
                 card: id,
                 key,
@@ -368,6 +424,12 @@ pub(super) async fn apply(
                     Note::Stopped { reason } => format!(
                         "The run was stopped: {reason}. Stop work on stage {stage} and do not report a result."
                     ),
+                    Note::Answer { text } if text.is_empty() => format!(
+                    "A person asks you to carry on with stage {stage}. Report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
+                    Note::Answer { text } => format!(
+                    "A person answered: {text}\n\nCarry on with stage {stage}, and report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
                     Note::Resumed => format!(
                         "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
                     ),
@@ -452,6 +514,17 @@ async fn task_text(
         },
         channel: Some(channel),
         visit,
+        // Only the stage's first task carries them: a later round is a reply, not a new brief.
+        sendback: match round {
+            None => run
+                .steps
+                .iter()
+                .rev()
+                .find(|s| s.stage == stage && s.visit == visit)
+                .map(|s| s.sendback.clone())
+                .unwrap_or_default(),
+            Some(_) => String::new(),
+        },
     };
     let mut text = render_task(
         package,
@@ -612,6 +685,17 @@ async fn note(tx: &mut dyn Tx, ctx: &Ctx, card: &Card, summary: String) -> Resul
     );
     tx.events().append(event).await?;
     Ok(())
+}
+
+/// The payload of an `inbox.resolved` event.
+pub(super) fn resolved_payload(item: &InboxItem, answer: &str, by: &str) -> serde_json::Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "stage": item.stage,
+        "answer": answer,
+        "by": by,
+    })
 }
 
 pub(super) async fn append(

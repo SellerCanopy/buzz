@@ -248,6 +248,7 @@ pub(super) fn to_activity(event: Event) -> ActivityEntry {
             .as_i64()
             .and_then(|v| i32::try_from(v).ok())
             .unwrap_or_default(),
+        run_id: event.run_id.map(|id| id.to_string()).unwrap_or_default(),
         event_seq: event.seq,
         at: Some(crate::routes::poll::timestamp(event.at)),
         r#type: text("type"),

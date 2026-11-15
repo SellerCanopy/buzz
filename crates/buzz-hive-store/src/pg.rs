@@ -6,12 +6,14 @@ use buzz_hive_core::domain::artifact::{
 };
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
+use buzz_hive_core::domain::inbox::{InboxItem, InboxKind};
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::domain::timer::{Timer, TimerKind};
+use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread, Store,
-    StoreError, StoredPackage, TimersRepo, Tx, WorkflowsRepo,
+    InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread,
+    Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -78,6 +80,12 @@ impl Tx for PgTx {
         self
     }
     fn timers(&mut self) -> &mut dyn TimersRepo {
+        self
+    }
+    fn inbox(&mut self) -> &mut dyn InboxRepo {
+        self
+    }
+    fn usage(&mut self) -> &mut dyn UsageRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -1279,6 +1287,218 @@ impl TimersRepo for PgTx {
         .await
         .map_err(store_error)?;
         Ok(secs.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))))
+    }
+}
+
+type InboxRow = (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    i32,
+    String,
+    String,
+    serde_json::Value,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The columns of an [`InboxRow`], as a literal so queries can be built with `concat!`.
+macro_rules! inbox_columns {
+    () => {
+        "id, card_id, run_id, stage, visit, kind, title, detail, opened_at, resolved_at, \
+         resolved_by, answer"
+    };
+}
+
+fn decode_inbox(row: InboxRow) -> Result<InboxItem, StoreError> {
+    let (
+        id,
+        card_id,
+        run_id,
+        stage,
+        visit,
+        kind,
+        title,
+        detail,
+        opened_at,
+        resolved_at,
+        resolved_by,
+        answer,
+    ) = row;
+    Ok(InboxItem {
+        id,
+        card_id,
+        run_id,
+        stage,
+        visit: u32::try_from(visit)
+            .map_err(|_| StoreError::Conflict(format!("stored visit {visit} for item {id}")))?,
+        kind: InboxKind::parse(&kind)
+            .ok_or_else(|| StoreError::Conflict(format!("stored kind {kind} for item {id}")))?,
+        title,
+        detail,
+        opened_at,
+        resolved_at,
+        resolved_by,
+        answer,
+    })
+}
+
+#[async_trait::async_trait]
+impl InboxRepo for PgTx {
+    async fn insert(&mut self, item: &InboxItem) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.inbox (community_id, id, card_id, run_id, stage, visit, kind, \
+             title, detail, opened_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(self.community)
+        .bind(item.id)
+        .bind(item.card_id)
+        .bind(item.run_id)
+        .bind(&item.stage)
+        .bind(i32::try_from(item.visit).unwrap_or(i32::MAX))
+        .bind(item.kind.as_str())
+        .bind(&item.title)
+        .bind(&item.detail)
+        .bind(item.opened_at)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<InboxItem>, StoreError> {
+        let row: Option<InboxRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            inbox_columns!(),
+            " FROM hive.inbox WHERE community_id = $1 AND id = $2"
+        ))
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_inbox).transpose()
+    }
+
+    async fn list(
+        &mut self,
+        card: Option<uuid::Uuid>,
+        include_resolved: bool,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let rows: Vec<InboxRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            inbox_columns!(),
+            " FROM hive.inbox WHERE community_id = $1 \
+             AND ($2::uuid IS NULL OR card_id = $2) AND ($3 OR resolved_at IS NULL) \
+             ORDER BY (resolved_at IS NOT NULL), opened_at DESC, id"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .bind(include_resolved)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_inbox).collect()
+    }
+
+    async fn resolve(
+        &mut self,
+        id: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<bool, StoreError> {
+        let done = sqlx::query(
+            "UPDATE hive.inbox SET resolved_at = now(), resolved_by = $3, answer = $4 \
+             WHERE community_id = $1 AND id = $2 AND resolved_at IS NULL",
+        )
+        .bind(self.community)
+        .bind(id)
+        .bind(by)
+        .bind(answer)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn resolve_card(
+        &mut self,
+        card: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let rows: Vec<InboxRow> = sqlx::query_as(concat!(
+            "UPDATE hive.inbox SET resolved_at = now(), resolved_by = $3, answer = $4 \
+             WHERE community_id = $1 AND card_id = $2 AND resolved_at IS NULL RETURNING ",
+            inbox_columns!()
+        ))
+        .bind(self.community)
+        .bind(card)
+        .bind(by)
+        .bind(answer)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        let mut items = rows
+            .into_iter()
+            .map(decode_inbox)
+            .collect::<Result<Vec<_>, _>>()?;
+        items.sort_by_key(|item| (std::cmp::Reverse(item.opened_at), item.id));
+        Ok(items)
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageRepo for PgTx {
+    async fn usage(&mut self, weeks: u32) -> Result<Usage, StoreError> {
+        let (runs, ended, average, longest): (i64, i64, Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT count(*), count(ended_at), \
+                 avg(EXTRACT(EPOCH FROM (ended_at - started_at)))::float8, \
+                 max(EXTRACT(EPOCH FROM (ended_at - started_at)))::float8 \
+                 FROM hive.runs WHERE community_id = $1",
+        )
+        .bind(self.community)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        // One row per week, so a week with nothing still shows. A week starts Monday, UTC.
+        let rows: Vec<(chrono::NaiveDate, i64, i64)> = sqlx::query_as(
+            "WITH w AS (SELECT generate_series( \
+                 date_trunc('week', now() AT TIME ZONE 'utc') - make_interval(weeks => $2 - 1), \
+                 date_trunc('week', now() AT TIME ZONE 'utc'), interval '1 week') AS starts) \
+             SELECT w.starts::date, \
+                 count(e.seq) FILTER (WHERE e.kind = 'card.created'), \
+                 count(e.seq) FILTER (WHERE e.kind = 'run.started') \
+             FROM w LEFT JOIN hive.events e ON e.community_id = $1 \
+                 AND e.actor_kind = 'agent' AND e.kind IN ('card.created', 'run.started') \
+                 AND e.at >= w.starts AT TIME ZONE 'utc' \
+                 AND e.at < (w.starts + interval '1 week') AT TIME ZONE 'utc' \
+             GROUP BY w.starts ORDER BY w.starts",
+        )
+        .bind(self.community)
+        .bind(i32::try_from(weeks).unwrap_or(i32::MAX))
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        let count = |n: i64| u32::try_from(n).unwrap_or(u32::MAX);
+        let seconds = |s: Option<f64>| s.map_or(0, |s| s.max(0.0) as u64);
+        Ok(Usage {
+            runs: count(runs),
+            ended_runs: count(ended),
+            average_run_seconds: seconds(average),
+            longest_run_seconds: seconds(longest),
+            weeks: rows
+                .into_iter()
+                .map(|(starts, cards, started)| UsageWeek {
+                    starts,
+                    cards_created_by_agents: count(cards),
+                    runs_started_by_agents: count(started),
+                })
+                .collect(),
+        })
     }
 }
 

@@ -79,15 +79,35 @@ service EngineService {
   rpc RetryRun(RetryRunRequest) returns (Run);
   // Approve approves the card's open approval stage, naming the version of
   // each artifact, and moves the card on passed.
+  //
+  // Beehive: an artifact the stage lists and the request leaves out is
+  // approved at its latest version. The card needs an open approval item, else
+  // FailedPrecondition, and a listed artifact with no saved version is
+  // FailedPrecondition too. Approve is the Run level; the agent that holds the
+  // stage may call it until auto mode (Phase 13) decides who may.
   rpc Approve(ApproveRequest) returns (Card);
   // SendBack answers the card's open approval stage with comments and moves
   // the card on needs_work. The stage it goes to gets the comments.
+  //
+  // Beehive: a person only. An agent is PermissionDenied, and empty comments
+  // are InvalidArgument.
   rpc SendBack(SendBackRequest) returns (Card);
   // SendMessage queues text for the card's running agent, which reads it as
   // its next turn. It fails with FailedPrecondition when the card has no
   // running agent session, and InvalidArgument for empty text or text over
   // 32 KiB.
+  //
+  // Beehive: a person only. The text is posted as a reply in the stage's
+  // thread, mentioning the stage's agent, and the run does not change.
   rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  // Beehive addition: the agent of a running stage asks a person a question
+  // and waits for the reply. It opens a question item in Needs you and the run
+  // waits. The caller must be the stage's agent, and stage and visit must
+  // name the stage the card is at, as StageDone's do.
+  rpc AskGate(AskGateRequest) returns (Run);
+  // Beehive addition: counts of what agents did, from the event log. It has no
+  // token or cost figures.
+  rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
   // GetRun returns one run.
   rpc GetRun(GetRunRequest) returns (Run);
   // ListRuns returns runs and the newest event seq from one snapshot.
@@ -98,6 +118,9 @@ service EngineService {
   // ListActivity returns a card's activity entries, oldest first, and the
   // newest event seq from one snapshot. It fails with InvalidArgument for
   // a missing card_id or a limit over 1000.
+  //
+  // Beehive: entries are the card's activity.added events. An answer to a
+  // Needs you item is an entry of type answer with the reason in detail.
   rpc ListActivity(ListActivityRequest) returns (ListActivityResponse);
   // AddNote stores a person's note on the card's current stage. It fails
   // with FailedPrecondition when the card is at no stage, and with
@@ -109,13 +132,19 @@ service EngineService {
   // GetFullPayload returns the uncut payload of a cut event, which names
   // it by full_ref. It fails with NotFound when the run, its log or the
   // ref is missing, and with InvalidArgument for a malformed ref.
+  //
+  // Beehive: events are never cut, so full_ref is the seq of one of the run's
+  // card's events, and the payload is that event's own.
   rpc GetFullPayload(GetFullPayloadRequest) returns (GetFullPayloadResponse);
   // ListInbox returns Needs you items and the newest event seq from one
-  // snapshot.
+  // snapshot. Open items come first, and each group is newest first.
   rpc ListInbox(ListInboxRequest) returns (ListInboxResponse);
   // AnswerInbox answers an open Needs you item and returns it resolved. It
   // fails with InvalidArgument for an answer the item's kind does not
   // allow, and with FailedPrecondition when the item is already answered.
+  //
+  // Beehive: a person only. Choices are approve, reject, reply, skip, stop,
+  // retry and dismiss, and each kind takes some of them (see InboxItem.choices).
   rpc AnswerInbox(AnswerInboxRequest) returns (InboxItem);
   // ListWorkflows returns every loaded workflow by package name, with the
   // cards that run it and whether it passes its checks.
@@ -819,10 +848,12 @@ message RunInput {
 
 // InboxItem is one Needs you item.
 message InboxItem {
-  int64 id = 1;
+  // Beehive: UUIDs, as strings.
+  string id = 1;
+  // Beehive: approval, question, route, no_result, missing_output or failure.
   string kind = 2;
-  int64 run_id = 3;
-  int64 card_id = 4;
+  string run_id = 3;
+  string card_id = 4;
   // open or resolved.
   string state = 5;
   string title = 6;
@@ -832,6 +863,9 @@ message InboxItem {
   repeated string choices = 8;
   // The answer it was resolved with: a choice, or field values or answers
   // as JSON. Empty while open.
+  //
+  // Beehive: the choice's name as plain text, or superseded when the run moved
+  // on without an answer.
   string answer_json = 9;
   google.protobuf.Timestamp created_at = 10;
   // Unset while open.
@@ -839,6 +873,12 @@ message InboxItem {
   // The title of the item's card, set by ListInbox. Empty when the item has
   // no card or the card has no title.
   string card_title = 12;
+  // Beehive: the stage the run was at, and which visit of it.
+  string stage = 13;
+  int32 visit = 14;
+  // Beehive: the pubkey of whoever answered. Empty while open, and for an item
+  // the engine closed itself.
+  string resolved_by = 15;
 }
 
 message CreateCardRequest {
@@ -1148,28 +1188,64 @@ message SetHandoffRequest {
 }
 
 message ApproveRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   // The versions approved. An artifact the stage lists but this leaves out
   // is approved at the version the approval item showed.
   repeated ArtifactVersion artifacts = 2;
 }
 
 message SendBackRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   // Required. The stage the card goes back to gets them as
   // {{sendback.comments}}.
   string comments = 2;
 }
 
 message SendMessageRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   // Required, at most 32 KiB.
   string text = 2;
 }
 
 message SendMessageResponse {
   // 16 hex characters, named by the message.* events.
+  //
+  // Beehive: 32 hex characters, the end of the message's outbox key.
   string message_id = 1;
+}
+
+message AskGateRequest {
+  // The card's UUID.
+  string card_id = 1;
+  // The stage and visit the task named, as StageDone takes them.
+  string stage = 2;
+  int32 visit = 3;
+  // What the person is asked. Required, at most 10000 characters.
+  string question = 4;
+}
+
+message GetUsageRequest {}
+
+// UsageWeek is what agents started in one week, which begins on a Monday (UTC).
+message UsageWeek {
+  // The Monday, as YYYY-MM-DD.
+  string starts = 1;
+  int32 cards_created_by_agents = 2;
+  int32 runs_started_by_agents = 3;
+}
+
+message GetUsageResponse {
+  // Every run the community has had, and the ones that have ended.
+  int32 runs = 1;
+  int32 ended_runs = 2;
+  // Over the ended runs, in whole seconds. Zero with none.
+  int64 average_run_seconds = 3;
+  int64 longest_run_seconds = 4;
+  // The last eight weeks, oldest first, the current one last.
+  repeated UsageWeek weeks = 5;
 }
 
 message GetRunRequest {
@@ -1214,7 +1290,9 @@ message ListInboxRequest {
   // Resolved items are left out unless this is set.
   bool include_resolved = 1;
   // 0 lists the items of every card.
-  int64 card_id = 2;
+  //
+  // Beehive: the card's UUID, or empty for every card.
+  string card_id = 2;
 }
 
 message ListInboxResponse {
@@ -1223,7 +1301,8 @@ message ListInboxResponse {
 }
 
 message AnswerInboxRequest {
-  int64 item_id = 1;
+  // Beehive: the item's UUID.
+  string item_id = 1;
   // One of the item's choices, such as "allow_once" or "decline". Empty
   // when answering a question with values or an ask with answers.
   string choice = 2;
@@ -1231,6 +1310,9 @@ message AnswerInboxRequest {
   string values_json = 3;
   // An ask item's answers, one per question, in order.
   repeated string answers = 4;
+  // Beehive: the text a choice needs. For reject it is the reason, and for
+  // reply it is the reply. values_json and answers are InvalidArgument when set.
+  string text = 5;
 }
 
 message ListWorkflowsRequest {}
@@ -2670,7 +2752,8 @@ enum UsageFeature {
 }
 
 message ListActivityRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
   optional string stage_id = 2;
   optional int32 visit = 3;
   // progress, decision, blocker, answer, note or event. Empty: every type.
@@ -2785,7 +2868,8 @@ message ReadHistoryResponse {
 }
 
 message GetFullPayloadRequest {
-  int64 run_id = 1;
+  // Beehive: the run's UUID.
+  string run_id = 1;
   string full_ref = 2;
 }
 

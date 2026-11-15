@@ -7,6 +7,7 @@ use std::time::Duration;
 use buzz_hive_core::access::ActorKind;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::Event;
+use buzz_hive_core::domain::inbox::InboxKind;
 use buzz_hive_core::domain::run::RunState;
 use buzz_hive_core::domain::timer::TimerKind;
 use buzz_hive_core::orchestrator::cards::{create_card, NewCard};
@@ -105,13 +106,29 @@ async fn a_timeout_fires_at_its_boundary_and_not_before() {
         ("only", TimerKind::Timeout)
     );
 
+    // A stage with no retries that never reports opens a Needs you item and waits, instead of
+    // failing the run.
     let events = fire_due(&f).await;
-    let ended = of_kind(&events, "run.ended");
-    assert_eq!(ended.len(), 1);
-    assert_eq!(ended[0].payload["outcome"], "failed");
-    assert_eq!(ended[0].payload["reason"], "only timed out after 10m");
-    assert_eq!(card_state(&f, card).await, CardState::Failed);
+    assert!(of_kind(&events, "run.ended").is_empty());
+    let waiting = of_kind(&events, "run.waiting");
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].payload["condition"], "no_result");
+    assert_eq!(
+        waiting[0].payload["reason"],
+        "only timed out after 10m without reporting a result"
+    );
+    assert_eq!(
+        of_kind(&events, "inbox.opened")[0].payload["kind"],
+        "no_result"
+    );
+    assert_eq!(card_state(&f, card).await, CardState::Waiting);
     assert_eq!(next_in(&f).await, None);
+    let open = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.inbox().list(Some(card), false).await.unwrap()
+    };
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].kind, InboxKind::NoResult);
 }
 
 #[tokio::test]
@@ -287,7 +304,7 @@ async fn a_stopped_stage_that_never_posted_is_stopped_without_a_note() {
 
 #[tokio::test]
 async fn a_failed_or_stopped_card_retries_as_a_new_run_with_its_own_thread() {
-    let (f, clock) = configured("10m", 0, "1m").await;
+    let (f, clock) = configured("10m", 1, "1m").await;
     let card = begun(&f, "solo").await;
     let run = {
         let mut tx = f.store.begin(COMMUNITY).await.unwrap();
@@ -300,6 +317,12 @@ async fn a_failed_or_stopped_card_retries_as_a_new_run_with_its_own_thread() {
         "{refused:?}"
     );
 
+    // The one retry is used up, so the second timeout fails the run.
+    clock.advance(10 * MINUTE);
+    fire_due(&f).await;
+    clock.advance(MINUTE);
+    fire_due(&f).await;
+    f.drain().await.unwrap();
     clock.advance(10 * MINUTE);
     fire_due(&f).await;
     assert_eq!(card_state(&f, card).await, CardState::Failed);
@@ -310,6 +333,12 @@ async fn a_failed_or_stopped_card_retries_as_a_new_run_with_its_own_thread() {
     assert_eq!(next.visit, 2);
     assert_eq!(card_state(&f, card).await, CardState::Running);
     assert_eq!(next_in(&f).await, Some(10 * MINUTE));
+    // The failure's Needs you item is closed by the new run.
+    let open = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.inbox().list(Some(card), false).await.unwrap()
+    };
+    assert!(open.is_empty(), "{open:?}");
     f.drain().await.unwrap();
     let roots = f
         .relay
@@ -468,10 +497,10 @@ async fn a_restart_keeps_a_pending_timer_and_fires_an_overdue_one() {
     assert_eq!(next_in(&after).await, Some(Duration::ZERO));
     let events = fire_due(&after).await;
     assert_eq!(
-        of_kind(&events, "run.ended")[0].payload["outcome"],
-        "failed"
+        of_kind(&events, "run.waiting")[0].payload["condition"],
+        "no_result"
     );
-    assert_eq!(card_state(&after, pending).await, CardState::Failed);
+    assert_eq!(card_state(&after, pending).await, CardState::Waiting);
 }
 
 #[tokio::test]

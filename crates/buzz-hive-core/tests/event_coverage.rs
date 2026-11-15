@@ -15,6 +15,7 @@ use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
 };
+use buzz_hive_core::orchestrator::inbox::{approve, send_back};
 use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::timers;
@@ -23,7 +24,7 @@ use buzz_hive_core::testing::MemStore;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 11;
+const CURRENT_PHASE: u8 = 12;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -211,6 +212,33 @@ async fn retry_scenarios(f: &Fixture, clock: &ManualClock) {
     }
 }
 
+/// Phase 12: a plan reaches an approval stage, is sent back once and approved the second time.
+async fn approval_scenarios(f: &Fixture) {
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let card = begun(f, "gated").await;
+    for round in 0..2 {
+        save_artifact(
+            &f.env(),
+            &agent,
+            card,
+            "plan",
+            ArtifactContent::Text(format!("version {round}")),
+        )
+        .await
+        .unwrap();
+        f.report(&agent, card, "passed", "ready").await.unwrap();
+        if round == 0 {
+            send_back(&f.env(), &person(), card, "Add a rollback step.")
+                .await
+                .unwrap();
+        } else {
+            approve(&f.env(), &person(), card, &Default::default())
+                .await
+                .unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let (f, clock) = Fixture::timed();
@@ -221,6 +249,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     routing_scenarios(&f).await;
     artifact_scenarios(&f).await;
     retry_scenarios(&f, &clock).await;
+    approval_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

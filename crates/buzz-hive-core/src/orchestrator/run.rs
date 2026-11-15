@@ -57,7 +57,7 @@ pub async fn start_run_at(
 }
 
 /// [`start_run_at`] inside a transaction the caller holds and commits.
-async fn start_in(
+pub(super) async fn start_in(
     env: &Env<'_>,
     ctx: &Ctx,
     tx: &mut dyn Tx,
@@ -218,7 +218,7 @@ pub async fn stage_done(
 }
 
 /// Refuses a report that does not say which stage and visit it is for.
-fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
+pub(super) fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
     if stage.is_empty() {
         return Err(OpError::InvalidArgument(
             "stage is required: the stage the task named".into(),
@@ -233,7 +233,12 @@ fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
 }
 
 /// Refuses a report for a stage or visit the run is no longer at.
-fn check_position(run: &Run, running: &str, stage: &str, visit: u32) -> Result<(), OpError> {
+pub(super) fn check_position(
+    run: &Run,
+    running: &str,
+    stage: &str,
+    visit: u32,
+) -> Result<(), OpError> {
     if stage != running || visit != run.visit {
         return Err(OpError::FailedPrecondition(format!(
             "this report is for stage {stage} visit {visit}, but the run is at stage {running} visit {}; \
@@ -247,7 +252,7 @@ fn check_position(run: &Run, running: &str, stage: &str, visit: u32) -> Result<(
 /// Refuses an agent a call that is a person's to make. An agent acts through the stage task
 /// it was given, so it may report a result or move its own card, and may not hold, release or
 /// skip a card, which would let one agent override the others on a board.
-fn people_only(ctx: &Ctx, what: &str) -> Result<(), OpError> {
+pub(super) fn people_only(ctx: &Ctx, what: &str) -> Result<(), OpError> {
     if ctx.actor.kind == ActorKind::Agent {
         return Err(OpError::PermissionDenied(format!(
             "only a person may {what}; an agent reports with {STAGE_DONE}"
@@ -371,7 +376,7 @@ pub async fn stop_run(
 }
 
 /// Stops the card's run in a transaction the caller holds. With `only`, the run must be that one.
-async fn stop_in(
+pub(super) async fn stop_in(
     env: &Env<'_>,
     ctx: &Ctx,
     tx: &mut dyn Tx,

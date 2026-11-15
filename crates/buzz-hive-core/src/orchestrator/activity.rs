@@ -192,6 +192,111 @@ pub async fn read_history(
         .await?)
 }
 
+/// `list_activity` returns this many entries when the caller names no limit.
+pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
+/// The most entries `list_activity` returns.
+pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
+
+/// Which of a card's activity entries `list_activity` keeps. A field left empty keeps all.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityFilter {
+    pub stage: Option<String>,
+    pub visit: Option<u32>,
+    /// progress, decision, answer, note or message.
+    pub types: Vec<String>,
+    pub author: Option<crate::access::ActorKind>,
+    pub after_seq: i64,
+    /// 0 means [`DEFAULT_ACTIVITY_LIMIT`].
+    pub limit: i64,
+}
+
+/// The card's activity entries that pass `filter`, oldest first, and the newest event seq,
+/// read in one transaction so a page can watch from it.
+pub async fn list_activity(
+    store: &dyn crate::ports::store::Store,
+    ctx: &Ctx,
+    card_id: Uuid,
+    filter: &ActivityFilter,
+) -> Result<(Vec<Event>, i64), OpError> {
+    if !(0..=MAX_ACTIVITY_LIMIT).contains(&filter.limit) {
+        return Err(OpError::InvalidArgument(format!(
+            "limit is {}; it must be 1 to {MAX_ACTIVITY_LIMIT}, or 0 for {DEFAULT_ACTIVITY_LIMIT}",
+            filter.limit
+        )));
+    }
+    let limit = match filter.limit {
+        0 => DEFAULT_ACTIVITY_LIMIT,
+        n => n,
+    };
+    let mut tx = store.begin(ctx.community).await?;
+    let seq = tx.events().latest_seq().await?;
+    tx.cards()
+        .get(card_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
+    let keeps = |event: &Event| {
+        let p = &event.payload;
+        filter
+            .stage
+            .as_deref()
+            .is_none_or(|stage| p["stage"].as_str() == Some(stage))
+            && filter
+                .visit
+                .is_none_or(|visit| p["visit"].as_u64() == Some(u64::from(visit)))
+            && (filter.types.is_empty()
+                || p["type"]
+                    .as_str()
+                    .is_some_and(|t| filter.types.iter().any(|want| want == t)))
+            && filter.author.is_none_or(|kind| event.actor.kind == kind)
+    };
+    // The filter runs here, so a page of the log may hold none that pass. Keep reading
+    // until the limit is met or the log ends.
+    let mut kept: Vec<Event> = Vec::new();
+    let mut after = filter.after_seq.max(0);
+    while (kept.len() as i64) < limit {
+        let page = tx
+            .events()
+            .of_card(card_id, KIND, after, MAX_ACTIVITY_LIMIT)
+            .await?;
+        let Some(last) = page.last().map(|event| event.seq) else {
+            break;
+        };
+        let more = page.len() as i64 == MAX_ACTIVITY_LIMIT;
+        kept.extend(page.into_iter().filter(|event| keeps(event)));
+        after = last;
+        if !more {
+            break;
+        }
+    }
+    kept.truncate(limit as usize);
+    Ok((kept, seq))
+}
+
+/// The payload of the event `seq`, when it belongs to the run's card. Events are never cut,
+/// so this is the whole of what the activity entry summarizes.
+pub async fn full_payload(
+    store: &dyn crate::ports::store::Store,
+    ctx: &Ctx,
+    run_id: Uuid,
+    seq: i64,
+) -> Result<serde_json::Value, OpError> {
+    let mut tx = store.begin(ctx.community).await?;
+    let run = tx
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("run {run_id} does not exist")))?;
+    let event = tx
+        .events()
+        .after(seq.saturating_sub(1), 1)
+        .await?
+        .into_iter()
+        .next()
+        .filter(|event| event.seq == seq && event.card_id == Some(run.card_id))
+        .ok_or_else(|| OpError::NotFound(format!("event {seq} is not on run {run_id}'s card")))?;
+    Ok(event.payload)
+}
+
 /// One entry as the brief reads it, or `None` for an entry of another stage or another kind.
 fn entry_of(event: &Event, stage: &str) -> Option<Entry> {
     let p = &event.payload;

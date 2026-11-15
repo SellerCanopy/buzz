@@ -131,6 +131,17 @@ pub fn catalog() -> Catalog {
             ]
             .concat(),
         ),
+        // draft saves a plan, a person approves it at gate, and a rejection goes back to draft.
+        (
+            "gated",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n    on:\n      needs_work: draft\n"
+                    .to_owned(),
+                stage("ship", ""),
+            ]
+            .concat(),
+        ),
         // A stage that repeats until every item of its plan is checked.
         (
             "ticked",

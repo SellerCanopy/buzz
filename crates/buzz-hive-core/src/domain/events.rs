@@ -91,6 +91,16 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // A stage's attempt failed and will run again. The payload has the stage, the attempt
     // that failed, how many seconds until the next one, and why it failed.
     ("retry.scheduled", 11),
+    // A run began waiting for a person, and an item was opened in Needs you. The payload has the
+    // item's id, kind, stage and title.
+    ("inbox.opened", 12),
+    // A person answered an item, or the run moved on and the engine closed it. The payload has
+    // the item's id, the answer, and who answered.
+    ("inbox.resolved", 12),
+    // A person approved an approval stage. The payload has the stage and the artifact versions.
+    ("approval.recorded", 12),
+    // A person sent an approval stage back. The payload has the stage and the comments.
+    ("card.sent_back", 12),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

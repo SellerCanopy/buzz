@@ -97,6 +97,13 @@ pub struct RunStep {
     /// while no attempt has failed.
     #[serde(default)]
     pub failure: String,
+    /// The comments a person sent the card back with from an approval stage, which this stage
+    /// gets with its task. Empty when the card did not come back to it.
+    #[serde(default)]
+    pub sendback: String,
+    /// Answers a person has given the stage's agent while the run waited at the stage.
+    #[serde(default)]
+    pub answers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

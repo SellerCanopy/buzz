@@ -22,8 +22,11 @@ use super::repeat::{
     agent_done_decision, is_agent_done, or_default, repeat_decision, RepeatState, RepeatStep,
     DEFAULT_MAX_ROUNDS, DEFAULT_STALL_AFTER,
 };
+use crate::domain::inbox::InboxKind;
 use crate::domain::run::{Run, RunState, RunStep};
-use crate::domain::workflow::{Stage, KIND_PROMPT, RESULT_PASSED};
+use crate::domain::workflow::{
+    Stage, KIND_APPROVAL, KIND_PROMPT, RESULT_NEEDS_INPUT, RESULT_NEEDS_WORK, RESULT_PASSED,
+};
 use crate::ports::store::Pubkey;
 use crate::workflow::load::Package;
 use crate::workflow::routes::ROUTE_ASK;
@@ -69,6 +72,26 @@ pub enum Input {
     RetryNow { stage: String },
     /// A person or an agent stops the run. `reason` says who and why.
     Cancel { reason: String },
+    /// A person approves the approval stage the run waits at. `artifacts` are the versions
+    /// they approved, which the orchestrator read in the same transaction.
+    Approve { artifacts: Vec<Approved> },
+    /// A person sends the approval stage back with `reason`. The stage the card goes to gets
+    /// the reason with its task.
+    Reject { reason: String },
+    /// The stage's agent asks a person a question and waits for the reply, without leaving the
+    /// stage.
+    Ask { stage: String, question: String },
+    /// A person answers the stage's agent while the run waits at a stage that has a thread:
+    /// the reply to a question, or, with no text, a request to carry on after a timeout or a
+    /// missing output. The stage runs again.
+    Answer { text: String },
+}
+
+/// One artifact version a person approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approved {
+    pub name: String,
+    pub version: u32,
 }
 
 /// What the reducer needs to know that is not in the run or the workflow.
@@ -128,6 +151,8 @@ pub enum Note {
     Retry { reason: String, attempt: u32 },
     /// The run was stopped, and the stage's agent should stop work.
     Stopped { reason: String },
+    /// A person answered. With no text, the stage's agent is asked to carry on.
+    Answer { text: String },
 }
 
 /// What the orchestrator does after a step.
@@ -168,6 +193,16 @@ pub enum Effect {
     ArmTimeout { stage: String, after: Duration },
     /// Runs the stage again in `after`.
     ArmRetry { stage: String, after: Duration },
+    /// Opens a Needs you item for the run, which waits for a person. The orchestrator writes it
+    /// in the transaction that saves the run, and closes it when the run moves on.
+    OpenInbox {
+        stage: String,
+        visit: u32,
+        kind: InboxKind,
+        reason: String,
+        /// The artifacts an approval lists, by name.
+        artifacts: Vec<String>,
+    },
     /// An event for the log.
     Emit {
         kind: &'static str,
@@ -237,6 +272,16 @@ pub fn retry_key(card: Uuid, stage: &str, visit: u32, attempt: u32) -> String {
 /// The outbox key of the note that tells a stopped stage's agent to stop.
 pub fn stop_key(card: Uuid, stage: &str, visit: u32) -> String {
     format!("{}:stop", task_key(card, stage, visit))
+}
+
+/// The outbox key of the reply that carries the `n`th answer a person gave a stage's agent.
+pub fn answer_key(card: Uuid, stage: &str, visit: u32, n: u32) -> String {
+    format!("{}:answer:{n}", task_key(card, stage, visit))
+}
+
+/// The outbox key of the status line that says a stage waits for approval.
+pub fn gate_key(card: Uuid, stage: &str, visit: u32) -> String {
+    format!("{}:gate", task_key(card, stage, visit))
 }
 
 /// The outbox key of the status line that says a stage failed for good.
@@ -322,6 +367,10 @@ pub fn step(run: &Run, wf: &Package, facts: &Facts, input: Input) -> Step {
         Input::TimedOut { stage } => timed_out(run, wf, facts, &stage),
         Input::RetryNow { stage } => retry_now(run, wf, facts, &stage),
         Input::Cancel { reason } => cancel(run, wf, facts, &reason),
+        Input::Approve { artifacts } => approve(run, wf, facts, &artifacts),
+        Input::Reject { reason } => reject(run, wf, facts, &reason),
+        Input::Answer { text } => answer(run, wf, facts, &text),
+        Input::Ask { stage, question } => ask(run, wf, facts, &stage, &question),
     }
 }
 
@@ -359,6 +408,8 @@ struct Walk<'a> {
     ended: Option<Ended>,
     reason: Option<String>,
     hops: u32,
+    /// Comments a person sent the card back with. The next stage the walk enters keeps them.
+    sendback: Option<String>,
 }
 
 impl<'a> Walk<'a> {
@@ -384,6 +435,7 @@ impl<'a> Walk<'a> {
             ended: None,
             reason: None,
             hops: 0,
+            sendback: None,
         }
     }
 
@@ -413,11 +465,18 @@ impl<'a> Walk<'a> {
 
     /// The run waits for a person, who answers by skipping the stage or moving the card.
     fn wait(&mut self, reason: String) {
-        self.wait_for(reason, json!({}));
+        self.wait_for(InboxKind::Route, reason, json!({}), Vec::new());
     }
 
-    /// Like [`Self::wait`], with more fields in the `run.waiting` payload.
-    fn wait_for(&mut self, reason: String, extra: serde_json::Value) {
+    /// The run waits for a person, and a Needs you item of `kind` says why. `extra` adds fields
+    /// to the `run.waiting` payload.
+    fn wait_for(
+        &mut self,
+        kind: InboxKind,
+        reason: String,
+        extra: serde_json::Value,
+        artifacts: Vec<String>,
+    ) {
         self.run.state = RunState::Waiting;
         let mut payload =
             json!({ "stage": self.run.current_stage, "visit": self.run.visit, "reason": reason });
@@ -425,7 +484,22 @@ impl<'a> Walk<'a> {
             fields.extend(extra.clone());
         }
         self.emit("run.waiting", payload);
+        self.open_inbox(kind, reason.clone(), artifacts);
         self.reason = Some(reason);
+    }
+
+    /// Asks for a Needs you item at the stage the run is at.
+    fn open_inbox(&mut self, kind: InboxKind, reason: String, artifacts: Vec<String>) {
+        let Some(stage) = self.run.current_stage.clone() else {
+            return;
+        };
+        self.effects.push(Effect::OpenInbox {
+            stage,
+            visit: self.run.visit,
+            kind,
+            reason,
+            artifacts,
+        });
     }
 
     /// The next visit to `stage`: one past the highest the card has made.
@@ -481,10 +555,28 @@ impl<'a> Walk<'a> {
         match route {
             Route::Done => self.end(Ended::Done),
             Route::Stop => self.end(Ended::Stopped),
-            Route::Ask => self.wait(format!(
-                "{} {said}: choose where the card goes",
-                title(stage)
-            )),
+            Route::Ask => {
+                let asked = self
+                    .run
+                    .steps
+                    .last()
+                    .filter(|step| step.stage == stage.id && step.result == RESULT_NEEDS_INPUT)
+                    .map(|step| step.summary.clone());
+                match asked {
+                    Some(question) => {
+                        let reason = if question.trim().is_empty() {
+                            format!("{} needs input", title(stage))
+                        } else {
+                            format!("{} needs input: {}", title(stage), question.trim())
+                        };
+                        self.wait_for(InboxKind::Question, reason, json!({}), Vec::new());
+                    }
+                    None => self.wait(format!(
+                        "{} {said}: choose where the card goes",
+                        title(stage)
+                    )),
+                }
+            }
             Route::Stage(ref to) | Route::Call { ref to, .. } => {
                 let Some(to_idx) = stages.iter().position(|s| s.id == *to) else {
                     self.wait(format!(
@@ -556,6 +648,7 @@ impl<'a> Walk<'a> {
             round: 1,
             then,
             held,
+            sendback: self.sendback.take().unwrap_or_default(),
             ..RunStep::default()
         });
         if held {
@@ -595,9 +688,13 @@ impl<'a> Walk<'a> {
             self.route(idx, Route::from_target(target), &said, false);
             return;
         }
+        if stage.kind == KIND_APPROVAL {
+            self.gate(idx);
+            return;
+        }
         if stage.kind != KIND_PROMPT {
             self.wait(format!(
-                "{} is a {} stage, and only prompt stages run so far; skip it to carry on",
+                "{} is a {} stage, and only prompt and approval stages run so far; skip it to carry on",
                 title(stage),
                 stage.kind
             ));
@@ -623,6 +720,30 @@ impl<'a> Walk<'a> {
             round: None,
         });
         self.arm_timeout(idx);
+    }
+
+    /// The run waits at the approval stage at `idx` until a person approves or sends it back.
+    fn gate(&mut self, idx: usize) {
+        let stage = &self.stages()[idx];
+        let artifacts = stage
+            .approval
+            .as_ref()
+            .map(|a| a.artifacts.clone())
+            .unwrap_or_default();
+        let listed = artifacts.join(", ");
+        let card = self.run.card_id;
+        let visit = self.run.visit;
+        self.effects.push(Effect::PostStatus {
+            card,
+            key: gate_key(card, &stage.id, visit),
+            text: format!("waiting for approval of: {listed}."),
+        });
+        self.wait_for(
+            InboxKind::Approval,
+            format!("{} waits for approval of {listed}", title(stage)),
+            json!({ "condition": CONDITION_APPROVAL, "artifacts": artifacts }),
+            artifacts,
+        );
     }
 
     /// What a repeat stage does after a round that reported `result`.
@@ -868,15 +989,22 @@ fn missing_output(
         missing.join(", ")
     );
     walk.wait_for(
+        InboxKind::MissingOutput,
         reason,
         json!({ "condition": CONDITION_MISSING_OUTPUT, "missing": missing }),
+        Vec::new(),
     );
     walk.finish()
 }
 
 /// The condition a `run.waiting` event names when a stage passed without a required output.
-/// Phase 12 opens a Needs you item of this kind.
 pub const CONDITION_MISSING_OUTPUT: &str = "missing_output";
+/// The condition a `run.waiting` event names when an approval stage waits for a person.
+pub const CONDITION_APPROVAL: &str = "approval";
+/// The condition a `run.waiting` event names when a stage's agent asks a person a question.
+pub const CONDITION_QUESTION: &str = "question";
+/// The condition a `run.waiting` event names when a stage's time ran out with no result.
+pub const CONDITION_NO_RESULT: &str = "no_result";
 
 /// Moves a waiting or held card on as if its stage had passed.
 fn skip(run: &Run, wf: &Package, facts: &Facts) -> Step {
@@ -999,6 +1127,11 @@ fn stage_failed(run: &Run, wf: &Package, facts: &Facts, stage: &str, reason: &st
             let name = title(def).to_owned();
             walk.current().failure = reason.to_owned();
             walk.end_for(Ended::Failed, Some(reason));
+            walk.open_inbox(
+                InboxKind::Failure,
+                format!("{name} failed: {reason}"),
+                Vec::new(),
+            );
             walk.effects.push(Effect::PostStatus {
                 card,
                 key: failed_key(card, stage, visit),
@@ -1009,17 +1142,32 @@ fn stage_failed(run: &Run, wf: &Package, facts: &Facts, stage: &str, reason: &st
     walk.finish()
 }
 
-/// The stage's timeout came due, so the attempt failed.
+/// The stage's timeout came due. A stage with retries fails the attempt, and the run fails once
+/// they are used up. A stage with none asks a person: its agent never reported, so nothing has
+/// said the work failed, and the person may ask the agent to carry on, skip the stage or stop
+/// the run.
 fn timed_out(run: &Run, wf: &Package, facts: &Facts, stage: &str) -> Step {
     let Some((def, _)) = running_at(run, wf, stage) else {
         return Step::unchanged(run);
     };
+    let exec = facts.execution(stage);
     let reason = format!(
         "{} timed out after {}",
         title(def),
-        say_duration(facts.execution(stage).timeout)
+        say_duration(exec.timeout)
     );
-    stage_failed(run, wf, facts, stage, &reason)
+    if exec.retries > 0 {
+        return stage_failed(run, wf, facts, stage, &reason);
+    }
+    let mut walk = Walk::new(run, wf, facts);
+    walk.current().failure = reason.clone();
+    walk.wait_for(
+        InboxKind::NoResult,
+        format!("{reason} without reporting a result"),
+        json!({ "condition": CONDITION_NO_RESULT }),
+        Vec::new(),
+    );
+    walk.finish()
 }
 
 /// A retry's wait is over. The stage's agent hears why the last attempt failed, in the thread
@@ -1043,6 +1191,117 @@ fn retry_now(run: &Run, wf: &Package, facts: &Facts, stage: &str) -> Step {
         note: Note::Retry {
             reason: step.failure,
             attempt: step.attempts,
+        },
+    });
+    walk.arm_timeout(idx);
+    walk.finish()
+}
+
+/// The approval stage a run waits at, and its index, while no one has decided it.
+fn awaiting_approval<'a>(run: &Run, wf: &'a Package) -> Option<(&'a Stage, usize)> {
+    if run.state != RunState::Waiting {
+        return None;
+    }
+    let (def, idx) = wf.stage(run.current_stage.as_deref()?)?;
+    let undecided = run.steps.last().is_some_and(|step| step.result.is_empty());
+    (def.kind == KIND_APPROVAL && undecided).then_some((def, idx))
+}
+
+/// A person approves: the card moves on as if the stage had passed.
+fn approve(run: &Run, wf: &Package, facts: &Facts, artifacts: &[Approved]) -> Step {
+    let Some((def, idx)) = awaiting_approval(run, wf) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    let listed: Vec<serde_json::Value> = artifacts
+        .iter()
+        .map(|a| json!({ "name": a.name, "version": a.version }))
+        .collect();
+    walk.emit(
+        "approval.recorded",
+        json!({ "stage": def.id, "visit": run.visit, "artifacts": listed }),
+    );
+    let names: Vec<String> = artifacts
+        .iter()
+        .map(|a| format!("{} v{}", a.name, a.version))
+        .collect();
+    let step = walk.current();
+    step.result = RESULT_PASSED.to_owned();
+    step.summary = format!("approved {}", names.join(", "));
+    walk.follow_result(idx, RESULT_PASSED);
+    walk.finish()
+}
+
+/// A person sends the approval stage back. The stage the card goes to is told why.
+fn reject(run: &Run, wf: &Package, facts: &Facts, reason: &str) -> Step {
+    let Some((def, idx)) = awaiting_approval(run, wf) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    walk.emit(
+        "card.sent_back",
+        json!({ "stage": def.id, "visit": run.visit, "comments": reason }),
+    );
+    let step = walk.current();
+    step.result = RESULT_NEEDS_WORK.to_owned();
+    step.summary = reason.to_owned();
+    walk.sendback = Some(reason.to_owned());
+    walk.follow_result(idx, RESULT_NEEDS_WORK);
+    walk.finish()
+}
+
+/// The stage's agent asks a person a question. The run waits, with no timeout, until the
+/// question is answered.
+fn ask(run: &Run, wf: &Package, facts: &Facts, stage: &str, question: &str) -> Step {
+    let Some((def, _)) = running_at(run, wf, stage) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    walk.current().summary = question.to_owned();
+    walk.wait_for(
+        InboxKind::Question,
+        format!("{} asks: {}", title(def), question.trim()),
+        json!({ "condition": CONDITION_QUESTION }),
+        Vec::new(),
+    );
+    walk.finish()
+}
+
+/// A person answers the agent of the stage the run waits at. The stage runs again in the thread
+/// it has, with a new timeout and a fresh count of attempts.
+fn answer(run: &Run, wf: &Package, facts: &Facts, text: &str) -> Step {
+    let Some((def, idx)) = run
+        .current_stage
+        .as_deref()
+        .and_then(|id| wf.stage(id))
+        .filter(|(def, _)| run.state == RunState::Waiting && def.kind == KIND_PROMPT)
+    else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    if walk.current().held {
+        return Step::unchanged(run);
+    }
+    walk.emit(
+        "run.resumed",
+        json!({ "stage": def.id, "visit": run.visit, "answered": !text.is_empty() }),
+    );
+    walk.run.state = RunState::Running;
+    let step = walk.current();
+    step.result.clear();
+    step.attempts = 0;
+    step.failure.clear();
+    step.answers += 1;
+    let (n, visit) = (step.answers, step.visit);
+    let card = run.card_id;
+    walk.effects.push(Effect::PostReply {
+        card,
+        stage: def.id.clone(),
+        visit,
+        agent: def.agent.clone().unwrap_or_default(),
+        key: answer_key(card, &def.id, visit, n),
+        note: Note::Answer {
+            text: text.to_owned(),
         },
     });
     walk.arm_timeout(idx);

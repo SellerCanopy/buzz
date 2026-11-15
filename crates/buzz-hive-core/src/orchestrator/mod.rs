@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod cards;
+pub mod inbox;
 mod lookup;
 pub mod outbox;
 mod routes;
@@ -13,6 +14,7 @@ pub mod run;
 pub mod settings;
 pub mod task_message;
 pub mod timers;
+pub mod usage;
 pub mod workflows;
 
 use crate::domain::events::Actor;

@@ -101,8 +101,8 @@ spec's title and are confirmed when that phase starts.
 | item (`app/e2e/<name>.spec.ts`) | decision | phase |
 |---|---|---|
 | `actions` | pending | 11 |
-| `activity` | pending | 12 |
-| `answers` | pending | 12 |
+| `activity` | changed (Phase 12: a card's Activity tab lists what happened on it, newest first, and an answer shows who gave it and the reason; `buzz-hive-api/tests/inbox.rs`, buzz-app `ActivityTab.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. An answer is an `activity.added` event, not a `hive.activity` table) | 12 |
+| `answers` | changed (Phase 12 answers an approval with Approve or Reject and a reason, a `needs_input` result with a reply, and the other items with retry, skip, stop or dismiss, in `tests/inbox.rs`, `buzz-hive-api/tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`. The Go spec's permission requests and its field and multi-question forms are not ported: `AnswerInbox` refuses `values_json` and `answers`) | 12 |
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
 | `artifacts` | changed (Phase 9 ports the contract: save, versions, read, hand-off, the stage-declared outputs rule and the task message naming inputs, in `tests/artifacts.rs` and `buzz-hive-api/tests/artifacts.rs`. The Go spec's approval and image-review screens are not ported; buzz-app `e2e` carries the Files tab) | 9 |
 | `assistant` | pending | 20 |
@@ -112,7 +112,7 @@ spec's title and are confirmed when that phase starts.
 | `browse` | pending (the Go spec browses GitHub issues, which needs intake) | 16 |
 | `builder-run` | pending | 19 |
 | `builder` | pending | 19 |
-| `calls` | pending (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents; Phase 9 did not port it, so it stays here; the spec's inbox and screens are Phase 12) | 12 |
+| `calls` | changed (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents; Phase 12 opens a Needs you item for a route that asks, with skip and stop) | 12 |
 | `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
@@ -125,10 +125,10 @@ spec's title and are confirmed when that phase starts.
 | `list` | pending (the Go spec drives a List layout of the board; no phase in the plan builds one, so it needs an owner) | unassigned |
 | `login` | dropped (team login and cookie session) | 1 |
 | `merge` | pending | 18 |
-| `needs-you` | pending | 12 |
+| `needs-you` | changed (Phase 12: the Needs you view lists open items with the card, the stage and a button per answer, and its tab counts them live; buzz-app `NeedsYou.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. A gate an agent opens is answered end to end in `buzz-hive/tests/e2e_approval.rs`, which needs a relay. Resolved items are not listed) | 12 |
 | `newtask` | pending | 16 |
 | `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is Phase 16) | 16 |
-| `paused-turn` | pending (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; the reply that finishes it is the Needs you item, Phase 12) | 12 |
+| `paused-turn` | changed (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; Phase 12 opens the Needs you item that a reply finishes, in `tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`) | 12 |
 | `permissions` | pending | 14 |
 | `pick-repo` | pending | 21 |
 | `plugin-command` | dropped (plugins) | 1 |
@@ -149,7 +149,7 @@ spec's title and are confirmed when that phase starts.
 | `stack-seed` | pending | 16 |
 | `start` | ported (Phase 6: an idle card with a workflow sits in To do, Start run posts the status and the first stage task, the card moves to Running; the third Go test, opening the Issue tab, waits for the card's later tabs) | 6 |
 | `testrun` | dropped (`StartTestRun`) | 1 |
-| `usage` | pending | 12 |
+| `usage` | changed (the Go spec checks the Dynatrace report. Phase 12 replaces it with the Usage view: runs, how long they took, and per week the cards and runs that agents started, with no token or cost figure; buzz-app `UsagePage.test.tsx`, `beehive.journey.mjs`, `e2e/needs-you.spec.mjs` and `buzz-hive-api/tests/inbox.rs`) | 12 |
 | `web` | dropped (token screen, sign-in modes) | 1 |
 | `workflow-options` | pending | 19 |
 
@@ -319,3 +319,38 @@ spec's title and are confirmed when that phase starts.
 - Tests: core `tests/artifacts.rs`, api `tests/artifacts.rs`, store
   `tests/postgres_artifacts.rs`, `buzz-hive/tests/e2e_files.rs` (needs a relay with
   `BUZZ_MEDIA_READ_MODE=enforce`, a private channel and the community host of the relay).
+
+## Phase 12 deliverables
+
+- Migration `0011_inbox.sql`: `hive.inbox` (kind, stage, visit, title, detail, who and when
+  it was resolved, and the answer). The plan's `hive.activity` table is not created: an
+  answer is an `activity.added` event of type `answer`, so the Activity tab has one source.
+  The plan's `relay_cursor` and `seen_events` tables are not created either, see below.
+- No relay listener (plan question 3, resolved by the human): gates and questions are
+  answered by buttons and tools only. There is no `relay_listener.rs`, so a reply typed in a
+  stage thread is not read.
+- Core: `domain/inbox.rs` (kinds and the answers each takes), `domain/usage.rs`,
+  `orchestrator/inbox.rs` (list, answer, approve, send back, ask, send message) and
+  `orchestrator/usage.rs`. There is no `kinds/approval.rs`; approval is a state of the
+  reducer (`rules/run.rs`), as the other stage kinds are.
+- Items: an approval stage (approve or reject), a `needs_input` result (reply, skip, stop), a
+  route that asks (skip, stop), a stage with no reported result when its time ran out
+  (retry, skip, stop), a missing output (retry, skip, stop) and a run that failed for good
+  (retry, dismiss). Moving the run by any other route resolves its open items as
+  `superseded`.
+- A time-out opens a "no result" item only for a stage with no retries. A stage with
+  retries keeps the Phase 11 behavior (retry, then fail), so a failed run stays reachable.
+- Approve records the latest version of each listed artifact and the card moves on. Reject
+  and SendBack need a reason, move the card on `needs_work`, and the next task of the stage
+  carries the reason. Only a person (not an agent) may answer, approve or send back.
+- Agents: `ask_gate` and `approve_gate` are tools at Run level. `approve_gate` is open to any
+  agent with Run until Phase 13 decides who may approve.
+- API: `ListInbox` and `GetUsage` at Read; `AnswerInbox`, `Approve`, `SendBack`,
+  `SendMessage` and `AskGate` at Run; `ListActivity` and `GetFullPayload` at Read.
+  `GetFullPayload` takes the event's seq as `full_ref`, because events are never cut.
+  The `inbox.proto` ids changed to string UUIDs. `AskGate` and `GetUsage` are new rpcs.
+- Usage counts what agents did: runs, how long they took, and per week the cards created
+  and the runs started by agents (counted from `hive.events` where the actor is an agent).
+  There is no token or cost field.
+- Tests: core `tests/inbox.rs`, api `tests/inbox.rs`, store `tests/postgres_inbox.rs` and
+  `buzz-hive/tests/e2e_approval.rs` (needs a local relay).

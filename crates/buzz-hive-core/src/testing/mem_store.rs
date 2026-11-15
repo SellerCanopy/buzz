@@ -5,14 +5,16 @@ use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
+use crate::domain::inbox::InboxItem;
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, Pubkey,
-    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
-    WorkflowsRepo,
+    CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
+    Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
+    UsageRepo, WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -35,6 +37,8 @@ struct State {
     /// Each artifact with its handoff flag, and its versions in save order.
     artifacts: Vec<MemArtifact>,
     timers: Vec<(CommunityId, MemTimer)>,
+    /// In the order opened.
+    inbox: Vec<(CommunityId, InboxItem)>,
 }
 
 #[derive(Clone)]
@@ -154,6 +158,12 @@ impl Tx for MemTx {
         self
     }
     fn timers(&mut self) -> &mut dyn TimersRepo {
+        self
+    }
+    fn inbox(&mut self) -> &mut dyn InboxRepo {
+        self
+    }
+    fn usage(&mut self) -> &mut dyn UsageRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -774,6 +784,9 @@ impl CardsRepo for MemTx {
         self.work
             .artifacts
             .retain(|a| !(a.community == community && a.card == id));
+        self.work
+            .inbox
+            .retain(|(c, i)| !(*c == community && i.card_id == id));
         Ok(())
     }
 }
@@ -952,6 +965,144 @@ impl TimersRepo for MemTx {
             .map(|(_, t)| t.fire_at)
             .min()
             .map(|at| (at - now).to_std().unwrap_or_default()))
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageRepo for MemTx {
+    async fn usage(&mut self, weeks: u32) -> Result<Usage, StoreError> {
+        let community = self.community;
+        let mut runs = 0u32;
+        let mut ended = Vec::new();
+        for (c, run) in &self.work.runs {
+            if *c == community {
+                runs += 1;
+                if let Some(end) = run.ended_at {
+                    ended.push((end - run.started_at).num_seconds().max(0) as u64);
+                }
+            }
+        }
+        // Events are stamped with the wall clock, so the weeks are the wall clock's.
+        let this_week = week_start(chrono::Utc::now().date_naive());
+        let mut rows: Vec<UsageWeek> = (0..weeks)
+            .rev()
+            .map(|back| UsageWeek {
+                starts: this_week - chrono::Duration::weeks(i64::from(back)),
+                cards_created_by_agents: 0,
+                runs_started_by_agents: 0,
+            })
+            .collect();
+        let log = self.log.lock().unwrap();
+        for (c, event) in &log.events {
+            if *c != community || event.actor.kind != ActorKind::Agent {
+                continue;
+            }
+            let starts = week_start(event.at.date_naive());
+            if let Some(row) = rows.iter_mut().find(|row| row.starts == starts) {
+                match event.kind.as_str() {
+                    "card.created" => row.cards_created_by_agents += 1,
+                    "run.started" => row.runs_started_by_agents += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(Usage {
+            runs,
+            ended_runs: ended.len() as u32,
+            average_run_seconds: ended
+                .iter()
+                .sum::<u64>()
+                .checked_div(ended.len() as u64)
+                .unwrap_or(0),
+            longest_run_seconds: ended.iter().copied().max().unwrap_or(0),
+            weeks: rows,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl InboxRepo for MemTx {
+    async fn insert(&mut self, item: &InboxItem) -> Result<(), StoreError> {
+        self.work.inbox.push((self.community, item.clone()));
+        Ok(())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<InboxItem>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .inbox
+            .iter()
+            .find(|(c, i)| *c == community && i.id == id)
+            .map(|(_, i)| i.clone()))
+    }
+
+    async fn list(
+        &mut self,
+        card: Option<uuid::Uuid>,
+        include_resolved: bool,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let community = self.community;
+        let mut items: Vec<InboxItem> = self
+            .work
+            .inbox
+            .iter()
+            .filter(|(c, i)| {
+                *c == community
+                    && card.is_none_or(|id| i.card_id == id)
+                    && (include_resolved || i.is_open())
+            })
+            .map(|(_, i)| i.clone())
+            .collect();
+        // Open first, then newest first.
+        items.sort_by(|a, b| {
+            b.is_open()
+                .cmp(&a.is_open())
+                .then(b.opened_at.cmp(&a.opened_at))
+        });
+        Ok(items)
+    }
+
+    async fn resolve(
+        &mut self,
+        id: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<bool, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let Some((_, item)) = self
+            .work
+            .inbox
+            .iter_mut()
+            .find(|(c, i)| *c == community && i.id == id && i.is_open())
+        else {
+            return Ok(false);
+        };
+        item.resolved_at = Some(now);
+        item.resolved_by = Some(by.to_owned());
+        item.answer = Some(answer.to_owned());
+        Ok(true)
+    }
+
+    async fn resolve_card(
+        &mut self,
+        card: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let mut resolved = Vec::new();
+        for (c, item) in &mut self.work.inbox {
+            if *c == community && item.card_id == card && item.is_open() {
+                item.resolved_at = Some(now);
+                item.resolved_by = Some(by.to_owned());
+                item.answer = Some(answer.to_owned());
+                resolved.push(item.clone());
+            }
+        }
+        Ok(resolved)
     }
 }
 

@@ -4,6 +4,7 @@ use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
+use crate::domain::inbox::InboxItem;
 use crate::domain::run::Run;
 use crate::domain::timer::{Timer, TimerKind};
 use crate::workflow::options::WorkflowOptions;
@@ -56,6 +57,8 @@ pub trait Tx: Send {
     fn outbox(&mut self) -> &mut dyn OutboxRepo;
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo;
     fn timers(&mut self) -> &mut dyn TimersRepo;
+    fn inbox(&mut self) -> &mut dyn InboxRepo;
+    fn usage(&mut self) -> &mut dyn UsageRepo;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -290,6 +293,41 @@ pub trait TimersRepo: Send {
     /// How long until the soonest timer is due: zero for one already overdue, `None` when
     /// there are no timers.
     async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError>;
+}
+
+/// The Needs you items: the places a run waits for a person.
+#[async_trait::async_trait]
+pub trait InboxRepo: Send {
+    async fn insert(&mut self, item: &InboxItem) -> Result<(), StoreError>;
+    /// The item. Every change to an item happens while its card is held, so a caller that
+    /// holds the card reads a settled item.
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<InboxItem>, StoreError>;
+    /// Items of one card, or of every card when `card` is `None`, open ones first and each
+    /// group newest first. Resolved items are left out unless `include_resolved`.
+    async fn list(
+        &mut self,
+        card: Option<uuid::Uuid>,
+        include_resolved: bool,
+    ) -> Result<Vec<InboxItem>, StoreError>;
+    /// Resolves an open item with `answer`, by `by`. `false` when it was already resolved.
+    async fn resolve(&mut self, id: uuid::Uuid, answer: &str, by: &str)
+        -> Result<bool, StoreError>;
+    /// Resolves every open item of the card, and returns them as resolved.
+    async fn resolve_card(
+        &mut self,
+        card: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<Vec<InboxItem>, StoreError>;
+}
+
+/// What the Usage page counts, read in one snapshot.
+#[async_trait::async_trait]
+pub trait UsageRepo: Send {
+    /// The community's runs and durations, and the last `weeks` weeks of what agents started,
+    /// counted from the event log by the actor of each event. The weeks are the database's
+    /// own, the current one last.
+    async fn usage(&mut self, weeks: u32) -> Result<crate::domain::usage::Usage, StoreError>;
 }
 
 /// The relay thread a stage task opened. Its root is the message that mentions the agent.
