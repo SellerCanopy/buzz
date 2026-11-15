@@ -239,6 +239,8 @@ async fn a_started_run_posts_the_status_and_the_task_and_the_relay_returns_both(
             bus: app.bus.clone(),
             community,
             hive: app.hive_pubkey.clone(),
+            catalog: app.catalog.clone(),
+            code_host: None,
             wake: app.outbox.clone(),
         };
         let task = tokio::spawn(drain.run(stopped));

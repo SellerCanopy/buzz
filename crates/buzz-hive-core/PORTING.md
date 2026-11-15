@@ -34,6 +34,8 @@ never edited. Phase numbers refer to the Beehive plan.
 | `core/openspec` | kept, not dropped: the built-in `openspec` package calls `check_openspec`. Phase 5 ports the action's argument checks (`workflow/actions.rs`) and ships the package with its `NOTICE` and `LICENSE-OpenSpec`. The document validator runs inside the action, so it ports with the action runner in Phase 18 | 18 |
 | `core/issuefiles` | dropped (the Go package copies an issue's attached images into the card's folder; a card has no folder here and the Issue tab shows the issue's own text. Phase 16 does not fetch or store issue attachments) | 16 |
 | `core/config` | ported | 6 |
+| `worktrees` table and the `worktree.prepared` event | dropped (Phase 17: a card has no folder on the engine's disk. The card branch is `buzz/<8 hex of the card id>-<title slug>`, built by `card_branch`, and each stage agent clones or fetches it itself. The `worktree` stage template does that as a first stage) | 17 |
+| `cleanup_worktree` action | changed (Phase 17: passes at once and records a passed result, since the engine holds nothing to clean up; an existing workflow that lists it keeps working) | 17 |
 
 ## Go test directories
 
@@ -46,7 +48,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `adapters/actions` | 1 | pending | 18 |
 | `adapters/artifacts/local` | 2 | changed (documents live in the `hive.artifacts` tables of the relay's Postgres and a file is a pointer to a media-store blob, so there is no folder adapter; `postgres_artifacts.rs` and `tests/artifacts.rs` carry the contract) | 9 |
 | `adapters/downloadmark` | 3 | pending | unassigned |
-| `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. The Go pull-request calls stay Phase 17. `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
+| `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. Phase 17 adds `open_pull_request` (finds an open pull request for the head first, then `POST /repos/{o}/{r}/pulls` with `draft`). `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
 | `adapters/gitwork` | 5 | dropped | 1 |
 | `adapters/keyring` | 1 | dropped | 23 |
 | `adapters/localrepo` | 2 | dropped (scratch folders) | 1 |
@@ -77,7 +79,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `core/openspec` | 1 | kept, not dropped (see Features): the validator ports with the action runner | 18 |
 | `core/orchestrator` | 56 | pending | unassigned |
 | `core/pricing` | 1 | dropped | 1 |
-| `core/pullrequests` | 2 | pending | 17 |
+| `core/pullrequests` | 2 | changed (Phase 17: the `open_pull_request` action stage in `orchestrator/pull_request.rs`, `hive.pull_requests` and `GetCard.pull_request`; tests `pull_request_action.rs` and `postgres_pull_requests.rs`. The Go merge and close tracking is not ported) | 17 |
 | `core/redact` | 1 | pending | unassigned |
 | `core/rules` | 21 | pending | unassigned |
 | `core/session` | 18 | pending | unassigned |
@@ -510,3 +512,50 @@ spec's title and are confirmed when that phase starts.
   `tests/postgres_intake.rs`; api `tests/intake.rs`; binary `tests/github_adapter.rs`,
   `tests/intake_loop.rs` (paused time) and `tests/intake_replay.rs` (real adapter, loops and routes
   against the replay server, with a restart). Real GitHub is not exercised.
+
+## Phase 17 deliverables
+
+- `kind: action` stages run. `open_pull_request` queues one outbox row of kind `pull_request` in
+  the transaction that enters the stage. The drain asks `CodeHost::open_pull_request` for it and
+  the stage then reports `passed` (the pull request is stored in `hive.pull_requests`, migration
+  `0014`, one row per card) or `failed` with the host's reason, through the same reducer step as
+  an agent's `stage_done`. An action stage has no agent, no stage thread and no timeout.
+  `cleanup_worktree` passes at once. Any other action waits with "does not run yet; skip it".
+- Arguments (`with`): `title` (the card title when empty), `body` or `body_artifact` (the latest
+  text of that artifact; one that is missing or is a file is a `FailedPrecondition` when the
+  stage is entered, where Go failed the stage), `base` (the repo's default branch when empty,
+  checked as a branch name), and `draft` (on unless it renders as `false`). The body ends with
+  `Closes #N` when the card's issue is in the same repo. Head is the card branch.
+- The outbox key is `task_key(card, stage, visit)`, not the plan's per-card `kiln:{card}:pr`: a
+  card that comes back to the stage (`fix_ci` to `pull_request`) is a new visit with its own call,
+  and a per-card key would swallow it and leave the stage waiting. The key given to the host is
+  the same row key.
+- Retries: a rate limit or an unreachable host leaves the row failed and backed off by the
+  drain's per-card backoff (the host's `retry_after` is not read), so a fleet restart makes at most
+  one call per card per pass. A refusal (`Unauthorized`, `NotFound`, `Rejected`, no `GH_TOKEN`)
+  fails the stage at once. A run that was stopped or moved on drops the call. A repeated call
+  finds the pull request already open for the head, so one stage opens one pull request.
+- `HostError::Rejected` is new, for a 422 (a branch that was never pushed, no commits between
+  the branches). `CodeHost::open_pull_request` takes a `NewPullRequest`.
+- Code stages: a prompt stage whose workspace is not `none`, on a card with an issue, ends its
+  task message with the instruction to commit and push `{{branch}}` before `stage_done`. The
+  `worktree` template is an editable first stage that fetches or creates and pushes the branch.
+  `implement` fetches the branch, commits and pushes, and does not open the pull request.
+- `Card.branch` (field 27) is new on the wire, set by `GetCard` for a card with an issue, and
+  `Card.pull_request` (already in the proto) is filled for the Details tab.
+- A bug fixed on the way: stopping a run that sat at an action stage posted a "stopped" reply
+  for a thread that has no task. The reply is now skipped when the stage has no agent task.
+- Spike 10 (`buzz-hive/tests/branch_handoff.rs`): a bare git repo in a temp dir and three clones
+  with different `user.name` and `user.email`. The first clone makes the branch and pushes it, the
+  second fetches it from git alone, commits and pushes, and the first fast-forwards onto that
+  work; both authors are in the log. A clone that did not fetch first is refused on push, so the
+  `worktree` template fetches before it starts and the stage message tells the agent to commit and
+  push. The replay server then answers the pull request lookup, the default-branch lookup and the
+  `POST`, and the head it was asked for is the branch the clones used. It did not run against
+  GitHub. Untested: the real `GH_TOKEN` scopes (it needs repo write and pull request write), branch
+  protection and required checks on a pushed branch, and whether the agent image has a git identity
+  and credentials to push. A push that GitHub refuses is the agent's to report; the engine only
+  sees the pull request call fail with `Rejected` if the branch is missing.
+- Tests: core `tests/pull_request_action.rs` and the `card_branch` unit tests in `domain/card.rs`;
+  store `tests/postgres_pull_requests.rs`; binary `tests/github_adapter.rs` (draft body shape,
+  default base, existing pull request, a race, a 422) and `tests/branch_handoff.rs`.

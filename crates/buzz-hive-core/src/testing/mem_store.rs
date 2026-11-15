@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
-use crate::domain::card::Card;
+use crate::domain::card::{Card, PullRequest};
 use crate::domain::events::{check_new, Event};
 use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, StoredIssue};
@@ -14,9 +14,9 @@ use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
     CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog,
-    OutboxRepo, OutboxRow, PersonInfo, Posting, Pubkey, RelayEvent, RunsRepo, SettingsRepo,
-    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
-    MESSAGE_KINDS,
+    OutboxRepo, OutboxRow, PersonInfo, Posting, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo,
+    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
+    WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -44,6 +44,7 @@ struct State {
     /// In creation order.
     intake: Vec<(CommunityId, IntakeRule)>,
     issues: Vec<(CommunityId, StoredIssue)>,
+    pulls: std::collections::BTreeMap<(CommunityId, uuid::Uuid), PullRequest>,
 }
 
 #[derive(Clone)]
@@ -178,6 +179,9 @@ impl Tx for MemTx {
         self
     }
     fn issues(&mut self) -> &mut dyn IssuesRepo {
+        self
+    }
+    fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -837,6 +841,7 @@ impl CardsRepo for MemTx {
         self.work
             .inbox
             .retain(|(c, i)| !(*c == community && i.card_id == id));
+        self.work.pulls.remove(&(community, id));
         Ok(())
     }
 }
@@ -1425,6 +1430,27 @@ impl MemTx {
 
     fn missing_issue(repo: &RepoRef, number: u64) -> StoreError {
         StoreError::NotFound(format!("issue {repo}#{number} has not been read"))
+    }
+}
+
+#[async_trait::async_trait]
+impl PullRequestsRepo for MemTx {
+    async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError> {
+        let community = self.community;
+        if !self
+            .work
+            .cards
+            .iter()
+            .any(|(c, have)| *c == community && have.id == card)
+        {
+            return Err(StoreError::NotFound(format!("card {card}")));
+        }
+        self.work.pulls.insert((community, card), pull.clone());
+        Ok(())
+    }
+
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError> {
+        Ok(self.work.pulls.get(&(self.community, card)).cloned())
     }
 }
 

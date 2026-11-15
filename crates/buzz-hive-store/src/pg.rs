@@ -4,7 +4,7 @@ use buzz_hive_core::access::{ActorKind, Level};
 use buzz_hive_core::domain::artifact::{
     ArtifactContent, ArtifactInfo, ArtifactKind, ArtifactVersion,
 };
-use buzz_hive_core::domain::card::{Card, CardState};
+use buzz_hive_core::domain::card::{Card, CardState, PullRequest};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::domain::inbox::{InboxItem, InboxKind};
 use buzz_hive_core::domain::intake::{
@@ -15,9 +15,9 @@ use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo,
-    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
-    WorkflowsRepo,
+    InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
+    PullRequestsRepo, RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage,
+    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -101,6 +101,9 @@ impl Tx for PgTx {
         self
     }
     fn issues(&mut self) -> &mut dyn IssuesRepo {
+        self
+    }
+    fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -1873,6 +1876,56 @@ fn decode_issue(row: IssueRow) -> Result<StoredIssue, StoreError> {
 
 fn issue_number(number: u64) -> Result<i64, StoreError> {
     i64::try_from(number).map_err(|_| StoreError::Conflict(format!("issue number {number}")))
+}
+
+#[async_trait::async_trait]
+impl PullRequestsRepo for PgTx {
+    async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.pull_requests (community_id, card_id, repo, number, url, head, \
+             base, state, draft) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (community_id, card_id) DO UPDATE SET repo = EXCLUDED.repo, \
+             number = EXCLUDED.number, url = EXCLUDED.url, head = EXCLUDED.head, \
+             base = EXCLUDED.base, state = EXCLUDED.state, draft = EXCLUDED.draft, \
+             updated_at = now()",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(&pull.repo)
+        .bind(issue_number(pull.number)?)
+        .bind(&pull.url)
+        .bind(&pull.head)
+        .bind(&pull.base)
+        .bind(&pull.state)
+        .bind(pull.draft)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError> {
+        let row: Option<(String, i64, String, String, String, String, bool)> = sqlx::query_as(
+            "SELECT repo, number, url, head, base, state, draft FROM hive.pull_requests \
+             WHERE community_id = $1 AND card_id = $2",
+        )
+        .bind(self.community)
+        .bind(card)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(row.map(
+            |(repo, number, url, head, base, state, draft)| PullRequest {
+                repo,
+                number: number as u64,
+                url,
+                head,
+                base,
+                state,
+                draft,
+            },
+        ))
+    }
 }
 
 #[async_trait::async_trait]

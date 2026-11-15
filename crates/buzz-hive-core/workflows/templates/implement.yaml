@@ -10,4 +10,4 @@ prompt: |
 
   {{issue.body}}
 
-  Work on the branch {{branch}}. Run the repository's own checks, and fix what fails. Commit when the change is done and its tests pass. Do not push and do not open a pull request.
+  Work on the branch {{branch}}: fetch from origin first, because an earlier stage may have pushed to it, and check it out. Run the repository's own checks, and fix what fails. Commit when the change is done and its tests pass, and push the branch. Do not open a pull request: a later stage does.

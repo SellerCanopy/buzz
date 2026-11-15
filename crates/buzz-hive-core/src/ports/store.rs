@@ -2,7 +2,7 @@
 
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
-use crate::domain::card::Card;
+use crate::domain::card::{Card, PullRequest};
 use crate::domain::events::Event;
 use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, RepoRef, StoredIssue};
@@ -62,6 +62,7 @@ pub trait Tx: Send {
     fn usage(&mut self) -> &mut dyn UsageRepo;
     fn intake(&mut self) -> &mut dyn IntakeRepo;
     fn issues(&mut self) -> &mut dyn IssuesRepo;
+    fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -391,6 +392,21 @@ pub enum Posting {
         agent: Pubkey,
         text: String,
     },
+    /// A call to the code host that opens a pull request, for an `open_pull_request` stage.
+    /// The branch, the title and the body are fixed when the post is queued, like the text of
+    /// the others. The drain makes the call and reports the stage's result.
+    PullRequest {
+        stage: String,
+        visit: u32,
+        /// The repo as `owner/name`.
+        repo: String,
+        head: String,
+        /// Empty means the repo's default branch.
+        base: String,
+        title: String,
+        body: String,
+        draft: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -503,6 +519,14 @@ pub trait IssuesRepo: Send {
         number: u64,
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StoreError>;
+}
+
+/// The pull request each card opened.
+#[async_trait::async_trait]
+pub trait PullRequestsRepo: Send {
+    /// Records the card's pull request, replacing the one before it.
+    async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError>;
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError>;
 }
 
 /// A package the store holds versions of.

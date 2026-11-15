@@ -171,6 +171,8 @@ async fn scenario(
         bus: app.bus.clone(),
         community: world.community,
         hive: app.hive_pubkey.clone(),
+        catalog: app.catalog.clone(),
+        code_host: None,
         wake: app.outbox.clone(),
     };
     let drain_task = tokio::spawn(drain.run(stopped));

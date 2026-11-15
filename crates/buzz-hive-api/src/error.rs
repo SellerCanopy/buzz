@@ -101,6 +101,9 @@ impl From<HostError> for HiveError {
             HostError::Unauthorized(message) => {
                 Self::FailedPrecondition(format!("GitHub refused the team token: {message}"))
             }
+            HostError::Rejected(message) => {
+                Self::FailedPrecondition(format!("GitHub refused the request: {message}"))
+            }
             HostError::Other(message) => Self::Unavailable(format!("GitHub failed: {message}")),
         }
     }

@@ -12,10 +12,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use buzz_hive_core::domain::card::PullRequest;
 use buzz_hive_core::domain::intake::{
     Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef,
 };
-use buzz_hive_core::ports::code_host::{CodeHost, HostError, MAX_REPOS};
+use buzz_hive_core::ports::code_host::{CodeHost, HostError, NewPullRequest, MAX_REPOS};
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ETAG, IF_NONE_MATCH, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
@@ -160,6 +161,24 @@ impl GitHub {
             .map_err(|e| HostError::Other(format!("GitHub sent a reply that is not JSON ({e})")))
     }
 
+    /// The open pull request whose head is the branch `head` of `repo`, if there is one.
+    async fn open_pull_for(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, HostError> {
+        let url = self.url(
+            &["repos", &repo.owner, &repo.name, "pulls"],
+            &[
+                ("state", "open".to_owned()),
+                ("head", format!("{}:{head}", repo.owner)),
+                ("per_page", "1".to_owned()),
+            ],
+        );
+        let (body, _) = self.get(url).await?;
+        Ok(items(&body).first().and_then(|item| pull_from(item, repo)))
+    }
+
     /// Every comment on an issue, oldest first, up to [`MAX_COMMENT_PAGES`] pages.
     async fn all_comments(
         &self,
@@ -300,6 +319,55 @@ impl CodeHost for GitHub {
             .ok_or_else(|| HostError::Other("GitHub's reply to a comment has no id".into()))
     }
 
+    async fn open_pull_request(
+        &self,
+        request: &NewPullRequest,
+        _key: &str,
+    ) -> Result<PullRequest, HostError> {
+        let repo = &request.repo;
+        // A repeat after a failure, or a branch that already has its pull request.
+        if let Some(found) = self.open_pull_for(repo, &request.head).await? {
+            return Ok(found);
+        }
+        let base = if request.base.is_empty() {
+            let (info, _) = self
+                .get(self.url(&["repos", &repo.owner, &repo.name], &[]))
+                .await?;
+            info.get("default_branch")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    HostError::Other("GitHub's reply for the repo has no default branch".into())
+                })?
+        } else {
+            request.base.clone()
+        };
+        let url = self.url(&["repos", &repo.owner, &repo.name, "pulls"], &[]);
+        let made = self
+            .post(
+                url,
+                &json!({
+                    "title": request.title,
+                    "head": request.head,
+                    "base": base,
+                    "body": request.body,
+                    "draft": request.draft,
+                }),
+            )
+            .await;
+        match made {
+            Ok(item) => pull_from(&item, repo).ok_or_else(|| {
+                HostError::Other("GitHub's reply to a pull request has no number".into())
+            }),
+            // Two calls that raced: the other one's pull request is the one.
+            Err(HostError::Rejected(message)) if message.contains("already exists") => self
+                .open_pull_for(repo, &request.head)
+                .await?
+                .ok_or(HostError::Rejected(message)),
+            Err(other) => Err(other),
+        }
+    }
+
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {
         let mut repos = Vec::new();
         let pages = MAX_REPOS.div_ceil(100) as u32;
@@ -398,6 +466,21 @@ fn classify_at(
     match status {
         StatusCode::UNAUTHORIZED => HostError::Unauthorized(message),
         StatusCode::NOT_FOUND | StatusCode::GONE => HostError::NotFound(message),
+        StatusCode::UNPROCESSABLE_ENTITY => HostError::Rejected(
+            // The reason that names the field, such as a head branch that is not on the host, is
+            // in `errors`, not in the message.
+            serde_json::from_slice::<Value>(bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("errors")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|e| e.get("message").and_then(Value::as_str))
+                        .next()
+                        .map(str::to_owned)
+                })
+                .map_or(message.clone(), |detail| format!("{message}: {detail}")),
+        ),
         StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => {
             if let Some(seconds) = headers
                 .get(RETRY_AFTER)
@@ -506,6 +589,26 @@ fn repo_of(item: &Value) -> Option<RepoRef> {
         return None;
     };
     RepoRef::parse(&format!("{owner}/{name}")).ok()
+}
+
+/// The pull request in one item of a listing or the reply to opening one.
+fn pull_from(item: &Value, repo: &RepoRef) -> Option<PullRequest> {
+    let merged = item.get("merged_at").is_some_and(|at| !at.is_null());
+    let state = match item.get("state").and_then(Value::as_str)? {
+        "open" => "open",
+        _ if merged => "merged",
+        _ => "closed",
+    };
+    let branch = |side: &str| item.get(side).map(|b| text(b, "ref")).unwrap_or_default();
+    Some(PullRequest {
+        repo: repo.to_string(),
+        number: item.get("number").and_then(Value::as_u64)?,
+        url: text(item, "html_url"),
+        head: branch("head"),
+        base: branch("base"),
+        state: state.to_owned(),
+        draft: item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+    })
 }
 
 fn comment_from(item: &Value) -> Option<Comment> {

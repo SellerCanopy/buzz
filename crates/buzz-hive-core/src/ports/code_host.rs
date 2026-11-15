@@ -1,12 +1,13 @@
 //! The code host: where issues live. GitHub is the first adapter.
 //!
 //! A call may be repeated after a failure, so the calls that write take a key, and an adapter
-//! makes a repeat harmless. Later phases add the calls for pull requests and checks.
+//! makes a repeat harmless. Later phases add the calls for checks and merging.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::domain::card::PullRequest;
 use crate::domain::intake::{Comment, CommentId, Issue, IssueFilter, Page, RepoRef};
 
 /// Why a call to the host failed. A caller acts on the kind, not on the text.
@@ -21,6 +22,10 @@ pub enum HostError {
     /// The host refused the token, or there is none.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    /// The host understood the call and refused it for what it asked, such as a pull request
+    /// from a branch that was never pushed. Asking again changes nothing until the cause is fixed.
+    #[error("rejected: {0}")]
+    Rejected(String),
     /// Anything else: the host is down, a reply could not be read, a request timed out.
     #[error("{0}")]
     Other(String),
@@ -59,11 +64,34 @@ pub trait CodeHost: Send + Sync {
         key: &str,
     ) -> Result<CommentId, HostError>;
 
+    /// Opens a pull request, or returns the open one that already has `request.head` as its
+    /// head, so a repeat after a failure opens one pull request. `key` names the call for
+    /// an adapter that can remember it. `Rejected` means the host refused the request itself,
+    /// for example because the head branch is not on the host.
+    async fn open_pull_request(
+        &self,
+        request: &NewPullRequest,
+        key: &str,
+    ) -> Result<PullRequest, HostError>;
+
     /// The repos the token reaches under `owner`, or every repo it reaches when empty.
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError>;
 
     /// The token's own login, then the login of each organization it belongs to.
     async fn list_owners(&self) -> Result<Vec<String>, HostError>;
+}
+
+/// What a pull request is opened with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPullRequest {
+    pub repo: RepoRef,
+    /// The branch the work is on.
+    pub head: String,
+    /// The branch to merge into. Empty means the repo's default branch.
+    pub base: String,
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
 }
 
 /// The most repos `list_repos` returns. A caller that gets this many knows the list may be cut.

@@ -12,7 +12,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::lookup::Memo;
-use super::task_message::{render_task, with_card_link, CardText, Handoff};
+use super::task_message::{render_task, with_card_link, CardText, Handoff, IssueText};
 use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
 use crate::access::ActorKind;
@@ -58,14 +58,13 @@ pub(super) async fn facts(
         let resolution = config::resolve(&card.workflow, Some(stage), &layers, false);
         execution.insert(stage.id.clone(), execution_from(&resolution));
     }
-    // A card made from an issue has the issue's labels as last read; any other has none.
-    let labels = tx
-        .issues()
-        .by_card(card.id)
-        .await?
-        .map(|row| row.issue.labels)
-        .unwrap_or_default();
+    // A card made from an issue has the issue's labels as last read, and the issue's repo; any
+    // other has neither.
+    let issue = tx.issues().by_card(card.id).await?;
+    let repo = issue.as_ref().map(|row| row.issue.repo.to_string());
+    let labels = issue.map(|row| row.issue.labels).unwrap_or_default();
     Ok(Facts {
+        repo,
         labels,
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
@@ -424,6 +423,25 @@ pub(super) async fn apply(
                 };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
+            Effect::OpenPullRequest {
+                card: id,
+                stage,
+                visit,
+                repo,
+                key,
+            } => {
+                let posting = super::pull_request::posting(
+                    env,
+                    tx,
+                    card,
+                    &run,
+                    package,
+                    (&stage, visit),
+                    &repo,
+                )
+                .await?;
+                tx.outbox().enqueue(&key, id, &posting).await?;
+            }
             Effect::ArmTimeout { stage, after } => {
                 tx.timers()
                     .arm(run.id, &stage, TimerKind::Timeout, after)
@@ -446,6 +464,8 @@ pub(super) async fn apply(
                 let agent = match tx.outbox().by_key(&task_key(id, &stage, visit)).await? {
                     Some(row) => match row.posting {
                         Posting::StageTask { agent, .. } => agent,
+                        // An action stage has no agent to tell.
+                        _ if matches!(note, Note::Stopped { .. }) => continue,
                         _ => return Err(no_thread(&stage)),
                     },
                     // A stage that was held or never launched has no thread, and nobody to tell
@@ -628,6 +648,11 @@ async fn task_text(
         },
         channel: Some(channel),
         visit,
+        issue: tx.issues().by_card(card.id).await?.map(|row| IssueText {
+            repo: row.issue.repo.to_string(),
+            number: row.issue.number,
+            url: row.issue.url,
+        }),
         // Only the stage's first task carries them: a later round is a reply, not a new brief.
         sendback: match round {
             None => run

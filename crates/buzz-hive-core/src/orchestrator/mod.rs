@@ -12,6 +12,7 @@ pub mod inbox;
 pub mod intake;
 mod lookup;
 pub mod outbox;
+pub mod pull_request;
 mod routes;
 pub mod run;
 pub mod settings;

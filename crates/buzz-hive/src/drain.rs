@@ -10,11 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use buzz_hive_core::bus::Bus;
-use buzz_hive_core::orchestrator::outbox::drain_outbox;
+use buzz_hive_core::orchestrator::outbox::{drain_outbox_with, Actions};
 use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::ports::relay::Relay;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::workflow::load::Catalog;
+use buzz_hive_core::workflow::source::CatalogSource;
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
@@ -32,6 +34,10 @@ pub struct Drain {
     pub bus: Bus,
     pub community: CommunityId,
     pub hive: String,
+    /// The workflows, which a pull request's result is routed through.
+    pub catalog: Arc<dyn CatalogSource>,
+    /// Makes the calls of action stages. With none, an action that needs it fails its stage.
+    pub code_host: Option<Arc<dyn CodeHost>>,
     /// Woken by a commit that queued a post.
     pub wake: Arc<Notify>,
 }
@@ -135,7 +141,20 @@ impl Drain {
         };
         let now = Instant::now();
         let skipped = state.waiting(now);
-        match drain_outbox(&env, self.community, self.relay.as_ref(), &skipped, stop).await {
+        let actions = Actions {
+            host: self.code_host.as_deref(),
+            catalog: self.catalog.as_ref(),
+        };
+        match drain_outbox_with(
+            &env,
+            self.community,
+            self.relay.as_ref(),
+            Some(&actions),
+            &skipped,
+            stop,
+        )
+        .await
+        {
             Ok(done) => {
                 state.unreadable = 0;
                 self.bus.publish(&done.events);

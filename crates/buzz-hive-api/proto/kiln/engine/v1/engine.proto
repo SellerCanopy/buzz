@@ -720,6 +720,10 @@ message Card {
   // Beehive: the labels the card's issue had when it was last read. Only GetCard
   // sets it.
   repeated string issue_labels = 26;
+  // Beehive: the git branch the card's work goes on, `buzz/<short id>-<title>`.
+  // Only GetCard sets it, and only for a card that has an issue, so a repo
+  // to push it to. Empty otherwise.
+  string branch = 27;
 }
 
 // Beehive: the relay thread one visit to a stage opened. Its root is the top-level

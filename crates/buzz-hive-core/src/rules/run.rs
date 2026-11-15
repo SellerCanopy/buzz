@@ -26,9 +26,11 @@ use super::repeat::{
 use crate::domain::inbox::InboxKind;
 use crate::domain::run::{Run, RunState, RunStep};
 use crate::domain::workflow::{
-    Stage, KIND_APPROVAL, KIND_PROMPT, RESULT_NEEDS_INPUT, RESULT_NEEDS_WORK, RESULT_PASSED,
+    Stage, KIND_ACTION, KIND_APPROVAL, KIND_PROMPT, RESULT_NEEDS_INPUT, RESULT_NEEDS_WORK,
+    RESULT_PASSED,
 };
 use crate::ports::store::Pubkey;
+use crate::workflow::actions::{CLEANUP_WORKTREE, OPEN_PULL_REQUEST};
 use crate::workflow::load::Package;
 use crate::workflow::routes::ROUTE_ASK;
 
@@ -114,6 +116,9 @@ pub struct Facts {
     /// Whether the card is in auto mode. A loop is then bounded even when its workflow sets no
     /// loop limit.
     pub auto_mode: bool,
+    /// The repo of the card's issue as `owner/name`, or `None` for a card with no issue. An
+    /// action that needs the code host has no repo to act on without it.
+    pub repo: Option<String>,
 }
 
 impl Facts {
@@ -206,6 +211,18 @@ pub enum Effect {
         reason: String,
         /// The artifacts an approval lists, by name.
         artifacts: Vec<String>,
+    },
+    /// Opens a pull request for the card's branch in `repo`, as the action stage `stage` asks.
+    /// The orchestrator renders the stage's `with` arguments and queues the call. The drain
+    /// makes it and reports `passed` or `failed` for the stage, so the stage has no agent and
+    /// no timeout: the call is bounded by the code host's own limit and retried until the host
+    /// answers.
+    OpenPullRequest {
+        card: Uuid,
+        stage: String,
+        visit: u32,
+        repo: String,
+        key: String,
     },
     /// An event for the log.
     Emit {
@@ -701,9 +718,13 @@ impl<'a> Walk<'a> {
             self.gate(idx);
             return;
         }
+        if stage.kind == KIND_ACTION {
+            self.launch_action(idx);
+            return;
+        }
         if stage.kind != KIND_PROMPT {
             self.wait(format!(
-                "{} is a {} stage, and only prompt and approval stages run so far; skip it to carry on",
+                "{} is a {} stage, and only prompt, approval and action stages run so far; skip it to carry on",
                 title(stage),
                 stage.kind
             ));
@@ -729,6 +750,66 @@ impl<'a> Walk<'a> {
             round: None,
         });
         self.arm_timeout(idx);
+    }
+
+    /// Runs the action stage at `idx`. Opening a pull request is asked of the code host. Cleaning
+    /// up the worktree passes at once, because every agent keeps its own checkout and the
+    /// card's work is on the card branch. The other actions run in a later phase, and the run
+    /// waits at them for a person to skip the stage.
+    fn launch_action(&mut self, idx: usize) {
+        let stage = &self.stages()[idx];
+        match stage.action.as_str() {
+            OPEN_PULL_REQUEST => {
+                let Some(repo) = self.facts.repo.clone() else {
+                    self.wait(format!(
+                        "{} opens a pull request, and the card has no repo; skip it to carry on",
+                        title(stage)
+                    ));
+                    return;
+                };
+                self.run.state = RunState::Running;
+                self.reason = None;
+                let card = self.run.card_id;
+                let visit = self.run.visit;
+                self.effects.push(Effect::OpenPullRequest {
+                    card,
+                    stage: stage.id.clone(),
+                    visit,
+                    repo,
+                    key: task_key(card, &stage.id, visit),
+                });
+            }
+            CLEANUP_WORKTREE => {
+                self.record(
+                    RESULT_PASSED,
+                    "nothing to clean up: each agent keeps its own checkout",
+                );
+                self.follow_result(idx, RESULT_PASSED);
+            }
+            other => self.wait(format!(
+                "{} runs the action {other}, which does not run yet; skip it to carry on",
+                title(stage)
+            )),
+        }
+    }
+
+    /// Records the result the current stage reported, in the log and on its step.
+    fn record(&mut self, result: &str, summary: &str) {
+        let stage = self.run.current_stage.clone().unwrap_or_default();
+        let (visit, round) = (self.run.visit, self.current().round);
+        self.emit(
+            "result.reported",
+            json!({
+                "stage": stage,
+                "visit": visit,
+                "round": round,
+                "result": result,
+                "summary": summary,
+            }),
+        );
+        let step = self.current();
+        step.result = result.to_owned();
+        step.summary = summary.to_owned();
     }
 
     /// The run waits at the approval stage at `idx` until a person approves or sends it back.
@@ -943,20 +1024,7 @@ fn stage_done(
         return Step::unchanged(run);
     };
     let mut walk = Walk::new(run, wf, facts);
-    let round = walk.current().round;
-    walk.emit(
-        "result.reported",
-        json!({
-            "stage": stage,
-            "visit": run.visit,
-            "round": round,
-            "result": result,
-            "summary": summary,
-        }),
-    );
-    let step = walk.current();
-    step.result = result.to_owned();
-    step.summary = summary.to_owned();
+    walk.record(result, summary);
     if wf.workflow.stages[idx].repeat.is_some() {
         walk.repeat_round(idx, result);
     } else {

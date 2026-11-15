@@ -89,6 +89,7 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
             Effect::ArmTimeout { .. } => "timeout",
             Effect::ArmRetry { .. } => "retry",
             Effect::OpenInbox { .. } => "inbox",
+            Effect::OpenPullRequest { .. } => "pull_request",
         })
         .collect();
     assert_eq!(kinds, ["run.started", "status", "task"]);

@@ -438,6 +438,11 @@ pub fn check_action(stage: &Stage) -> Vec<Finding> {
     out
 }
 
+/// The action that opens a pull request for the card branch.
+pub const OPEN_PULL_REQUEST: &str = "open_pull_request";
+/// The action that removes the card's worktree.
+pub const CLEANUP_WORKTREE: &str = "cleanup_worktree";
+
 type With = BTreeMap<String, ActionArg>;
 
 fn arg_text<'a>(with: &'a With, name: &str) -> &'a str {

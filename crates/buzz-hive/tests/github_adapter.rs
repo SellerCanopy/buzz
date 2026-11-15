@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use buzz_hive::github_adapter::GitHub;
 use buzz_hive_core::domain::intake::{IssueFilter, IssueState, Page, RepoRef};
-use buzz_hive_core::ports::code_host::{CodeHost, HostError};
+use buzz_hive_core::ports::code_host::{CodeHost, HostError, NewPullRequest};
 use chrono::{TimeZone, Utc};
 use support::github_replay::{Exchange, Replay};
 
@@ -333,6 +333,151 @@ async fn a_comment_is_written_once_for_a_key() {
         body.ends_with("<!-- buzz-hive:card:example-org/api#42 -->"),
         "{body}"
     );
+    replay.finish();
+}
+
+const PULLS: &str = "/repos/example-org/api/pulls";
+
+fn new_pull(title: &str, base: &str) -> NewPullRequest {
+    NewPullRequest {
+        repo: repo(),
+        head: "buzz/8b93fa58-fix-login".into(),
+        base: base.into(),
+        title: title.into(),
+        body: "Closes #7".into(),
+        draft: true,
+    }
+}
+
+fn pull_json(number: u64, draft: bool) -> String {
+    format!(
+        r#"{{"number":{number},"state":"open","draft":{draft},"html_url":"https://github.example.org/example-org/api/pull/{number}","head":{{"ref":"buzz/8b93fa58-fix-login"}},"base":{{"ref":"main"}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn a_pull_request_is_opened_as_a_draft_from_the_card_branch() {
+    let replay = Replay::start(vec![
+        // Nothing is open for the branch yet.
+        Exchange::get(PULLS)
+            .query("state", "open")
+            .query("head", "example-org:buzz/8b93fa58-fix-login")
+            .body("[]"),
+        Exchange::post(PULLS).status(201).body(&pull_json(12, true)),
+    ])
+    .await;
+    let pull = github(&replay)
+        .await
+        .open_pull_request(&new_pull("Fix login", "main"), "kiln:c:pr:1")
+        .await
+        .unwrap();
+    assert_eq!(pull.number, 12);
+    assert!(pull.draft);
+    assert_eq!(pull.state, "open");
+    assert_eq!(pull.head, "buzz/8b93fa58-fix-login");
+    assert_eq!(
+        pull.url,
+        "https://github.example.org/example-org/api/pull/12"
+    );
+    let posts: Vec<_> = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&posts[0].body).unwrap();
+    assert_eq!(
+        sent,
+        serde_json::json!({
+            "title": "Fix login",
+            "head": "buzz/8b93fa58-fix-login",
+            "base": "main",
+            "body": "Closes #7",
+            "draft": true,
+        })
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn an_empty_base_is_the_repos_default_branch() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULLS).query("state", "open").body("[]"),
+        Exchange::get("/repos/example-org/api").body(r#"{"default_branch":"trunk"}"#),
+        Exchange::post(PULLS).status(201).body(&pull_json(13, true)),
+    ])
+    .await;
+    github(&replay)
+        .await
+        .open_pull_request(&new_pull("Fix login", ""), "kiln:c:pr:1")
+        .await
+        .unwrap();
+    let post = replay
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST")
+        .unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(sent["base"], "trunk");
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_pull_request_already_open_for_the_branch_is_returned_and_nothing_is_posted() {
+    let replay = Replay::start(vec![Exchange::get(PULLS)
+        .query("state", "open")
+        .query("head", "example-org:buzz/8b93fa58-fix-login")
+        .body(&format!("[{}]", pull_json(12, true)))])
+    .await;
+    let pull = github(&replay)
+        .await
+        .open_pull_request(&new_pull("Fix login", "main"), "kiln:c:pr:1")
+        .await
+        .unwrap();
+    assert_eq!(pull.number, 12);
+    assert!(replay.requests().iter().all(|r| r.method == "GET"));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn two_calls_that_race_end_with_the_one_pull_request() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULLS).query("state", "open").body("[]"),
+        Exchange::post(PULLS).status(422).body(
+            r#"{"message":"Validation Failed","errors":[{"message":"A pull request already exists for example-org:buzz/8b93fa58-fix-login."}]}"#,
+        ),
+        Exchange::get(PULLS)
+            .query("state", "open")
+            .body(&format!("[{}]", pull_json(12, true))),
+    ])
+    .await;
+    let pull = github(&replay)
+        .await
+        .open_pull_request(&new_pull("Fix login", "main"), "kiln:c:pr:1")
+        .await
+        .unwrap();
+    assert_eq!(pull.number, 12);
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_branch_that_was_never_pushed_is_rejected_with_githubs_reason() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULLS).query("state", "open").body("[]"),
+        Exchange::post(PULLS).status(422).body(
+            r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","field":"head","message":"head invalid"}]}"#,
+        ),
+    ])
+    .await;
+    let error = github(&replay)
+        .await
+        .open_pull_request(&new_pull("Fix login", "main"), "kiln:c:pr:1")
+        .await
+        .unwrap_err();
+    match error {
+        HostError::Rejected(message) => assert!(message.contains("head invalid"), "{message}"),
+        other => panic!("{other:?}"),
+    }
     replay.finish();
 }
 

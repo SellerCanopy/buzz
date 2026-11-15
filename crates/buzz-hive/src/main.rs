@@ -198,6 +198,8 @@ async fn run() -> Result<(), String> {
             bus: app.bus.clone(),
             community,
             hive: hive_pubkey.clone(),
+            catalog: app.catalog.clone(),
+            code_host: app.code_host.clone(),
             wake: app.outbox.clone(),
         };
         tokio::spawn(drain.run(stopped))

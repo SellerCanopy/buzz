@@ -1,6 +1,6 @@
 //! Card procedures: list, read, create, archive, restore, remove and add a note.
 
-use buzz_hive_core::domain::card::{Card as DomainCard, CardState};
+use buzz_hive_core::domain::card::{card_branch, Card as DomainCard, CardState};
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::domain::intake::RepoRef;
 use buzz_hive_core::orchestrator::auto;
@@ -13,8 +13,8 @@ use crate::error::HiveError;
 use crate::proto::{
     ActivityAuthor, ActivityEntry, AddNoteRequest, AddNoteResponse, ArchiveCardsRequest,
     ArchiveCardsResponse, Card, CreateCardRequest, CreateTaskRequest, GetCardRequest,
-    ListCardsRequest, ListCardsResponse, RemoveCardRequest, RemoveCardResponse, RestoreCardRequest,
-    SetCardWorkflowRequest, SetCardWorkflowResponse, StageThread,
+    ListCardsRequest, ListCardsResponse, PullRequest, RemoveCardRequest, RemoveCardResponse,
+    RestoreCardRequest, SetCardWorkflowRequest, SetCardWorkflowResponse, StageThread,
 };
 use crate::routes::intake::{fill_issues, fill_one};
 use crate::unary::Ctx;
@@ -59,6 +59,17 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         .and_then(|run| run.current_stage)
         .filter(|_| !idle)
         .unwrap_or_default();
+    proto.pull_request = tx
+        .pull_requests()
+        .by_card(id)
+        .await?
+        .map(|pull| PullRequest {
+            number: i32::try_from(pull.number).unwrap_or(i32::MAX),
+            url: pull.url,
+            state: pull.state,
+            draft: pull.draft,
+            ..PullRequest::default()
+        });
     proto.stages = tx
         .runs()
         .threads(id)
@@ -75,6 +86,7 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
     drop(tx);
     if let Some(row) = fill_one(&app, &ctx, &mut proto).await? {
         proto.issue_labels = row.issue.labels;
+        proto.branch = card_branch(id, &proto.title);
     }
     Ok(proto)
 }

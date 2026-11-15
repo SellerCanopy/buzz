@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 
+use crate::domain::card::PullRequest;
 use crate::domain::intake::{Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef};
-use crate::ports::code_host::{CodeHost, HostError};
+use crate::ports::code_host::{CodeHost, HostError, NewPullRequest};
 
 #[derive(Default)]
 struct Inner {
@@ -16,6 +17,8 @@ struct Inner {
     /// Errors the next calls fail with, one per call, oldest first.
     failures: VecDeque<HostError>,
     next_comment: CommentId,
+    /// The pull requests opened, with the key each was opened under.
+    pulls: Vec<(NewPullRequest, String, PullRequest)>,
     /// Every call made, as a line such as `list_issues example-org/api page 1`.
     calls: Vec<String>,
 }
@@ -89,6 +92,17 @@ impl FakeCodeHost {
     /// Every call made so far, oldest first.
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
+    }
+
+    /// The pull requests Beehive opened, in order.
+    pub fn pull_requests(&self) -> Vec<(NewPullRequest, PullRequest)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pulls
+            .iter()
+            .map(|(request, _, pull)| (request.clone(), pull.clone()))
+            .collect()
     }
 
     /// The comments Beehive wrote, as `(repo, number, body)`.
@@ -240,6 +254,40 @@ impl CodeHost for FakeCodeHost {
             .comments
             .push((repo.clone(), number, comment, Some(key.to_owned())));
         Ok(id)
+    }
+
+    async fn open_pull_request(
+        &self,
+        request: &NewPullRequest,
+        key: &str,
+    ) -> Result<PullRequest, HostError> {
+        let mut inner = self.enter(format!(
+            "open_pull_request {} {}..{} {key}",
+            request.repo, request.base, request.head
+        ))?;
+        if let Some((_, _, pull)) = inner.pulls.iter().find(|(have, k, _)| {
+            k == key || (have.repo == request.repo && have.head == request.head)
+        }) {
+            return Ok(pull.clone());
+        }
+        let number = inner.pulls.len() as u64 + 1;
+        let pull = PullRequest {
+            repo: request.repo.to_string(),
+            number,
+            url: format!("https://github.example.org/{}/pull/{number}", request.repo),
+            head: request.head.clone(),
+            base: if request.base.is_empty() {
+                "main".to_owned()
+            } else {
+                request.base.clone()
+            },
+            state: "open".into(),
+            draft: request.draft,
+        };
+        inner
+            .pulls
+            .push((request.clone(), key.to_owned(), pull.clone()));
+        Ok(pull)
     }
 
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {
