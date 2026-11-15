@@ -5,6 +5,7 @@ use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
 use crate::domain::run::Run;
+use crate::domain::timer::{Timer, TimerKind};
 use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
@@ -54,6 +55,7 @@ pub trait Tx: Send {
     fn runs(&mut self) -> &mut dyn RunsRepo;
     fn outbox(&mut self) -> &mut dyn OutboxRepo;
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo;
+    fn timers(&mut self) -> &mut dyn TimersRepo;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -251,6 +253,43 @@ pub trait RunsRepo: Send {
     ) -> Result<Option<StageThread>, StoreError>;
     /// Every thread the card's stages opened, in the order they were recorded.
     async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError>;
+}
+
+/// The timers runs wait on. A timer is a row, written in the transaction that changes the run,
+/// so a restarted service finds every one. Time is the store's own, so every instance and
+/// every restart agree on when a timer is due.
+#[async_trait::async_trait]
+pub trait TimersRepo: Send {
+    /// Sets a timer to fire `after` from now, in place of one of the same run, stage and kind.
+    async fn arm(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+        after: std::time::Duration,
+    ) -> Result<(), StoreError>;
+    /// Drops every timer of the run.
+    async fn clear_run(&mut self, run: uuid::Uuid) -> Result<(), StoreError>;
+    /// The timers whose time has come, soonest first, at most `limit`.
+    async fn due(&mut self, limit: i64) -> Result<Vec<Timer>, StoreError>;
+    /// Removes a timer that is still due. `false` when it is gone, or was armed again for
+    /// later, so a caller that lost the race does nothing.
+    async fn take_due(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<bool, StoreError>;
+    /// Removes a timer, due or not. Nothing happens when it is gone.
+    async fn remove(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<(), StoreError>;
+    /// How long until the soonest timer is due: zero for one already overdue, `None` when
+    /// there are no timers.
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError>;
 }
 
 /// The relay thread a stage task opened. Its root is the message that mentions the agent.

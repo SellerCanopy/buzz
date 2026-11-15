@@ -7,10 +7,11 @@ use buzz_hive_core::domain::artifact::{
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::domain::run::{Run, RunState};
+use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
     OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread, Store,
-    StoreError, StoredPackage, Tx, WorkflowsRepo,
+    StoreError, StoredPackage, TimersRepo, Tx, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -74,6 +75,9 @@ impl Tx for PgTx {
         self
     }
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
+        self
+    }
+    fn timers(&mut self) -> &mut dyn TimersRepo {
         self
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
@@ -1165,6 +1169,117 @@ fn decode_outbox(row: OutboxDbRow) -> Result<OutboxRow, StoreError> {
         attempts,
         last_error,
     })
+}
+
+#[async_trait::async_trait]
+impl TimersRepo for PgTx {
+    async fn arm(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+        after: std::time::Duration,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.timers (community_id, run_id, stage, kind, fire_at) \
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) \
+             ON CONFLICT (community_id, run_id, stage, kind) DO UPDATE SET fire_at = EXCLUDED.fire_at",
+        )
+        .bind(self.community)
+        .bind(run)
+        .bind(stage)
+        .bind(kind.as_str())
+        .bind(after.as_secs_f64())
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn clear_run(&mut self, run: uuid::Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM hive.timers WHERE community_id = $1 AND run_id = $2")
+            .bind(self.community)
+            .bind(run)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn due(&mut self, limit: i64) -> Result<Vec<Timer>, StoreError> {
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT run_id, stage, kind FROM hive.timers \
+             WHERE community_id = $1 AND fire_at <= now() ORDER BY fire_at, run_id LIMIT $2",
+        )
+        .bind(self.community)
+        .bind(limit)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter()
+            .map(|(run_id, stage, kind)| {
+                let kind = TimerKind::parse(&kind)
+                    .ok_or_else(|| StoreError::Conflict(format!("timer kind {kind:?}")))?;
+                Ok(Timer {
+                    run_id,
+                    stage,
+                    kind,
+                })
+            })
+            .collect()
+    }
+
+    async fn take_due(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<bool, StoreError> {
+        let taken = sqlx::query(
+            "DELETE FROM hive.timers WHERE community_id = $1 AND run_id = $2 \
+             AND stage = $3 AND kind = $4 AND fire_at <= now()",
+        )
+        .bind(self.community)
+        .bind(run)
+        .bind(stage)
+        .bind(kind.as_str())
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(taken.rows_affected() == 1)
+    }
+
+    async fn remove(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM hive.timers WHERE community_id = $1 AND run_id = $2 \
+             AND stage = $3 AND kind = $4",
+        )
+        .bind(self.community)
+        .bind(run)
+        .bind(stage)
+        .bind(kind.as_str())
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let secs: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (min(fire_at) - now()))::float8 \
+             FROM hive.timers WHERE community_id = $1",
+        )
+        .bind(self.community)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(secs.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))))
+    }
 }
 
 #[async_trait::async_trait]

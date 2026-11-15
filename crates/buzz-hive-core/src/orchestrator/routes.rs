@@ -19,9 +19,11 @@ use crate::config::{self, Layer, Layers, Resolution};
 use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
 use crate::domain::run::{Run, RunState};
+use crate::domain::timer::TimerKind;
+use crate::domain::workflow::Duration as SettingDuration;
 use crate::ports::store::{Posting, Tx};
 use crate::rules::run::{
-    entry_stage, step, task_key, Effect, Ended, Facts, Input, Note, Round, Step,
+    entry_stage, step, task_key, Effect, Ended, Execution, Facts, Input, Note, Round, Step,
 };
 use crate::tool_names::STAGE_DONE;
 use crate::workflow::load::Package;
@@ -48,26 +50,53 @@ pub(super) async fn facts(
         Some((stage, _)) => artifacts::plan_progress(tx, card.id, stage).await?,
         None => (0, 0),
     };
+    let layers = layers(tx, card, Some(package), &BTreeMap::new()).await?;
+    let mut execution = BTreeMap::new();
+    for stage in &package.workflow.stages {
+        let resolution = config::resolve(&card.workflow, Some(stage), &layers, false);
+        execution.insert(stage.id.clone(), execution_from(&resolution));
+    }
     Ok(Facts {
         // Issue labels arrive with intake (Phase 16).
         labels: Vec::new(),
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
         plan,
+        execution,
     })
 }
 
-/// Every setting of one stage of the card's workflow, through the six layers. `parameters`
-/// are the run's own values.
-pub(super) async fn resolve_settings(
-    env: &Env<'_>,
+/// A stage's timeout and retries from its resolved settings. A value that does not parse was
+/// refused when it was saved, so it falls back to the engine default here.
+fn execution_from(resolution: &Resolution) -> Execution {
+    let wait = |key: &str| {
+        resolution
+            .value(key)
+            .and_then(|v| v.as_str())
+            .and_then(|text| SettingDuration::parse(text).ok())
+            .and_then(|d| u64::try_from(d.nanos()).ok())
+            .map(std::time::Duration::from_nanos)
+            .unwrap_or_default()
+    };
+    Execution {
+        timeout: wait("execution.timeout"),
+        retries: resolution
+            .value("execution.retries.max")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or_default(),
+        backoff: wait("execution.retries.backoff"),
+    }
+}
+
+/// The settings layers of the card's workflow, as stored. `parameters` are the run's own values.
+async fn layers(
     tx: &mut dyn Tx,
     card: &Card,
+    package: Option<&Package>,
     parameters: &BTreeMap<String, String>,
-    stage: Option<&str>,
-) -> Result<Resolution, OpError> {
-    let package = env.catalog.get(&card.workflow);
-    let layers = Layers {
+) -> Result<Layers, OpError> {
+    Ok(Layers {
         user: Layer::new(
             "community settings",
             tx.settings().list("engine", "").await?,
@@ -84,7 +113,20 @@ pub(super) async fn resolve_settings(
         params: package
             .map(|p| p.meta.parameters.clone())
             .unwrap_or_default(),
-    };
+    })
+}
+
+/// Every setting of one stage of the card's workflow, through the six layers. `parameters`
+/// are the run's own values.
+pub(super) async fn resolve_settings(
+    env: &Env<'_>,
+    tx: &mut dyn Tx,
+    card: &Card,
+    parameters: &BTreeMap<String, String>,
+    stage: Option<&str>,
+) -> Result<Resolution, OpError> {
+    let package = env.catalog.get(&card.workflow);
+    let layers = layers(tx, card, package, parameters).await?;
     let stage = stage
         .and_then(|id| package.and_then(|p| p.stage(id)))
         .map(|(s, _)| s);
@@ -192,6 +234,12 @@ pub(super) async fn apply(
         Mode::Insert => tx.runs().insert(&run).await?,
         Mode::Update => tx.runs().update(&run).await?,
     }
+    // Every change to a run retires its timers, and the effects that follow set the ones the
+    // new state needs: a stage that waits, ends or is held has none, and one that runs has the
+    // timeout it just started.
+    if !effects.is_empty() {
+        tx.timers().clear_run(run.id).await?;
+    }
     let state = card_state(&run, ended);
     let before = card.state;
     let changed = state != before;
@@ -270,6 +318,16 @@ pub(super) async fn apply(
                 };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
+            Effect::ArmTimeout { stage, after } => {
+                tx.timers()
+                    .arm(run.id, &stage, TimerKind::Timeout, after)
+                    .await?;
+            }
+            Effect::ArmRetry { stage, after } => {
+                tx.timers()
+                    .arm(run.id, &stage, TimerKind::Retry, after)
+                    .await?;
+            }
             Effect::PostReply {
                 card: id,
                 stage,
@@ -284,6 +342,9 @@ pub(super) async fn apply(
                         Posting::StageTask { agent, .. } => agent,
                         _ => return Err(no_thread(&stage)),
                     },
+                    // A stage that was held or never launched has no thread, and nobody to tell
+                    // to stop.
+                    None if matches!(note, Note::Stopped { .. }) => continue,
                     None => return Err(no_thread(&stage)),
                 };
                 let text = match &note {
@@ -301,6 +362,12 @@ pub(super) async fn apply(
                         )
                         .await?
                     }
+                    Note::Retry { reason, attempt } => format!(
+                        "Attempt {attempt} of stage {stage} failed: {reason}. Please try again in this thread, and report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
+                    Note::Stopped { reason } => format!(
+                        "The run was stopped: {reason}. Stop work on stage {stage} and do not report a result."
+                    ),
                     Note::Resumed => format!(
                         "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
                     ),
@@ -346,7 +413,8 @@ fn no_thread(stage: &str) -> OpError {
 fn card_state(run: &Run, ended: Option<Ended>) -> CardState {
     match (run.state, ended) {
         (_, Some(Ended::Done)) => CardState::Done,
-        (_, Some(Ended::Stopped)) => CardState::Stopped,
+        (_, Some(Ended::Stopped | Ended::Cancelled)) => CardState::Stopped,
+        (_, Some(Ended::Failed)) => CardState::Failed,
         (RunState::Waiting | RunState::Paused, _) => CardState::Waiting,
         _ => CardState::Running,
     }

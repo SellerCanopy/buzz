@@ -9,12 +9,15 @@
 //! top-level mention in the update channel, so each stage is a new agent session.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::json;
 use uuid::Uuid;
 
 use super::conditions::{describe, unmet};
-use super::decide::{loop_count, over_loop_limit, resolve_route, routes_backward, Route};
+use super::decide::{
+    loop_count, over_loop_limit, resolve_route, retry_decision, routes_backward, Route,
+};
 use super::repeat::{
     agent_done_decision, is_agent_done, or_default, repeat_decision, RepeatState, RepeatStep,
     DEFAULT_MAX_ROUNDS, DEFAULT_STALL_AFTER,
@@ -25,8 +28,8 @@ use crate::ports::store::Pubkey;
 use crate::workflow::load::Package;
 use crate::workflow::routes::ROUTE_ASK;
 
-/// What can happen to a run. Phase 11 adds the timeouts and retries. `step` matches
-/// exhaustively, so a variant added without an arm fails to compile.
+/// What can happen to a run. `step` matches exhaustively, so a variant added without an arm
+/// fails to compile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     /// A person, or an agent, starts the run. `stage` is where; `None` starts at the first
@@ -58,6 +61,14 @@ pub enum Input {
         missing: Vec<String>,
         summary: String,
     },
+    /// The stage's attempt failed for `reason`. It runs again when the stage allows retries.
+    StageFailed { stage: String, reason: String },
+    /// The stage's timeout came due. It fails the attempt like [`Input::StageFailed`].
+    TimedOut { stage: String },
+    /// A retry's wait is over: the stage's agent is told to try again in the same thread.
+    RetryNow { stage: String },
+    /// A person or an agent stops the run. `reason` says who and why.
+    Cancel { reason: String },
 }
 
 /// What the reducer needs to know that is not in the run or the workflow.
@@ -73,6 +84,26 @@ pub struct Facts {
     /// after the round that just ended: the latest version of the stage's plan artifact, or
     /// `(0, 0)` when it has none.
     pub plan: (u32, u32),
+    /// How long each stage may run and how often it retries, from the settings, by stage id. A
+    /// stage that is not listed has no timeout and no retries.
+    pub execution: BTreeMap<String, Execution>,
+}
+
+impl Facts {
+    fn execution(&self, stage: &str) -> Execution {
+        self.execution.get(stage).copied().unwrap_or_default()
+    }
+}
+
+/// A stage's `execution.*` settings, resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Execution {
+    /// How long an attempt may run before it fails. Zero means no timeout.
+    pub timeout: Duration,
+    /// How many times a failed attempt runs again.
+    pub retries: u32,
+    /// The wait before the first retry. It doubles with each one.
+    pub backoff: Duration,
 }
 
 /// What a repeat stage tells the agent about its next round.
@@ -93,6 +124,10 @@ pub enum Note {
     Round(Round),
     /// The card was resumed while the stage was running.
     Resumed,
+    /// Attempt `attempt` failed for `reason`, and the stage runs again.
+    Retry { reason: String, attempt: u32 },
+    /// The run was stopped, and the stage's agent should stop work.
+    Stopped { reason: String },
 }
 
 /// What the orchestrator does after a step.
@@ -127,6 +162,12 @@ pub enum Effect {
         key: String,
         note: Note,
     },
+    /// Fails the stage's attempt in `after`, unless it reports first. The orchestrator writes
+    /// the timer in the transaction that changes the run, and clears every timer of the run
+    /// when it changes, so the newest step decides which timer stands.
+    ArmTimeout { stage: String, after: Duration },
+    /// Runs the stage again in `after`.
+    ArmRetry { stage: String, after: Duration },
     /// An event for the log.
     Emit {
         kind: &'static str,
@@ -141,6 +182,10 @@ pub enum Ended {
     Done,
     /// A route stopped the card.
     Stopped,
+    /// The stage failed and has no retries left.
+    Failed,
+    /// A person or an agent stopped the run.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +227,33 @@ pub fn round_key(card: Uuid, stage: &str, visit: u32, round: u32) -> String {
 /// The outbox key of the `resume`th reply that tells a resumed stage's agent to carry on.
 pub fn resume_key(card: Uuid, stage: &str, visit: u32, resume: u32) -> String {
     format!("{}:resume:{resume}", task_key(card, stage, visit))
+}
+
+/// The outbox key of the reply that tells a stage's agent to try again after attempt `attempt` failed.
+pub fn retry_key(card: Uuid, stage: &str, visit: u32, attempt: u32) -> String {
+    format!("{}:retry:{attempt}", task_key(card, stage, visit))
+}
+
+/// The outbox key of the note that tells a stopped stage's agent to stop.
+pub fn stop_key(card: Uuid, stage: &str, visit: u32) -> String {
+    format!("{}:stop", task_key(card, stage, visit))
+}
+
+/// The outbox key of the status line that says a stage failed for good.
+pub fn failed_key(card: Uuid, stage: &str, visit: u32) -> String {
+    format!("{}:failed", task_key(card, stage, visit))
+}
+
+/// A wait the way a person reads it: `30m`, `1h`, `90s`.
+pub fn say_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// The stage a run starts at and the name of the Buzz agent that works it. `stage` is where
@@ -246,6 +318,10 @@ pub fn step(run: &Run, wf: &Package, facts: &Facts, input: Input) -> Step {
             missing,
             summary,
         } => missing_output(run, wf, facts, &stage, &missing, &summary),
+        Input::StageFailed { stage, reason } => stage_failed(run, wf, facts, &stage, &reason),
+        Input::TimedOut { stage } => timed_out(run, wf, facts, &stage),
+        Input::RetryNow { stage } => retry_now(run, wf, facts, &stage),
+        Input::Cancel { reason } => cancel(run, wf, facts, &reason),
     }
 }
 
@@ -361,17 +437,39 @@ impl<'a> Walk<'a> {
 
     /// Ends the run where the workflow sends it.
     fn end(&mut self, ended: Ended) {
+        self.end_for(ended, None);
+    }
+
+    /// Ends the run. `reason` is why it failed or was stopped, when that is not the workflow's doing.
+    fn end_for(&mut self, ended: Ended, reason: Option<&str>) {
         let (outcome, target) = match ended {
             Ended::Done => (RESULT_PASSED, "done"),
             Ended::Stopped => ("stopped", "stop"),
+            Ended::Failed => ("failed", "failed"),
+            Ended::Cancelled => ("stopped", "stopped"),
         };
         self.run.state = RunState::Ended;
         self.ended = Some(ended);
         self.current().routed_to = Some(target.to_owned());
-        self.emit(
-            "run.ended",
-            json!({ "outcome": outcome, "stage": self.run.current_stage, "visit": self.run.visit }),
-        );
+        let mut payload =
+            json!({ "outcome": outcome, "stage": self.run.current_stage, "visit": self.run.visit });
+        if let (Some(reason), Some(fields)) = (reason, payload.as_object_mut()) {
+            fields.insert("reason".to_owned(), json!(reason));
+            self.reason = Some(reason.to_owned());
+        }
+        self.emit("run.ended", payload);
+    }
+
+    /// Asks for the timeout of the stage at `idx`, when the stage has one.
+    fn arm_timeout(&mut self, idx: usize) {
+        let stage = &self.stages()[idx];
+        let after = self.facts.execution(&stage.id).timeout;
+        if !after.is_zero() {
+            self.effects.push(Effect::ArmTimeout {
+                stage: stage.id.clone(),
+                after,
+            });
+        }
     }
 
     /// Follows `route` out of the stage at `from`, the run's current stage. `said` says what
@@ -524,6 +622,7 @@ impl<'a> Walk<'a> {
             key: task_key(card, &stage.id, visit),
             round: None,
         });
+        self.arm_timeout(idx);
     }
 
     /// What a repeat stage does after a round that reported `result`.
@@ -577,6 +676,11 @@ impl<'a> Walk<'a> {
                     },
                 };
                 let card = self.run.card_id;
+                // A new round is a new attempt.
+                let step = self.current();
+                step.attempts = 0;
+                step.failure.clear();
+                self.arm_timeout(idx);
                 if spec.fresh_session {
                     // A new top-level mention, so a new session.
                     let visit = self.bump(&stage.id);
@@ -851,6 +955,127 @@ fn resume(run: &Run, wf: &Package, facts: &Facts) -> Step {
         key: resume_key(card, &stage.id, visit, resumes),
         note: Note::Resumed,
     });
+    walk.arm_timeout(idx);
+    walk.finish()
+}
+
+/// The run waits for the stage at `idx`, which is the current one and is running.
+fn running_at<'a>(run: &Run, wf: &'a Package, stage: &str) -> Option<(&'a Stage, usize)> {
+    let current = run.state == RunState::Running && run.current_stage.as_deref() == Some(stage);
+    wf.stage(stage).filter(|_| current)
+}
+
+/// The attempt failed. It runs again after a wait, or the run fails when no retries are left.
+fn stage_failed(run: &Run, wf: &Package, facts: &Facts, stage: &str, reason: &str) -> Step {
+    let Some((def, _)) = running_at(run, wf, stage) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    let exec = facts.execution(stage);
+    let attempt = walk.current().attempts + 1;
+    match retry_decision(attempt, exec.retries, exec.backoff) {
+        Some(wait) => {
+            let step = walk.current();
+            step.attempts = attempt;
+            step.failure = reason.to_owned();
+            walk.emit(
+                "retry.scheduled",
+                json!({
+                    "stage": stage,
+                    "visit": run.visit,
+                    "attempt": attempt,
+                    "wait_s": wait.as_secs(),
+                    "reason": reason,
+                }),
+            );
+            walk.effects.push(Effect::ArmRetry {
+                stage: stage.to_owned(),
+                after: wait,
+            });
+        }
+        None => {
+            let card = run.card_id;
+            let visit = walk.current().visit;
+            let name = title(def).to_owned();
+            walk.current().failure = reason.to_owned();
+            walk.end_for(Ended::Failed, Some(reason));
+            walk.effects.push(Effect::PostStatus {
+                card,
+                key: failed_key(card, stage, visit),
+                text: format!("run failed at stage {name}: {reason}."),
+            });
+        }
+    }
+    walk.finish()
+}
+
+/// The stage's timeout came due, so the attempt failed.
+fn timed_out(run: &Run, wf: &Package, facts: &Facts, stage: &str) -> Step {
+    let Some((def, _)) = running_at(run, wf, stage) else {
+        return Step::unchanged(run);
+    };
+    let reason = format!(
+        "{} timed out after {}",
+        title(def),
+        say_duration(facts.execution(stage).timeout)
+    );
+    stage_failed(run, wf, facts, stage, &reason)
+}
+
+/// A retry's wait is over. The stage's agent hears why the last attempt failed, in the thread
+/// the stage already has, and the stage's timeout starts again.
+fn retry_now(run: &Run, wf: &Package, facts: &Facts, stage: &str) -> Step {
+    let Some((def, idx)) = running_at(run, wf, stage) else {
+        return Step::unchanged(run);
+    };
+    let mut walk = Walk::new(run, wf, facts);
+    let step = walk.current().clone();
+    if step.attempts == 0 {
+        return Step::unchanged(run);
+    }
+    let card = run.card_id;
+    walk.effects.push(Effect::PostReply {
+        card,
+        stage: stage.to_owned(),
+        visit: step.visit,
+        agent: def.agent.clone().unwrap_or_default(),
+        key: retry_key(card, stage, step.visit, step.attempts),
+        note: Note::Retry {
+            reason: step.failure,
+            attempt: step.attempts,
+        },
+    });
+    walk.arm_timeout(idx);
+    walk.finish()
+}
+
+/// Ends a run that has not ended. The stage's agent is told to stop in its thread.
+fn cancel(run: &Run, wf: &Package, facts: &Facts, reason: &str) -> Step {
+    let live = matches!(
+        run.state,
+        RunState::Running | RunState::Waiting | RunState::Paused
+    );
+    if !live || run.current_stage.is_none() {
+        return Step::unchanged(run);
+    }
+    let mut walk = Walk::new(run, wf, facts);
+    let step = walk.current().clone();
+    let agent = wf
+        .stage(&step.stage)
+        .and_then(|(def, _)| def.agent.clone())
+        .unwrap_or_default();
+    let card = run.card_id;
+    walk.effects.push(Effect::PostReply {
+        card,
+        stage: step.stage.clone(),
+        visit: step.visit,
+        agent,
+        key: stop_key(card, &step.stage, step.visit),
+        note: Note::Stopped {
+            reason: reason.to_owned(),
+        },
+    });
+    walk.end_for(Ended::Cancelled, Some(reason));
     walk.finish()
 }
 

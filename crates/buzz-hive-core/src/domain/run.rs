@@ -89,6 +89,14 @@ pub struct RunStep {
     /// passes. Empty when it follows the stage's own route.
     #[serde(default)]
     pub then: String,
+    /// Attempts at the stage that failed, so the next one is `attempts + 1`. A retry keeps the
+    /// stage's thread and visit.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Why the latest attempt failed, for the note that tells the agent to try again. Empty
+    /// while no attempt has failed.
+    #[serde(default)]
+    pub failure: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -4,4 +4,5 @@ pub mod artifact;
 pub mod card;
 pub mod events;
 pub mod run;
+pub mod timer;
 pub mod workflow;

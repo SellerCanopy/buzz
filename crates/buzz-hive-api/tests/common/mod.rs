@@ -58,6 +58,7 @@ pub fn app_with(directory: FakeDirectory, store: MemStore) -> App {
         community: community(),
         hive_pubkey: HIVE.into(),
         outbox: Arc::new(tokio::sync::Notify::new()),
+        timers: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

@@ -136,6 +136,7 @@ async fn run(world: &World, outsider: &Keys) {
         community: world.community,
         hive_pubkey: adapter.pubkey(),
         outbox: Arc::new(tokio::sync::Notify::new()),
+        timers: Arc::new(tokio::sync::Notify::new()),
     };
     let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

@@ -6,10 +6,13 @@ use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
 use crate::domain::run::{Run, RunState};
+use crate::domain::timer::{Timer, TimerKind};
+use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
     CommunityId, Directory, EventsRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, Pubkey,
-    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
+    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
+    WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -31,6 +34,13 @@ struct State {
     next_outbox_id: i64,
     /// Each artifact with its handoff flag, and its versions in save order.
     artifacts: Vec<MemArtifact>,
+    timers: Vec<(CommunityId, MemTimer)>,
+}
+
+#[derive(Clone)]
+struct MemTimer {
+    timer: Timer,
+    fire_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone)]
@@ -54,15 +64,31 @@ struct Log {
 
 /// A `Store` held in memory. `begin` copies the state and `commit` swaps the
 /// copy back in, so a dropped `Tx` rolls back.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct MemStore {
     state: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store whose timers read `clock`, so a test moves time by hand.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            state: Arc::default(),
+            log: Arc::default(),
+            clock,
+        }
     }
 
     /// Puts a card on a community's board, as the newest. Later phases create cards through routes.
@@ -86,6 +112,7 @@ impl Store for MemStore {
             pending: Vec::new(),
             shared: self.state.clone(),
             log: self.log.clone(),
+            clock: self.clock.clone(),
         }))
     }
 }
@@ -97,6 +124,7 @@ struct MemTx {
     pending: Vec<Event>,
     shared: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
+    clock: Arc<dyn Clock>,
 }
 
 #[async_trait::async_trait]
@@ -125,6 +153,9 @@ impl Tx for MemTx {
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
         self
     }
+    fn timers(&mut self) -> &mut dyn TimersRepo {
+        self
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let MemTx {
             community,
@@ -132,6 +163,7 @@ impl Tx for MemTx {
             pending,
             shared,
             log,
+            clock: _,
         } = *self;
         *shared.lock().unwrap() = work;
         let mut log = log.lock().unwrap();
@@ -814,6 +846,112 @@ impl WorkflowsRepo for MemTx {
             .options
             .insert((self.community, name.to_owned()), options.clone());
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl TimersRepo for MemTx {
+    async fn arm(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+        after: std::time::Duration,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        let fire_at = self.clock.now() + chrono::Duration::from_std(after).unwrap_or_default();
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind)
+        });
+        self.work.timers.push((
+            community,
+            MemTimer {
+                timer: Timer {
+                    run_id: run,
+                    stage: stage.to_owned(),
+                    kind,
+                },
+                fire_at,
+            },
+        ));
+        Ok(())
+    }
+
+    async fn clear_run(&mut self, run: uuid::Uuid) -> Result<(), StoreError> {
+        let community = self.community;
+        self.work
+            .timers
+            .retain(|(c, t)| !(*c == community && t.timer.run_id == run));
+        Ok(())
+    }
+
+    async fn due(&mut self, limit: i64) -> Result<Vec<Timer>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let mut due: Vec<&MemTimer> = self
+            .work
+            .timers
+            .iter()
+            .filter(|(c, t)| *c == community && t.fire_at <= now)
+            .map(|(_, t)| t)
+            .collect();
+        due.sort_by_key(|t| t.fire_at);
+        Ok(due
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(0))
+            .map(|t| t.timer.clone())
+            .collect())
+    }
+
+    async fn take_due(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<bool, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let before = self.work.timers.len();
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind
+                && t.fire_at <= now)
+        });
+        Ok(self.work.timers.len() < before)
+    }
+
+    async fn remove(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind)
+        });
+        Ok(())
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        Ok(self
+            .work
+            .timers
+            .iter()
+            .filter(|(c, _)| *c == community)
+            .map(|(_, t)| t.fire_at)
+            .min()
+            .map(|at| (at - now).to_std().unwrap_or_default()))
     }
 }
 

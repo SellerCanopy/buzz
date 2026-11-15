@@ -86,6 +86,8 @@ fn the_reducer_starts_a_created_run_and_ignores_every_other_state() {
             Effect::PostStatus { .. } => "status",
             Effect::PostStageTask { .. } => "task",
             Effect::PostReply { .. } => "reply",
+            Effect::ArmTimeout { .. } => "timeout",
+            Effect::ArmRetry { .. } => "retry",
         })
         .collect();
     assert_eq!(kinds, ["run.started", "status", "task"]);

@@ -31,7 +31,7 @@ use buzz_hive_core::orchestrator::outbox::{drain_outbox, Drained};
 use buzz_hive_core::orchestrator::run::{move_card, stage_done};
 use buzz_hive_core::orchestrator::{Env, OpError};
 use buzz_hive_core::ports::store::{Store, StoreError};
-use buzz_hive_core::testing::{FakeDirectory, FakeRelay, MemStore};
+use buzz_hive_core::testing::{FakeDirectory, FakeRelay, ManualClock, MemStore};
 use buzz_hive_core::workflow::load::{load, Catalog};
 use buzz_hive_core::workflow::source::{MemSource, Source};
 
@@ -172,6 +172,14 @@ impl Fixture {
             catalog: catalog(),
             relay: FakeRelay::new(),
         }
+    }
+
+    /// A fixture whose timers read a clock the test moves.
+    pub fn timed() -> (Self, ManualClock) {
+        let clock = ManualClock::new();
+        let mut fixture = Self::new();
+        fixture.store = MemStore::with_clock(std::sync::Arc::new(clock.clone()));
+        (fixture, clock)
     }
 
     pub fn with_directory(mut self, directory: FakeDirectory) -> Self {

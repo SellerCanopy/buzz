@@ -17,7 +17,7 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::store::{
     AccessRepo, AgentInfo, AgentLink, ArtifactsRepo, CardsRepo, CommunityId, Directory, EventsRepo,
-    OutboxRepo, RunsRepo, SettingsRepo, Store, StoreError, Tx, WorkflowsRepo,
+    OutboxRepo, RunsRepo, SettingsRepo, Store, StoreError, TimersRepo, Tx, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
@@ -95,6 +95,9 @@ impl Tx for SpyTx {
     }
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
         self.inner.artifacts()
+    }
+    fn timers(&mut self) -> &mut dyn TimersRepo {
+        self.inner.timers()
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         self.inner.commit().await

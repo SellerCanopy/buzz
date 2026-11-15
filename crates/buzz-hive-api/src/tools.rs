@@ -203,6 +203,20 @@ pub const TOOLS: &[Tool] = &[
         schema: read_history,
     },
     Tool {
+        name: "cancel_run",
+        route: "StopRun",
+        needs: Level::Run,
+        description: "Stop a run that has not ended. Its stage's agent is told to stop in the stage's thread, and the card is stopped. Give the run's id from get_card or list_runs.",
+        schema: run_id_only,
+    },
+    Tool {
+        name: "retry_stage",
+        route: "RetryRun",
+        needs: Level::Run,
+        description: "Start the next attempt of a run that failed or was stopped: a new run at the stage the old one ended at, with a new thread. Give the id of the card's newest run. The card must be failed or stopped.",
+        schema: run_id_only,
+    },
+    Tool {
         name: "get_hive_health",
         route: "GetStatus",
         needs: Level::Read,
@@ -262,6 +276,14 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
     ),
     (
+        "PauseAll",
+        "a person's call from the board, at the Admin level; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "ResetCard",
+        "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
     ),
@@ -290,6 +312,10 @@ fn no_arguments() -> Value {
 
 fn card_id_only() -> Value {
     object(vec![("cardId", string("The card's id."))], &["cardId"])
+}
+
+fn run_id_only() -> Value {
+    object(vec![("runId", string("The run's id."))], &["runId"])
 }
 
 fn create_card() -> Value {

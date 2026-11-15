@@ -61,12 +61,21 @@ service EngineService {
   // closed, it ends with outcome stopped, its open items are resolved, and
   // its card is stopped. It fails with FailedPrecondition for a run that has
   // ended with nothing left open.
+  //
+  // Beehive: the stage's agent is told in its thread to stop, the run's timers
+  // are cleared, and the run's last step is routed to stopped. A person or an
+  // agent may stop a run.
   rpc StopRun(StopRunRequest) returns (Run);
   // RetryRun starts the next attempt of a run's stage, with optional
   // run-layer setting overrides. It fails with FailedPrecondition unless the
   // run's card is failed or stopped, or an open item for the run offers
   // retry, or the card waits at the route item of a stage that reported
   // failed. That item is resolved as retry when the new attempt starts.
+  //
+  // Beehive: the run must be the card's newest, and the card failed or
+  // stopped. The attempt is a new run at the stage the old one ended at, with
+  // the old run's parameters, and opens a new thread. Non-empty overrides_json
+  // is InvalidArgument: run-layer overrides are not kept yet.
   rpc RetryRun(RetryRunRequest) returns (Run);
   // Approve approves the card's open approval stage, naming the version of
   // each artifact, and moves the card on passed.
@@ -355,12 +364,19 @@ service EngineService {
   // and Stop; Resume continues the agent session. No card is held. Runs
   // waiting with no session, such as an approval or a wait stage, keep
   // waiting.
+  //
+  // Beehive: it holds every running run, as PauseCard does one, and needs the
+  // Admin level. A person only. ResumeCard tells a held stage's agent to
+  // carry on and starts its timeout again.
   rpc PauseAll(PauseAllRequest) returns (PauseAllResponse);
   // ResetCard stops the card's run, closes its issue's open pull request,
   // removes the worktree keeping the branch, and puts the card idle on the
   // first stage, in that order. A step that fails leaves
   // the card where it is with a reset_failed item, and fails the call.
   // Artifacts are kept.
+  //
+  // Beehive: it stops the card's run, if it has one, and puts the card idle.
+  // There is no pull request or worktree to close. A person only.
   rpc ResetCard(ResetCardRequest) returns (Card);
   // RemoveCard takes the card off the board for good. A card with a run that
   // has not ended is FailedPrecondition until the run is stopped, and a test
@@ -764,6 +780,9 @@ message RunStep {
   bool skipped = 9;
   // Times the card was resumed while the stage was running.
   int32 resumes = 10;
+  // Beehive: why the stage's latest attempt failed, such as "build timed out
+  // after 30m". Empty while no attempt has failed in the current round.
+  string failure = 11;
 }
 
 // RunHolder is the engine process that holds a run.
@@ -903,11 +922,13 @@ message StageDoneRequest {
 }
 
 message StopRunRequest {
-  int64 run_id = 1;
+  // Beehive: the run's UUID. The Go engine used an int64.
+  string run_id = 1;
 }
 
 message RetryRunRequest {
-  int64 run_id = 1;
+  // Beehive: the run's UUID. The Go engine used an int64.
+  string run_id = 1;
   // Run-layer setting overrides: a JSON value by setting key, such as the
   // JSON string "opus" for agent.model. They replace the old run's
   // overrides; with none, the old run's carry over.
@@ -983,7 +1004,8 @@ message ResumeCardRequest {
 }
 
 message ResetCardRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
 }
 
 message RemoveCardRequest {

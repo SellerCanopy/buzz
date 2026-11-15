@@ -1,6 +1,6 @@
 //! Card procedures: list, read, create, archive, restore, remove and add a note.
 
-use buzz_hive_core::domain::card::Card as DomainCard;
+use buzz_hive_core::domain::card::{Card as DomainCard, CardState};
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::orchestrator::cards::{self, CardMove, NewCard};
 use uuid::Uuid;
@@ -42,6 +42,8 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         .ok_or_else(|| HiveError::NotFound(format!("card {id} does not exist")))?;
     // `body` is set by GetCard only: it can be 64 KiB. So are the stage threads, which the
     // Live tab reads, and the stage the card's newest run is in.
+    // A card that was reset is idle and starts again at the first stage, so it has no current one.
+    let idle = card.state == CardState::Idle;
     let mut proto = to_proto(card, true);
     proto.stage_id = tx
         .runs()
@@ -50,6 +52,7 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         .into_iter()
         .next()
         .and_then(|run| run.current_stage)
+        .filter(|_| !idle)
         .unwrap_or_default();
     proto.stages = tx
         .runs()

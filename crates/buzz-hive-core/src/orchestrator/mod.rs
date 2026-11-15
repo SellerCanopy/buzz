@@ -12,6 +12,7 @@ mod routes;
 pub mod run;
 pub mod settings;
 pub mod task_message;
+pub mod timers;
 pub mod workflows;
 
 use crate::domain::events::Actor;

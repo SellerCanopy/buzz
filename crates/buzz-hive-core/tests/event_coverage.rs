@@ -17,10 +17,13 @@ use buzz_hive_core::orchestrator::cards::{
 };
 use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
+use buzz_hive_core::orchestrator::timers;
+use buzz_hive_core::testing::ManualClock;
 use buzz_hive_core::testing::MemStore;
-use common::{ctx_for, person, Fixture, BUILDER, CHANNEL};
+use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
+use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 9;
+const CURRENT_PHASE: u8 = 11;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -189,15 +192,35 @@ async fn artifact_scenarios(f: &Fixture) {
         .unwrap();
 }
 
+/// Phase 11: a stage times out and is scheduled to run again.
+async fn retry_scenarios(f: &Fixture, clock: &ManualClock) {
+    let ctx = person();
+    set_setting(
+        &f.env(),
+        &ctx,
+        &Scope::User,
+        "execution.retries.max",
+        Some(serde_json::json!(1)),
+    )
+    .await
+    .unwrap();
+    begun(f, "solo").await;
+    clock.advance(Duration::from_secs(31 * 60));
+    for timer in timers::due(&f.store, COMMUNITY, 10).await.unwrap() {
+        timers::fire(&f.env(), COMMUNITY, &timer).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
-    let f = Fixture::new();
+    let (f, clock) = Fixture::timed();
     let store = &f.store;
     card_scenarios(store).await;
     run_scenarios(&f).await;
     report_scenarios(&f).await;
     routing_scenarios(&f).await;
     artifact_scenarios(&f).await;
+    retry_scenarios(&f, &clock).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

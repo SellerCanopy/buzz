@@ -44,6 +44,8 @@ pub struct App {
     pub hive_pubkey: String,
     /// Wakes the outbox drain after a commit that queued a post.
     pub outbox: Arc<tokio::sync::Notify>,
+    /// Wakes the timer loop after a commit that may have set a timer.
+    pub timers: Arc<tokio::sync::Notify>,
 }
 
 impl App {
@@ -74,7 +76,7 @@ impl App {
     ///
     /// An operation that can queue a post to the relay passes `needs_hive`, and fails here with
     /// the sentence to show when the service has no relay account. Its [`Op::settle`] wakes the
-    /// outbox drain. The others read and write cards, artifacts and settings with no relay
+    /// outbox drain and the timer loop. The others read and write cards, artifacts and settings with no relay
     /// account at all, and wake nothing.
     pub fn op(&self, needs_hive: bool) -> Result<Op<'_>, HiveError> {
         let hive = if needs_hive {
@@ -134,6 +136,9 @@ impl Op<'_> {
         self.app.bus.publish(events);
         if self.queues {
             self.app.outbox.notify_one();
+            // A start, a report, a resume or a retry may have set a timer sooner than any the
+            // loop is waiting for.
+            self.app.timers.notify_one();
         }
     }
 }

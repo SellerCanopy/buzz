@@ -88,6 +88,9 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     ("artifact.saved", 9),
     // A person set whether later stages get an artifact.
     ("artifact.handoff", 9),
+    // A stage's attempt failed and will run again. The payload has the stage, the attempt
+    // that failed, how many seconds until the next one, and why it failed.
+    ("retry.scheduled", 11),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

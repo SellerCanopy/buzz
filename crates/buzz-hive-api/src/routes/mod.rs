@@ -63,6 +63,10 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("LogWork", Level::Run),
     ("RecordDecision", Level::Run),
     ("ReadHistory", Level::Read),
+    ("StopRun", Level::Run),
+    ("RetryRun", Level::Run),
+    ("PauseAll", Level::Admin),
+    ("ResetCard", Level::Run),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -165,5 +169,9 @@ pub fn router() -> Router<App> {
     let r = route(r, "UpdatePlan", artifacts::update_plan);
     let r = route(r, "LogWork", artifacts::log_work);
     let r = route(r, "RecordDecision", artifacts::record_decision);
-    route(r, "ReadHistory", artifacts::read_history)
+    let r = route(r, "ReadHistory", artifacts::read_history);
+    let r = route(r, "StopRun", runs::stop_run);
+    let r = route(r, "RetryRun", runs::retry_run);
+    let r = route(r, "PauseAll", stages::pause_all);
+    route(r, "ResetCard", stages::reset_card)
 }
