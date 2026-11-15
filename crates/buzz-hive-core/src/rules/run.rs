@@ -1059,6 +1059,11 @@ fn pause(run: &Run) -> Step {
 }
 
 /// Lets a held stage start, or tells the agent of a paused one to carry on.
+///
+/// Pausing retires every timer of the run, including a retry that was waiting, and resuming
+/// starts only the stage's timeout. A stage paused during a retry wait is therefore not retried:
+/// its agent is asked to carry on, and the timeout decides what happens next, as it would for
+/// any stage that stays silent.
 fn resume(run: &Run, wf: &Package, facts: &Facts) -> Step {
     let Some((stage, idx)) = run
         .current_stage

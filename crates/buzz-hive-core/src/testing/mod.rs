@@ -1,5 +1,6 @@
 //! In-memory fakes so core and API tests run with no database.
 
+pub mod directory_scenarios;
 mod fake_relay;
 mod manual_clock;
 mod mem_store;

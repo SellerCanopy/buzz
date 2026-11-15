@@ -133,6 +133,27 @@ async fn requester_of(
             "requester claim was issued to another agent".into(),
         ));
     }
+    // A claim that names an agent is refused even if one was signed: an agent never acts at
+    // another agent's level, or its own, through a claim.
     let requester = app.resolve(&claim.sub).await?;
+    if requester.kind != ActorKind::Person {
+        return Err(HiveError::Unauthenticated(
+            "requester claim names an agent, not a person".into(),
+        ));
+    }
+    // A claim minted from a run lasts only while the run still holds this agent's stage, so
+    // an agent that handed the run on cannot keep acting for the person who started it.
+    if let Some(run) = claim.via.strip_prefix("run:") {
+        match crate::claims::requester_of_run(app, &actor.pubkey, run).await {
+            Ok(person) if person == claim.sub => {}
+            // The store being down says nothing about the run, so it is not a refusal.
+            Err(error) if error.status().is_server_error() => return Err(error),
+            _ => {
+                return Err(HiveError::Unauthenticated(
+                    "requester claim is for a run that no longer holds this agent's stage".into(),
+                ))
+            }
+        }
+    }
     Ok((Some(requester.level), Some(claim.sub)))
 }

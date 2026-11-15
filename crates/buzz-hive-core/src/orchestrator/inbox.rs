@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use super::auto::{artifacts_of, ACTIVITY_AUTO};
 use super::lookup::Memo;
-use super::routes::{append, apply, ask_directory, facts, resolved_payload, Mode};
+use super::routes::{
+    append, apply, ask_directory, ask_next, carrying_requester, facts, resolved_payload, Mode,
+};
 use super::run::{
     check_agent, check_position, locked, people_only, require_position, running_stage, start_in,
     stop_in,
@@ -196,6 +198,9 @@ pub(super) async fn decide(
         let package = env.catalog.get(&held.workflow);
         if let (Some(package), Some(channel)) = (package, update_channel(tx).await?) {
             ask_directory(env, ctx, package, channel).await?;
+            // An answer that finishes the workflow hands the card on, after `resolve` has
+            // appended, so the next workflow's agents are asked for now too.
+            ask_next(env, ctx, tx, package, channel).await?;
         }
     }
     let summary = summary_of(&found, choice);
@@ -205,9 +210,11 @@ pub(super) async fn decide(
         (InboxKind::Failure, ANSWER_RETRY) => {
             resolve(tx, ctx, &mut found, choice, &by, &summary, &run).await?;
             let parameters = run.parameters.clone();
+            // Auto mode retries for the person the run was for, not for the engine's account.
+            let restarted = carrying_requester(ctx, &run);
             start_in(
                 env,
-                ctx,
+                &restarted,
                 tx,
                 card_id,
                 run.current_stage.as_deref(),

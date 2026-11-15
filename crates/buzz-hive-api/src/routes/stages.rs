@@ -103,10 +103,14 @@ pub async fn pause_all(
     _req: PauseAllRequest,
 ) -> Result<PauseAllResponse, HiveError> {
     let op = app.op(false)?;
-    let (paused, events) = hold_all(&op.env(), &ctx.op()).await?;
-    op.settle(&events);
+    let done = hold_all(&op.env(), &ctx.op()).await?;
+    // The runs already held are held, so their events are published even when the sweep failed.
+    op.settle(&done.events);
+    if let Some(error) = done.failed {
+        return Err(error.into());
+    }
     Ok(PauseAllResponse {
-        paused: i32::try_from(paused).unwrap_or(i32::MAX),
+        paused: i32::try_from(done.paused).unwrap_or(i32::MAX),
     })
 }
 

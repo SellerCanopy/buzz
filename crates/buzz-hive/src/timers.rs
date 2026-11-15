@@ -4,17 +4,27 @@
 //! loses nothing: the first pass takes up whatever is due. Timers that came due while the
 //! service was down are spread over the first few seconds, so a restart does not fire them
 //! all at once. After that a commit that set a timer wakes the loop, and a long timer is the
-//! backstop for a wake that was lost. A pass that failed waits longer each time, up to a cap.
+//! backstop for a wake that was lost.
+//!
+//! A timer that cannot be carried out (its workflow left the catalog, say) is pushed later
+//! by a growing wait, the way the outbox drain holds back one card, and parked for an hour
+//! once it has failed [`PARK_AFTER`] times in a row. It never holds up the others. Only a
+//! failure of the store itself backs the whole loop off, and then a wake is not honored,
+//! since it would only fail again.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use buzz_hive_core::bus::Bus;
+use buzz_hive_core::domain::timer::Timer;
 use buzz_hive_core::orchestrator::timers::{due, fire, next_in, spread};
-use buzz_hive_core::orchestrator::Env;
-use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
+use buzz_hive_core::orchestrator::{Env, OpError};
+use buzz_hive_core::ports::store::{CommunityId, Directory, Store, StoreError};
 use buzz_hive_core::workflow::source::CatalogSource;
 use tokio::sync::{watch, Notify};
+use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::drain::retry_after;
 
@@ -26,6 +36,52 @@ const START_JITTER_MS: u64 = 2_000;
 pub const CATCH_UP_WINDOW: Duration = Duration::from_secs(5);
 /// Timers read per pass.
 const BATCH: i64 = 50;
+/// A timer that failed this many times in a row is parked, and logged as an error.
+pub const PARK_AFTER: u32 = 10;
+/// How far a parked timer is pushed back. It is tried again then, in case what was wrong
+/// has been fixed, such as a package that loads again.
+pub const PARKED: Duration = Duration::from_secs(60 * 60);
+
+/// A timer that could not be carried out: how many times in a row, and when it last failed.
+struct Stuck {
+    failures: u32,
+    last: Instant,
+}
+
+/// The timers the loop is holding back, by run, stage and kind.
+#[derive(Default)]
+struct Failing {
+    timers: HashMap<(Uuid, String, &'static str), Stuck>,
+}
+
+impl Failing {
+    fn key(timer: &Timer) -> (Uuid, String, &'static str) {
+        (timer.run_id, timer.stage.clone(), timer.kind.as_str())
+    }
+
+    /// Counts one more failure of `timer`, and returns how many there are in a row.
+    fn failed(&mut self, timer: &Timer, now: Instant) -> u32 {
+        let stuck = self.timers.entry(Self::key(timer)).or_insert(Stuck {
+            failures: 0,
+            last: now,
+        });
+        stuck.failures = stuck.failures.saturating_add(1);
+        stuck.last = now;
+        stuck.failures
+    }
+
+    /// `timer` was carried out, so it starts again from no failures.
+    fn cleared(&mut self, timer: &Timer) {
+        self.timers.remove(&Self::key(timer));
+    }
+
+    /// Forgets a timer that has not failed for two parked spells: it was cleared by a step
+    /// that got there first, and will not be seen again.
+    fn prune(&mut self, now: Instant) {
+        self.timers
+            .retain(|_, stuck| now.saturating_duration_since(stuck.last) < PARKED * 2);
+    }
+}
 
 pub struct TimerLoop {
     pub store: Arc<dyn Store>,
@@ -49,10 +105,11 @@ impl TimerLoop {
             return;
         }
         let mut failures = 0u32;
-        let mut first = true;
+        let mut failing = Failing::default();
+        // Every batch of overdue timers is spread, until a pass finds nothing due.
+        let mut catch_up = true;
         loop {
-            let outcome = self.pass(first, &mut stop).await;
-            first = false;
+            let outcome = self.pass(catch_up, &mut failing, &mut stop).await;
             let wait = match outcome {
                 Pass::Stopped => return,
                 Pass::Failed => {
@@ -66,12 +123,13 @@ impl TimerLoop {
                 }
                 Pass::Idle(wait) => {
                     failures = 0;
+                    catch_up = false;
                     Some(wait)
                 }
             };
             let wait = wait.unwrap_or(BACKSTOP);
             let stopped = if failures > 0 {
-                // The store or a timer is failing, so a wake would only fail again: back off.
+                // The store is failing, so a wake would only fail again: back off.
                 sleep_or_stop(wait, &mut stop).await
             } else {
                 tokio::select! {
@@ -86,7 +144,13 @@ impl TimerLoop {
     }
 
     /// Fires what is due. `catch_up` spreads the timers that are already overdue.
-    async fn pass(&self, catch_up: bool, stop: &mut watch::Receiver<bool>) -> Pass {
+    async fn pass(
+        &self,
+        catch_up: bool,
+        failing: &mut Failing,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Pass {
+        failing.prune(Instant::now());
         let timers = match due(self.store.as_ref(), self.community, BATCH).await {
             Ok(timers) => timers,
             Err(error) => {
@@ -108,7 +172,6 @@ impl TimerLoop {
         } else {
             vec![Duration::ZERO; timers.len()]
         };
-        let mut failed = false;
         let mut waited = Duration::ZERO;
         for (timer, delay) in timers.iter().zip(delays) {
             if sleep_or_stop(delay.saturating_sub(waited), stop).await {
@@ -124,6 +187,7 @@ impl TimerLoop {
             };
             match fire(&env, self.community, timer).await {
                 Ok(events) => {
+                    failing.cleared(timer);
                     if !events.is_empty() {
                         tracing::info!(
                             run = %timer.run_id,
@@ -135,25 +199,58 @@ impl TimerLoop {
                         self.outbox.notify_one();
                     }
                 }
+                // The store is down or broken, which says nothing about this timer. The rest
+                // of the batch would fail the same way.
+                Err(OpError::Store(
+                    error @ (StoreError::Unavailable(_) | StoreError::Internal(_)),
+                )) => {
+                    tracing::warn!(%error, "the store failed while carrying out a timer");
+                    return Pass::Failed;
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        run = %timer.run_id,
-                        stage = %timer.stage,
-                        "a timer could not be carried out; it stays set"
-                    );
-                    failed = true;
+                    let failures = failing.failed(timer, Instant::now());
+                    let wait = if failures >= PARK_AFTER {
+                        tracing::error!(
+                            %error,
+                            run = %timer.run_id,
+                            stage = %timer.stage,
+                            failures,
+                            "a timer keeps failing; it is parked and tried again later"
+                        );
+                        PARKED
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            run = %timer.run_id,
+                            stage = %timer.stage,
+                            failures,
+                            "a timer could not be carried out; it is tried again later"
+                        );
+                        retry_after(failures)
+                    };
+                    // The timer is still set, because its step rolled back. Pushing it later
+                    // keeps it from being read first on every pass.
+                    if let Err(error) = self.postpone(timer, wait).await {
+                        tracing::warn!(%error, "cannot set a failed timer back");
+                        return Pass::Failed;
+                    }
                 }
             }
             if *stop.borrow() {
                 return Pass::Stopped;
             }
         }
-        if failed {
-            Pass::Failed
-        } else {
-            Pass::Worked
-        }
+        Pass::Worked
+    }
+
+    /// Sets `timer` to fire `wait` from now, in place of the time it had.
+    async fn postpone(&self, timer: &Timer, wait: Duration) -> Result<(), StoreError> {
+        let mut tx = self.store.begin(self.community).await?;
+        tx.timers()
+            .arm(timer.run_id, &timer.stage, timer.kind, wait)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 }
 

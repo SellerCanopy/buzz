@@ -16,7 +16,7 @@ use buzz_hive_core::orchestrator::cards::{create_card, NewCard};
 use buzz_hive_core::orchestrator::inbox::{
     answer, approve, ask_gate, list, send_back, send_message,
 };
-use buzz_hive_core::orchestrator::run::{retry_run, skip_stage, start_run};
+use buzz_hive_core::orchestrator::run::{retry_run, skip_stage, start_run, stop_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::{timers, OpError};
 use buzz_hive_core::ports::store::Store;
@@ -730,4 +730,142 @@ async fn a_full_payload_is_read_only_for_an_event_on_the_runs_card() {
     assert!(matches!(far, Err(OpError::NotFound(_))), "{far:?}");
     let unknown = full_payload(&f.store, &person(), Uuid::new_v4(), entry.seq).await;
     assert!(matches!(unknown, Err(OpError::NotFound(_))), "{unknown:?}");
+}
+
+/// An item as it was left open by a run, written straight to the store.
+async fn plant(f: &Fixture, like: &InboxItem, run_id: Uuid) -> InboxItem {
+    let planted = InboxItem {
+        id: Uuid::new_v4(),
+        run_id,
+        resolved_at: None,
+        resolved_by: None,
+        answer: None,
+        ..like.clone()
+    };
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    tx.inbox().insert(&planted).await.unwrap();
+    tx.commit().await.unwrap();
+    planted
+}
+
+#[tokio::test]
+async fn an_answer_is_limited_to_ten_thousand_characters() {
+    let (f, card) = started("three").await;
+    f.report(&builder(), card, "needs_input", "Which?")
+        .await
+        .unwrap();
+    let item = the_open(&f, card, InboxKind::Question).await;
+    let over = answer(&f.env(), &person(), item.id, "reply", &"x".repeat(10_001))
+        .await
+        .unwrap_err();
+    assert!(matches!(over, OpError::InvalidArgument(_)), "{over:?}");
+    // Characters are counted, not bytes.
+    answer(&f.env(), &person(), item.id, "reply", &"é".repeat(10_000))
+        .await
+        .unwrap();
+
+    let (f, card) = at_the_gate().await;
+    let over = send_back(&f.env(), &person(), card, &"x".repeat(10_001))
+        .await
+        .unwrap_err();
+    assert!(matches!(over, OpError::InvalidArgument(_)), "{over:?}");
+    send_back(&f.env(), &person(), card, &"x".repeat(10_000))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_question_is_limited_to_ten_thousand_characters() {
+    let (f, card) = started("three").await;
+    let (stage, visit) = f.at(card).await;
+    let over = ask_gate(
+        &f.env(),
+        &builder(),
+        card,
+        &stage,
+        visit,
+        &"x".repeat(10_001),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(over, OpError::InvalidArgument(_)), "{over:?}");
+    ask_gate(
+        &f.env(),
+        &builder(),
+        card,
+        &stage,
+        visit,
+        &"x".repeat(10_000),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_item_a_run_left_open_is_refused_once_the_run_moved_on() {
+    let (f, card) = started("three").await;
+    f.report(&builder(), card, "needs_input", "Which?")
+        .await
+        .unwrap();
+    let item = the_open(&f, card, InboxKind::Question).await;
+    let old = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.runs().active_for_card(card).await.unwrap().unwrap()
+    };
+    stop_run(&f.env(), &person(), old.id).await.unwrap();
+    retry_run(&f.env(), &person(), old.id).await.unwrap();
+    f.drain().await.unwrap();
+
+    // Stopping the run closed its item. One a racing writer left open must not answer the new run.
+    let stale = plant(&f, &item, old.id).await;
+    let refused = answer(&f.env(), &person(), stale.id, "skip", "")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, OpError::FailedPrecondition(m) if m.contains("the run moved on")),
+        "{refused:?}"
+    );
+    // The new run was not touched by the stale answer.
+    assert_eq!(state(&f, card).await, CardState::Running);
+}
+
+#[tokio::test]
+async fn an_item_the_run_no_longer_waits_on_is_refused_and_stays_open() {
+    let (f, card) = started("three").await;
+    f.report(&builder(), card, "needs_input", "Which?")
+        .await
+        .unwrap();
+    let item = the_open(&f, card, InboxKind::Question).await;
+    let run = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.runs().active_for_card(card).await.unwrap().unwrap()
+    };
+    answer(&f.env(), &person(), item.id, "reply", "Postgres.")
+        .await
+        .unwrap();
+    // The run is running again, so a second question item for it has nothing to answer.
+    let stale = plant(&f, &item, run.id).await;
+    let refused = answer(&f.env(), &person(), stale.id, "reply", "Again.")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, OpError::FailedPrecondition(m) if m.contains("no longer waits")),
+        "{refused:?}"
+    );
+    assert_eq!(open_items(&f, card).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_message_needs_an_update_channel_to_go_to() {
+    let (f, card) = started("three").await;
+    set_setting(&f.env(), &person(), &Scope::User, "update_channel", None)
+        .await
+        .unwrap();
+    let refused = send_message(&f.env(), &person(), card, "Hello.")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, OpError::FailedPrecondition(m) if m.contains("update channel")),
+        "{refused:?}"
+    );
 }

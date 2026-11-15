@@ -143,6 +143,22 @@ pub fn catalog() -> Catalog {
             ]
             .concat(),
         ),
+        // Worked by two agents the other workflows do not use, to be handed a card.
+        (
+            "relay",
+            "  - id: r1\n    kind: prompt\n    agent: reviewer\n    prompt: Review\n  - id: r2\n    kind: prompt\n    agent: tester\n    prompt: Test\n"
+                .to_owned(),
+        ),
+        // Like gated, but the gate is the last stage, so approving it finishes the workflow.
+        (
+            "endgate",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n"
+                    .to_owned(),
+            ]
+            .concat(),
+        ),
         // b sends a failure back to a, and no loop limit bounds it.
         (
             "unbounded",

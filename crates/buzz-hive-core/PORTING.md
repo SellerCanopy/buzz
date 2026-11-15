@@ -461,12 +461,20 @@ spec's title and are confirmed when that phase starts.
   grants `SELECT` on eight `events` columns only; `content` and `sig` stay unreadable.
 - Harness: `buzz-acp` writes the id of the message that starts each turn to
   `<temp>/buzz-requester/<agent>/<index>/<channel>[-<root>]` and gives every MCP server
-  `BUZZ_REQUESTER_FILE`. A mid-turn mention (steering) does not rewrite it. A heartbeat turn
-  has no file. `buzz-hive-mcp` reads the file on every call, asks for a claim, holds it for 60
+  `BUZZ_REQUESTER_FILE`. A message steered into a running turn rewrites it only when it
+  mentions the agent, since only that message can name a requester. A heartbeat turn has no
+  file. `buzz-hive-mcp` reads the file on every call, asks for a claim, holds it for 60
   seconds per message, and sends it as `x-hive-claim`. A refused claim does not stop the call:
   it goes unclaimed and a permission refusal says why no person is named.
-- Fanout: a claim is held up to 60 seconds per client, so a reconnecting fleet makes at most
-  one claim request per agent per minute of activity.
+- Fanout: an issued claim is held up to 60 seconds per client, so a reconnecting fleet makes at
+  most one claim request per agent per minute of activity. A refused claim is not held, so an
+  agent whose message names no person asks again on every call; each ask is two relay reads
+  (the message, and whether a newer one mentions the agent) plus one person lookup.
+- Who a claim may name: a person, never an agent. A message an agent wrote, or a run an agent
+  started for itself, is refused, and `SetAccessLevel` is refused to an agent whose requester is
+  below Admin or is the person being lowered. A claim by chat is also checked for the message's
+  channel, but the message is not tied to the agent's current turn: an agent can still pick any
+  recent message that mentions it and names a person (see the checkpoint 3 fix plan, 1.3).
 - Tests: api `tests/claims.rs`, `tests/access.rs`, `tests/inbox.rs`; shim `tests/shim.rs`;
   `buzz-acp` `requester.rs` and a pool test; store `tests/postgres_roles.rs`;
   `buzz-hive/tests/claim_echo.rs` and `e2e_requester.rs` (needs a local relay).

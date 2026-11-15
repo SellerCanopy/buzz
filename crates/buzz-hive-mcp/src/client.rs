@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use buzz_hive_api::claims::{ClaimReply, ClaimRequest};
 use buzz_hive_api::routes::path;
+use buzz_hive_api::tools::RUN_ID_ARG;
 use buzz_hive_api::unary::CLAIM_HEADER;
 use buzz_hive_api::{AUTH_TOKEN_PATH, CLAIM_PATH};
 use nostr::nips::nip98::{HttpData, HttpMethod};
@@ -230,10 +232,22 @@ impl HiveClient {
             .and_then(|file| std::fs::read_to_string(file).ok())
             .map(|text| text.trim().to_owned())
             .filter(|id| !id.is_empty());
-        let run = arguments["run_id"].as_str().filter(|id| !id.is_empty());
+        let run = arguments[RUN_ID_ARG].as_str().filter(|id| !id.is_empty());
         let (basis, body) = match (event, run) {
-            (Some(id), _) => (format!("event:{id}"), serde_json::json!({ "event_id": id })),
-            (None, Some(id)) => (format!("run:{id}"), serde_json::json!({ "run_id": id })),
+            (Some(id), _) => (
+                format!("event:{id}"),
+                ClaimRequest {
+                    event_id: id,
+                    ..ClaimRequest::default()
+                },
+            ),
+            (None, Some(id)) => (
+                format!("run:{id}"),
+                ClaimRequest {
+                    run_id: id.to_owned(),
+                    ..ClaimRequest::default()
+                },
+            ),
             (None, None) => return Claim::None,
         };
         let mut held = self.claim.lock().await;
@@ -261,17 +275,17 @@ impl HiveClient {
             Err(error) => Err(error),
         };
         match reply {
-            Ok(reply) => match (reply["claim"].as_str(), reply["expires_at"].as_i64()) {
-                (Some(value), Some(expires_at)) => {
+            Ok(reply) => match serde_json::from_value::<ClaimReply>(reply) {
+                Ok(reply) => {
                     *held = Some(HeldClaim {
                         basis,
-                        value: value.to_owned(),
+                        value: reply.claim.clone(),
                         fetched_at: now,
-                        expires_at,
+                        expires_at: reply.expires_at,
                     });
-                    Claim::Held(value.to_owned())
+                    Claim::Held(reply.claim)
                 }
-                _ => Claim::Refused(CallError::new(
+                Err(_) => Claim::Refused(CallError::new(
                     "internal",
                     "Beehive's claim reply has no claim or expiry",
                 )),
@@ -378,7 +392,16 @@ async fn read_reply(response: reqwest::Response) -> Result<Value, CallError> {
         .map_err(|_| CallError::new("unavailable", "Beehive's reply was cut short"))?;
     let json: Option<Value> = serde_json::from_str(&text).ok();
     if status.is_success() {
-        return Ok(json.unwrap_or(Value::Null));
+        // An empty reply is a success with nothing to say. Anything else that is not JSON is a
+        // proxy's page or a cut-off body, and must not read as an accepted call.
+        return match json {
+            Some(json) => Ok(json),
+            None if text.trim().is_empty() => Ok(Value::Null),
+            None => Err(CallError::new(
+                "internal",
+                format!("Beehive answered {status} with a body that is not JSON"),
+            )),
+        };
     }
     let field = |name: &str| {
         json.as_ref()

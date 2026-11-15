@@ -62,23 +62,27 @@ pub fn record_requester(path: &Path, event_id: &str) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
+/// The newest event in `batch` that mentions `agent_pubkey_hex`, the one the service
+/// accepts as naming a requester.
+pub fn newest_mention(batch: &[BatchEvent], agent_pubkey_hex: &str) -> Option<String> {
+    batch
+        .iter()
+        .rev()
+        .find(|be| {
+            be.event.tags.iter().any(|tag| {
+                let tag = tag.as_slice();
+                tag.first().map(String::as_str) == Some("p")
+                    && tag.get(1).map(String::as_str) == Some(agent_pubkey_hex)
+            })
+        })
+        .map(|be| be.routing_event_id())
+}
+
 /// The event of a new turn's batch that asks `agent_pubkey_hex` to act: the last one that
 /// mentions it, else the last one. A batch of several messages is one turn, and the newest
 /// mention is the one the service accepts.
 pub fn requester_event(batch: &[BatchEvent], agent_pubkey_hex: &str) -> Option<String> {
-    let mentions = |be: &&BatchEvent| {
-        be.event.tags.iter().any(|tag| {
-            let tag = tag.as_slice();
-            tag.first().map(String::as_str) == Some("p")
-                && tag.get(1).map(String::as_str) == Some(agent_pubkey_hex)
-        })
-    };
-    batch
-        .iter()
-        .rev()
-        .find(mentions)
-        .or_else(|| batch.last())
-        .map(|be| be.routing_event_id())
+    newest_mention(batch, agent_pubkey_hex).or_else(|| batch.last().map(|be| be.routing_event_id()))
 }
 
 #[cfg(test)]
@@ -185,6 +189,27 @@ mod tests {
         }
         reader.join().unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn only_a_message_that_mentions_the_agent_is_a_steered_requester() {
+        let agent = nostr::Keys::generate().public_key();
+        let (mention, plain) = (batch_event(Some(&agent)), batch_event(None));
+        let hex = agent.to_hex();
+        assert_eq!(
+            newest_mention(std::slice::from_ref(&mention), &hex),
+            Some(mention.routing_event_id())
+        );
+        assert_eq!(newest_mention(std::slice::from_ref(&plain), &hex), None);
+        // The turn start still falls back to the last message when none mentions the agent.
+        assert_eq!(
+            requester_event(std::slice::from_ref(&plain), &hex),
+            Some(plain.routing_event_id())
+        );
+        assert_eq!(
+            newest_mention(&[mention.clone(), plain], &hex),
+            Some(mention.routing_event_id())
+        );
     }
 
     fn batch_event(agent: Option<&nostr::PublicKey>) -> BatchEvent {

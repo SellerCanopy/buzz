@@ -1287,6 +1287,36 @@ impl AgentPool {
         true
     }
 
+    /// Names the message folded into the running turn in `scope` as who asked, when it
+    /// mentions the agent. The service refuses a requester event once a newer message in its
+    /// thread mentions the agent, so a steer that is not recorded makes every later claim in
+    /// the turn fail. A message that does not mention the agent changes nothing.
+    pub fn record_steered_requester(
+        &self,
+        scope: &SessionScope,
+        agent_pubkey_hex: &str,
+        steered: &[crate::queue::BatchEvent],
+    ) {
+        let Some(event_id) = requester::newest_mention(steered, agent_pubkey_hex) else {
+            return;
+        };
+        let Some(meta) = self
+            .task_map
+            .values()
+            .find(|meta| meta.scope.as_ref() == Some(scope))
+        else {
+            return;
+        };
+        let path = requester::requester_path(agent_pubkey_hex, meta.agent_index, scope);
+        if let Err(error) = requester::record_requester(&path, &event_id) {
+            tracing::warn!(
+                target: "pool::session",
+                "could not record who asked in {}: {error}",
+                path.display()
+            );
+        }
+    }
+
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
         self.result_tx.clone()
     }
@@ -7558,6 +7588,61 @@ done"#
             .find(|var| var["name"] == requester::REQUESTER_FILE_ENV)
             .expect("the tool server is told where the requester file is");
         assert_eq!(named["value"], path.display().to_string());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_message_steered_into_a_running_turn_becomes_who_asked_when_it_mentions_the_agent() {
+        let agent_keys = Keys::generate();
+        let agent_hex = agent_keys.public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let steered = |mentions: bool| {
+            let mut builder = EventBuilder::new(Kind::Custom(9), "and one more thing");
+            if mentions {
+                builder = builder.tag(Tag::public_key(agent_keys.public_key()));
+            }
+            crate::queue::BatchEvent {
+                edit: None,
+                event: builder.sign_with_keys(&Keys::generate()).unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }
+        };
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        pool.task_map.insert(
+            tokio::spawn(async {}).id(),
+            TaskMeta {
+                agent_index: 5,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let path = requester::requester_path(&agent_hex, 5, &scope);
+        requester::record_requester(&path, "first").unwrap();
+
+        // A message that does not ask the agent to act leaves the file as it was.
+        pool.record_steered_requester(&scope, &agent_hex, &[steered(false)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+
+        let mention = steered(true);
+        pool.record_steered_requester(&scope, &agent_hex, std::slice::from_ref(&mention));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            mention.routing_event_id(),
+            "the steered message is who asked now"
+        );
+
+        // A scope with no turn running has no file to update.
+        let other = conv(Uuid::new_v4());
+        pool.record_steered_requester(&other, &agent_hex, &[steered(true)]);
+        assert!(!requester::requester_path(&agent_hex, 5, &other).exists());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

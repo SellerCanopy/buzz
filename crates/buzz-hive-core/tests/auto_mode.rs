@@ -14,7 +14,7 @@ use buzz_hive_core::domain::inbox::{InboxItem, InboxKind};
 use buzz_hive_core::orchestrator::activity::{list_activity, ActivityFilter};
 use buzz_hive_core::orchestrator::artifacts::save_artifact;
 use buzz_hive_core::orchestrator::cards::{create_card, NewCard};
-use buzz_hive_core::orchestrator::inbox::{approve, list};
+use buzz_hive_core::orchestrator::inbox::{answer, approve, list};
 use buzz_hive_core::orchestrator::run::{skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::{timers, usage, OpError};
@@ -321,10 +321,81 @@ async fn a_failed_run_is_started_again_twice_then_left_for_a_person() {
         .unwrap()
         .contains("retry 1 of 2"));
 
+    // Each run auto mode started again is for the person the first one was for, never for the
+    // engine's own account.
+    {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        let runs = tx.runs().list(Some(card)).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        assert!(
+            runs.iter()
+                .all(|run| run.requester.as_deref() == Some("aa")),
+            "{:?}",
+            runs.iter().map(|r| &r.requester).collect::<Vec<_>>()
+        );
+    }
+
     // A run auto mode started again is not one an agent started.
     let found = usage::get(&f.store, &person(), HIVE).await.unwrap();
     assert_eq!(found.runs, 3);
     assert!(found.weeks.iter().all(|w| w.runs_started_by_agents == 0));
+}
+
+/// The current run times out, is retried once, and fails for good.
+async fn run_fails(f: &Fixture, clock: &ManualClock) {
+    clock.advance(10 * MINUTE);
+    fire_due(f).await;
+    clock.advance(MINUTE);
+    fire_due(f).await;
+    f.drain().await.unwrap();
+    clock.advance(10 * MINUTE);
+    fire_due(f).await;
+}
+
+#[tokio::test]
+async fn a_person_retry_in_between_starts_the_automatic_count_again() {
+    let (f, clock): (Fixture, ManualClock) = Fixture::timed();
+    set(&f, "execution.timeout", json!("10m")).await;
+    set(&f, "execution.retries.max", json!(1)).await;
+    set(&f, "execution.retries.backoff", json!("1m")).await;
+    let card = auto_card(&f, "solo").await;
+
+    // The first failure is retried by auto mode.
+    run_fails(&f, &clock).await;
+    assert_eq!(answered_by_the_engine(&f, card, "retry").await.len(), 1);
+
+    // With auto mode off, the second failure waits, and a person retries it.
+    set_setting(
+        &f.env(),
+        &person(),
+        &Scope::Card(card),
+        "card.auto_mode",
+        Some(json!(false)),
+    )
+    .await
+    .unwrap();
+    run_fails(&f, &clock).await;
+    let waiting = open_items(&f, card).await;
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].kind, InboxKind::Failure);
+    answer(&f.env(), &person(), waiting[0].id, "retry", "")
+        .await
+        .unwrap();
+    f.drain().await.unwrap();
+
+    // The next failure counts from nothing: auto mode says it is its first retry, not its second.
+    auto_on(&f, card).await;
+    run_fails(&f, &clock).await;
+    assert_eq!(runs_of(&f, card).await, 4);
+    assert_eq!(answered_by_the_engine(&f, card, "retry").await.len(), 2);
+    let auto = entries(&f, card, "auto").await;
+    assert!(
+        auto.last().unwrap().payload["detail"]
+            .as_str()
+            .unwrap()
+            .contains("retry 1 of 2"),
+        "{auto:?}"
+    );
 }
 
 #[tokio::test]
@@ -418,4 +489,55 @@ async fn auto_mode_belongs_to_a_card() {
     .await
     .unwrap_err();
     assert!(matches!(text, OpError::InvalidArgument(_)), "{text:?}");
+}
+
+#[tokio::test]
+async fn a_card_auto_mode_hands_on_keeps_the_person_the_first_run_was_for() {
+    let f = Fixture::new();
+    {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.workflows()
+            .set_options(
+                "endgate",
+                &buzz_hive_core::workflow::options::WorkflowOptions {
+                    next_workflow: "second".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let card = auto_card(&f, "endgate").await;
+    save_plan(&f, card).await;
+    buzz_hive_core::orchestrator::run::stage_done(
+        &f.env(),
+        &builder(),
+        card,
+        "draft",
+        1,
+        "passed",
+        "",
+    )
+    .await
+    .unwrap();
+
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let runs = tx.runs().list(Some(card)).await.unwrap();
+    assert_eq!(
+        runs.len(),
+        2,
+        "the gate was approved and the card handed on"
+    );
+    assert!(runs
+        .iter()
+        .all(|run| run.requester.as_deref() == Some("aa")));
+}
+
+#[tokio::test]
+async fn an_agent_with_no_claim_starts_a_run_for_no_one() {
+    let f = Fixture::new();
+    let card = card_on(&f, "solo").await;
+    let (run, _) = start_run(&f.env(), &builder(), card).await.unwrap();
+    assert_eq!(run.requester, None, "an agent is never its own requester");
 }

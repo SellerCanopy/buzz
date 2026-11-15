@@ -15,6 +15,7 @@ use super::lookup::Memo;
 use super::task_message::{render_task, with_card_link, CardText, Handoff};
 use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
+use crate::access::ActorKind;
 use crate::config::{self, Layer, Layers, Resolution};
 use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
@@ -22,7 +23,7 @@ use crate::domain::inbox::{InboxItem, ANSWER_SUPERSEDED};
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::TimerKind;
 use crate::domain::workflow::Duration as SettingDuration;
-use crate::ports::store::{Posting, Tx};
+use crate::ports::store::{Posting, Pubkey, Tx};
 use crate::rules::run::{
     entry_stage, step, task_key, Effect, Ended, Execution, Facts, Input, Note, Round, Step,
 };
@@ -160,6 +161,26 @@ pub(super) fn run_layer(parameters: &BTreeMap<String, String>) -> Layer {
     )
 }
 
+/// The person a run started by `ctx` is for: the person an agent acts for, or the person
+/// who asked. An agent with no claim, and the engine's own account, name no one, so a run
+/// never records an agent as the person it acts for.
+fn requester_of(ctx: &Ctx) -> Option<Pubkey> {
+    ctx.requester
+        .clone()
+        .or_else(|| (ctx.actor.kind == ActorKind::Person).then(|| ctx.actor.pubkey.clone()))
+}
+
+/// `ctx` for a run that someone other than a person starts on a run's behalf, such as auto
+/// mode retrying it or a finished workflow handing its card on: the new run keeps `earlier`'s
+/// requester. A person who asks keeps their own place as the requester.
+pub(super) fn carrying_requester(ctx: &Ctx, earlier: &Run) -> Ctx {
+    let mut carried = ctx.clone();
+    if ctx.actor.kind != ActorKind::Person && carried.requester.is_none() {
+        carried.requester = earlier.requester.clone();
+    }
+    carried
+}
+
 /// Makes a run of `package` for `card`, starts it at `stage` (the first stage when `None`)
 /// and carries out the first step. `held` makes the entry stage honor the workflow's
 /// pauses. Nothing is written until the entry stage's agent is known, so a refusal leaves the
@@ -184,11 +205,7 @@ pub(super) async fn begin_run(
         package,
         &facts,
         Input::Start {
-            requester: Some(
-                ctx.requester
-                    .clone()
-                    .unwrap_or_else(|| ctx.actor.pubkey.clone()),
-            ),
+            requester: requester_of(ctx),
             stage: stage.map(str::to_owned),
             held,
         },
@@ -246,6 +263,8 @@ pub(super) async fn apply(
     if auto_mode_of(tx, card.id).await? {
         if let Some(channel) = channel {
             ask_directory(env, ctx, package, channel).await?;
+            // An answer auto mode gives may finish the workflow and hand the card on.
+            ask_next(env, ctx, tx, package, channel).await?;
         }
     }
     let next = if ended == Some(Ended::Done) && mode == Mode::Update {
@@ -477,7 +496,7 @@ pub(super) async fn apply(
     // A run that ends in the step that starts it, because its conditions skip every stage,
     // does not hand off, so two workflows that hand off to each other cannot loop.
     if let Some(next) = next {
-        hand_off(env, ctx, tx, card, next).await?;
+        hand_off(env, ctx, tx, card, &run, next).await?;
     }
     // A card in auto mode answers the item this step opened, and whatever the answer opens in
     // turn. The run and the card are then as the answers left them.
@@ -526,6 +545,24 @@ pub(super) async fn ask_directory(
         }
     }
     Ok(())
+}
+
+/// Asks the directory what the workflow `package` hands finished cards to will need, for a
+/// step that appends before it knows whether the workflow ends. Nothing is asked when the
+/// workflow has no next one, or it is not loaded.
+pub(super) async fn ask_next(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    tx: &mut dyn Tx,
+    package: &Package,
+    channel: Uuid,
+) -> Result<(), OpError> {
+    let options = tx.workflows().options().await?;
+    let next = resolve_options(package, options.get(&package.meta.name)).next;
+    match env.catalog.get(&next) {
+        Some(target) if !next.is_empty() => ask_directory(env, ctx, target, channel).await,
+        _ => Ok(()),
+    }
 }
 
 fn need_channel(channel: Option<Uuid>) -> Result<Uuid, OpError> {
@@ -685,6 +722,7 @@ async fn hand_off(
     ctx: &Ctx,
     tx: &mut dyn Tx,
     card: &mut Card,
+    finished: &Run,
     next: Next<'_>,
 ) -> Result<(), OpError> {
     let (next, target) = match next {
@@ -704,7 +742,7 @@ async fn hand_off(
     tx.events().append(at).await?;
     Box::pin(begin_run(
         env,
-        ctx,
+        &carrying_requester(ctx, finished),
         tx,
         card,
         target,
@@ -776,6 +814,18 @@ pub(super) async fn append(
     run: &Run,
     payload: serde_json::Value,
 ) -> Result<(), OpError> {
+    // One line per transition, so a stuck or misrouted run can be followed from the log. It is
+    // written before the commit: a step that rolls back, such as an auto answer the savepoint
+    // undoes, still shows what it tried.
+    tracing::info!(
+        kind,
+        card = %run.card_id,
+        run = %run.id,
+        stage = payload["stage"].as_str().unwrap_or(""),
+        visit = payload["visit"].as_u64().unwrap_or(0),
+        actor = %ctx.actor.pubkey,
+        "run event"
+    );
     let event = Event::new(
         kind,
         Some(run.card_id),

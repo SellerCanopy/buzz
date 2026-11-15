@@ -445,6 +445,12 @@ impl AccessRepo for MemTx {
         rows.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
         Ok(rows)
     }
+
+    /// Transactions here work on a copy and never wait on each other, so there is nothing to
+    /// take. Postgres serialises access changes, and its test shows it.
+    async fn lock(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1338,7 +1344,7 @@ impl Directory for FakeDirectory {
                 && MESSAGE_KINDS.contains(&e.kind)
                 && e.channel_id == event.channel_id
                 && e.mentions(agent)
-                && e.thread_root() == root
+                && e.in_thread(root)
                 && (e.created_at, &e.id) > (event.created_at, &event.id)
         }))
     }

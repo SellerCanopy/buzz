@@ -24,6 +24,7 @@ serde_yaml = { workspace = true }
 schemars = { workspace = true, features = ["derive", "std"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Lets this crate's own integration tests use the `testing` module.

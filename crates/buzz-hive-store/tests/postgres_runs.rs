@@ -253,6 +253,35 @@ async fn runs_stay_in_their_community() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn a_stage_thread_is_found_by_its_root_in_its_own_community_only() {
+    let (store, _guard, _relay) = store("hive_thread_root").await;
+    let (one, two) = (CommunityId::from_u128(1), CommunityId::from_u128(2));
+    let thread = StageThread {
+        card_id: Uuid::from_u128(1),
+        stage: "build".into(),
+        visit: 1,
+        root_event_id: "e1".into(),
+        agent_pubkey: "bb".into(),
+        channel_id: Uuid::from_u128(77),
+    };
+    let mut tx = store.begin(one).await.unwrap();
+    tx.cards().insert(&card(1)).await.unwrap();
+    tx.runs().record_thread(&thread).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = store.begin(one).await.unwrap();
+    assert_eq!(
+        tx.runs().thread_by_root("e1").await.unwrap(),
+        Some(thread.clone())
+    );
+    assert_eq!(tx.runs().thread_by_root("e2").await.unwrap(), None);
+    // The same root in another community is another thread, or none.
+    let mut tx = store.begin(two).await.unwrap();
+    assert_eq!(tx.runs().thread_by_root("e1").await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn a_stage_thread_is_recorded_once() {
     let (store, _guard, _relay) = store("hive_threads").await;
     let community = CommunityId::from_u128(1);

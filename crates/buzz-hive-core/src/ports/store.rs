@@ -80,6 +80,9 @@ pub trait AccessRepo: Send {
         by: &str,
     ) -> Result<(), StoreError>;
     async fn list(&mut self) -> Result<Vec<AccessRow>, StoreError>;
+    /// Takes this community's access lock until commit, so a change to levels waits for the
+    /// one before it and reads what that one wrote. Nothing else waits on it.
+    async fn lock(&mut self) -> Result<(), StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -496,7 +499,10 @@ pub trait Directory: Send + Sync {
         id: &str,
     ) -> Result<Option<RelayEvent>, StoreError>;
     /// Whether a message newer than `event` mentions `agent` in the thread rooted at `root`,
-    /// in the channel of `event`. Messages in the same second are ordered by id.
+    /// in the channel of `event`. Messages in the same second are ordered by id. A message is in
+    /// the thread when one of its `e` tags names `root`, whatever the tag's marker (see
+    /// [`RelayEvent::in_thread`]). The scenarios in `testing::directory_scenarios` hold every
+    /// implementation to this.
     async fn newer_mention(
         &self,
         community: CommunityId,
@@ -531,6 +537,15 @@ impl RelayEvent {
         self.tags
             .iter()
             .any(|t| t.first().is_some_and(|k| k == "p") && t.get(1).is_some_and(|v| v == pubkey))
+    }
+
+    /// Whether one of the message's `e` tags names `root`, whatever its marker. This is the
+    /// rule the relay query applies to decide whether a message is in a thread, so a fake
+    /// directory uses it too.
+    pub fn in_thread(&self, root: &str) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.first().is_some_and(|k| k == "e") && t.get(1).is_some_and(|v| v == root))
     }
 
     /// The id of the thread the message belongs to: the event its `root` marker names, else

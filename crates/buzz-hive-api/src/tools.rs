@@ -15,6 +15,7 @@ use buzz_hive_core::orchestrator::artifacts::MAX_PLAN_ITEM_BYTES;
 use buzz_hive_core::orchestrator::cards::{
     MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
 };
+use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
     MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
@@ -385,8 +386,12 @@ fn card_id_only() -> Value {
     object(vec![("cardId", string("The card's id."))], &["cardId"])
 }
 
+/// The argument that names a run, in the tools that take one. The MCP shim reads it from a
+/// call to fall back to a run claim, so the schemas below are its only owner.
+pub const RUN_ID_ARG: &str = "runId";
+
 fn run_id_only() -> Value {
-    object(vec![("runId", string("The run's id."))], &["runId"])
+    object(vec![(RUN_ID_ARG, string("The run's id."))], &[RUN_ID_ARG])
 }
 
 fn create_card() -> Value {
@@ -506,7 +511,9 @@ fn ask_gate() -> Value {
             ("visit", visit_field()),
             (
                 "question",
-                string("What you need a person to decide. Up to 10000 characters."),
+                string(&format!(
+                    "What you need a person to decide. Up to {MAX_TEXT_CHARS} characters."
+                )),
             ),
         ],
         &["cardId", "stage", "visit", "question"],
@@ -573,7 +580,7 @@ fn list_runs() -> Value {
 }
 
 fn get_run() -> Value {
-    object(vec![("runId", string("The run's id."))], &["runId"])
+    run_id_only()
 }
 
 fn add_note() -> Value {
@@ -889,6 +896,7 @@ mod tests {
         has("record_decision", &MAX_REJECTED);
         has("read_history", &MAX_HISTORY_LIMIT);
         has("read_history", &DEFAULT_HISTORY_LIMIT);
+        has("ask_gate", &MAX_TEXT_CHARS);
     }
 
     #[test]

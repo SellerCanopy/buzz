@@ -32,6 +32,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+buzz-hive-core = { path = "../buzz-hive-core", features = ["testing"] }
 tempfile = "3"
 base64 = { workspace = true }
 futures-util = { workspace = true }
@@ -42,3 +43,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tower = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

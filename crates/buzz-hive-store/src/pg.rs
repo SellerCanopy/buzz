@@ -203,6 +203,18 @@ impl AccessRepo for PgTx {
             .map(|(pubkey, level, kind)| decode_row(pubkey, level, kind))
             .collect()
     }
+
+    async fn lock(&mut self) -> Result<(), StoreError> {
+        // Its own key, apart from the event log's, so a change to levels never queues the
+        // community's other writers. A change takes this first and the log's second, and no
+        // path takes them the other way round.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive.access'), hashtext($1::text))")
+            .bind(self.community)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]

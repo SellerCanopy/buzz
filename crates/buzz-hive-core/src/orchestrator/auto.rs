@@ -20,7 +20,7 @@ use super::{Ctx, Env, OpError};
 use crate::access::ActorKind;
 use crate::domain::events::Actor;
 use crate::domain::inbox::{InboxItem, InboxKind, ANSWER_APPROVE, ANSWER_RETRY};
-use crate::ports::store::Tx;
+use crate::ports::store::{StoreError, Tx};
 use crate::rules::auto::{auto_answer, AutoAnswer, Tries, AUTO_RESUMES, AUTO_RETRIES};
 use crate::workflow::load::Package;
 
@@ -62,6 +62,13 @@ pub(super) async fn settle(
             AutoAnswer::Approve => (ANSWER_APPROVE, reason),
             AutoAnswer::Retry | AutoAnswer::Resume => (ANSWER_RETRY, reason),
             AutoAnswer::Person { reason } => {
+                tracing::info!(
+                    card = %card_id,
+                    item = %item.id,
+                    stage = %item.stage,
+                    reason = %reason,
+                    "auto mode left an item for a person"
+                );
                 leave(tx, &engine, &item, &reason).await?;
                 continue;
             }
@@ -83,11 +90,31 @@ pub(super) async fn settle(
             Ok(_) => {
                 tx.release_savepoint().await?;
                 answered = true;
+                tracing::info!(
+                    card = %card_id,
+                    item = %item.id,
+                    stage = %item.stage,
+                    choice,
+                    reason = %reason,
+                    "auto mode answered"
+                );
             }
-            // A failed store may have left the transaction unusable: let the caller see it.
-            Err(OpError::Store(e)) => return Err(e.into()),
+            // An unavailable or broken store may have left the transaction unusable: let the
+            // caller see it. A conflict or a missing row is undone by the savepoint like any
+            // other refusal.
+            Err(OpError::Store(e @ (StoreError::Unavailable(_) | StoreError::Internal(_)))) => {
+                return Err(e.into())
+            }
             Err(refused) => {
                 tx.rollback_savepoint().await?;
+                tracing::warn!(
+                    card = %card_id,
+                    item = %item.id,
+                    stage = %item.stage,
+                    choice,
+                    reason = %refused,
+                    "auto mode could not answer"
+                );
                 leave(
                     tx,
                     &engine,

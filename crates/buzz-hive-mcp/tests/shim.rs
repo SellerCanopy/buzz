@@ -46,6 +46,12 @@ struct Fake {
     claim_requests: Mutex<Vec<Value>>,
     /// When set, a claim request is refused with this message.
     refuse_claims: Mutex<Option<String>>,
+    /// How long, in seconds, a claim the fake issues lasts.
+    claim_lifetime: AtomicI64,
+    /// When set, the claim route answers with this status and plain text.
+    claim_failure: Mutex<Option<(StatusCode, &'static str)>>,
+    /// When set, the claim route answers 200 with this body in place of a claim.
+    claim_reply: Mutex<Option<Value>>,
 }
 
 async fn claim(
@@ -53,6 +59,12 @@ async fn claim(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     fake.claim_requests.lock().unwrap().push(body);
+    if let Some((status, text)) = *fake.claim_failure.lock().unwrap() {
+        return (status, Json(json!(text)));
+    }
+    if let Some(reply) = fake.claim_reply.lock().unwrap().clone() {
+        return (StatusCode::OK, Json(reply));
+    }
     if let Some(message) = fake.refuse_claims.lock().unwrap().clone() {
         return (
             StatusCode::FORBIDDEN,
@@ -62,7 +74,11 @@ async fn claim(
     let n = fake.claim_requests.lock().unwrap().len();
     (
         StatusCode::OK,
-        Json(json!({"claim": format!("claim{n}"), "expires_at": fake.clock.now() + 300})),
+        Json(json!({
+            "claim": format!("claim{n}"),
+            "expires_at": fake.clock.now() + fake.claim_lifetime.load(Ordering::SeqCst),
+            "requester": "person",
+        })),
     )
 }
 
@@ -134,10 +150,22 @@ async fn start(clock: Arc<TestClock>) -> (String, Arc<Fake>) {
         event_ids: Mutex::new(Vec::new()),
         claim_requests: Mutex::new(Vec::new()),
         refuse_claims: Mutex::new(None),
+        claim_lifetime: AtomicI64::new(300),
+        claim_failure: Mutex::new(None),
+        claim_reply: Mutex::new(None),
     });
     let app = Router::new()
         .route(buzz_hive_api::AUTH_TOKEN_PATH, post(trade))
         .route(buzz_hive_api::CLAIM_PATH, post(claim))
+        // A proxy's page, and an empty reply, where Beehive's JSON should be.
+        .route(
+            &buzz_hive_api::routes::path("Html"),
+            post(|| async { (StatusCode::OK, "<html>sign in</html>") }),
+        )
+        .route(
+            &buzz_hive_api::routes::path("Empty"),
+            post(|| async { StatusCode::OK }),
+        )
         .route(&buzz_hive_api::routes::path("{method}"), post(procedure))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -460,7 +488,7 @@ async fn a_call_that_names_a_run_claims_from_the_run_when_there_is_no_turn_file(
     let clock = TestClock::at(1_000);
     let (url, fake) = start(clock.clone()).await;
     let reply = client(&url, Keys::generate(), clock)
-        .call("StageDone", json!({"run_id": "r1"}))
+        .call("StageDone", json!({"runId": "r1"}))
         .await;
     // The fake refuses StageDone, but the claim was asked for and sent.
     assert!(reply.is_err());
@@ -477,7 +505,7 @@ async fn the_message_wins_over_the_run() {
     let (_dir, file) = requester_file("aa11");
     let client = client_with_file(&url, Keys::generate(), clock, Some(file));
     client
-        .call("GetCard", json!({"run_id": "r1"}))
+        .call("GetCard", json!({"runId": "r1"}))
         .await
         .unwrap();
     assert_eq!(
@@ -547,4 +575,146 @@ fn config_reads_the_requester_file_from_the_environment() {
     );
     assert_eq!(with(Some("  ")).requester_file, None);
     assert_eq!(with(None).requester_file, None);
+}
+
+/// A claim request for each call, whatever came of the one before.
+fn claim_count(fake: &Fake) -> usize {
+    fake.claim_requests.lock().unwrap().len()
+}
+
+#[tokio::test]
+async fn a_run_is_named_by_the_argument_the_schemas_declare() {
+    // The shim reads the argument from the schema's own name, so a tool that declares one is
+    // a tool whose calls fall back to a run claim.
+    for tool in ["get_run", "cancel_run", "retry_stage"] {
+        let row = TOOLS.iter().find(|t| t.name == tool).unwrap();
+        let schema = (row.schema)();
+        assert!(
+            schema["properties"][buzz_hive_api::tools::RUN_ID_ARG].is_object(),
+            "{tool}: {schema}"
+        );
+    }
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    client(&url, Keys::generate(), clock)
+        .call("GetRun", json!({"runId": "r9"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.claim_requests.lock().unwrap().as_slice(),
+        [json!({"run_id": "r9"})]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_claim_is_asked_for_again_on_each_call() {
+    // A refusal can clear within a minute (a stage thread the relay has not recorded yet), so
+    // it is not held the way a claim is.
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    *fake.refuse_claims.lock().unwrap() = Some("it is too old".into());
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file));
+    for _ in 0..5 {
+        client.call("GetCard", json!({})).await.unwrap();
+    }
+    assert_eq!(claim_count(&fake), 5);
+}
+
+#[tokio::test]
+async fn a_call_refused_as_unauthenticated_is_retried_on_a_new_token_and_a_new_claim() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    fake.reject_once.store(true, Ordering::SeqCst);
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file));
+    let reply = client.call("ListRuns", json!({})).await.unwrap();
+    assert_eq!(fake.trades.load(Ordering::SeqCst), 2);
+    assert_eq!(reply["bearer"], "Bearer t2");
+    // The retry did not reuse the claim the first send carried.
+    assert_eq!(claim_count(&fake), 2);
+    assert_eq!(reply["claim"], "claim2");
+}
+
+#[tokio::test]
+async fn a_claim_close_to_its_own_expiry_is_fetched_again_before_the_cache_runs_out() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    // Good for less than the renewal margin, so it cannot be held.
+    fake.claim_lifetime
+        .store(RENEW_BEFORE_SECS / 2, Ordering::SeqCst);
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file));
+    client.call("GetCard", json!({})).await.unwrap();
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(claim_count(&fake), 2);
+    assert_eq!(reply["claim"], "claim2");
+}
+
+#[tokio::test]
+async fn a_claim_reply_with_no_claim_goes_ahead_unclaimed_and_says_so() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    *fake.claim_reply.lock().unwrap() = Some(json!({"requester": "person"}));
+    let (_dir, file) = requester_file("aa11");
+    let hive = Hive::new(Arc::new(client_with_file(
+        &url,
+        Keys::generate(),
+        clock,
+        Some(file),
+    )));
+    let denied = hive
+        .forward(
+            "stage_done",
+            json!({"cardId": "c", "stage": "build", "visit": 1, "result": "passed"})
+                .as_object()
+                .cloned(),
+        )
+        .await
+        .unwrap();
+    let denied = serde_json::to_value(&denied).unwrap();
+    assert_eq!(denied["isError"], true);
+    assert_eq!(
+        denied["content"][0]["text"],
+        "[permission_denied] needs Run, you have Read. No person is named for this turn: Beehive's claim reply has no claim or expiry"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_route_that_is_down_goes_ahead_unclaimed() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    *fake.claim_failure.lock().unwrap() = Some((StatusCode::BAD_GATEWAY, "bad gateway"));
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file));
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(reply["claim"], Value::Null);
+    assert_eq!(claim_count(&fake), 1);
+}
+
+#[tokio::test]
+async fn an_empty_requester_file_names_no_turn() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    for text in ["", "  \n"] {
+        let (_dir, file) = requester_file("aa11");
+        std::fs::write(&file, text).unwrap();
+        let reply = client_with_file(&url, Keys::generate(), clock.clone(), Some(file))
+            .call("GetCard", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(reply["claim"], Value::Null);
+    }
+    assert_eq!(claim_count(&fake), 0);
+}
+
+#[tokio::test]
+async fn a_success_whose_body_is_not_json_is_an_error_and_an_empty_one_is_null() {
+    let clock = TestClock::at(1_000);
+    let (url, _fake) = start(clock.clone()).await;
+    let client = client(&url, Keys::generate(), clock);
+    let error = client.call("Html", json!({})).await.unwrap_err();
+    assert_eq!(error.code, "internal");
+    assert!(error.message.contains("not JSON"), "{error}");
+    assert_eq!(client.call("Empty", json!({})).await.unwrap(), Value::Null);
 }

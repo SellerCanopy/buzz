@@ -101,7 +101,8 @@ pub struct InboxItem {
     pub detail: serde_json::Value,
     pub opened_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
-    /// The pubkey of whoever answered. Empty for an item the engine closed itself.
+    /// The pubkey of whoever answered. For an item the engine closed itself (an auto answer, or
+    /// a run that moved on) it holds the Beehive account's own pubkey, which auto mode counts on.
     pub resolved_by: Option<String>,
     /// The choice it was resolved with, `superseded` when the run moved on without one.
     pub answer: Option<String>,

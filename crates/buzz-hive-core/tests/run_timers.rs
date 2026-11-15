@@ -252,6 +252,25 @@ async fn pausing_clears_the_timeout_and_resuming_starts_it_again() {
     assert_eq!(next_in(&f).await, Some(10 * MINUTE));
 }
 
+/// Pausing retires a retry that was waiting, and resuming starts the timeout only. This is the
+/// documented behavior (see `resume` in rules/run.rs), so a change to it is deliberate.
+#[tokio::test]
+async fn a_stage_paused_while_it_waits_to_retry_is_not_retried_after_resuming() {
+    let (f, clock) = configured("10m", 1, "1m").await;
+    let card = begun(&f, "solo").await;
+    clock.advance(10 * MINUTE);
+    fire_due(&f).await;
+    assert_eq!(next_in(&f).await, Some(MINUTE));
+
+    pause_card(&f.env(), &person(), card).await.unwrap();
+    assert_eq!(next_in(&f).await, None);
+    resume_card(&f.env(), &person(), card).await.unwrap();
+    // Only the stage's timeout is armed, and the retry is not.
+    assert_eq!(next_in(&f).await, Some(10 * MINUTE));
+    clock.advance(MINUTE);
+    assert!(fire_due(&f).await.is_empty());
+}
+
 #[tokio::test]
 async fn stopping_a_run_ends_it_tells_the_agent_and_clears_its_timers() {
     let (f, _clock) = configured("10m", 1, "1m").await;
@@ -283,7 +302,27 @@ async fn stopping_a_run_ends_it_tells_the_agent_and_clears_its_timers() {
         .await
         .is_err());
     let again = stop_run(&f.env(), &person(), run.id).await.unwrap_err();
-    assert!(matches!(again, OpError::FailedPrecondition(_)), "{again:?}");
+    assert!(
+        matches!(&again, OpError::FailedPrecondition(m) if m.contains("has ended")),
+        "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_workflow_did_not_load_is_not_said_to_have_ended() {
+    let (mut f, _clock) = configured("10m", 0, "1m").await;
+    let card = begun(&f, "solo").await;
+    let run = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        tx.runs().active_for_card(card).await.unwrap().unwrap()
+    };
+    // The service restarted without the package the run is on.
+    f.catalog = buzz_hive_core::workflow::load::load(&[]);
+    let refused = stop_run(&f.env(), &person(), run.id).await.unwrap_err();
+    match &refused {
+        OpError::FailedPrecondition(m) => assert!(!m.contains("has ended"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -382,13 +421,15 @@ async fn pausing_everything_holds_each_running_run_and_is_a_persons_call() {
         matches!(refused, OpError::PermissionDenied(_)),
         "{refused:?}"
     );
-    let (paused, _) = pause_all(&f.env(), &person()).await.unwrap();
-    assert_eq!(paused, 2);
+    let done = pause_all(&f.env(), &person()).await.unwrap();
+    assert_eq!((done.paused, done.skipped), (2, 0));
+    assert!(done.failed.is_none());
+    assert!(!done.events.is_empty());
     for card in [one, two] {
         assert_eq!(card_state(&f, card).await, CardState::Waiting);
     }
     assert_eq!(next_in(&f).await, None);
-    assert_eq!(pause_all(&f.env(), &person()).await.unwrap().0, 0);
+    assert_eq!(pause_all(&f.env(), &person()).await.unwrap().paused, 0);
 }
 
 #[tokio::test]

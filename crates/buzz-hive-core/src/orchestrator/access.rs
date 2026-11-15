@@ -12,8 +12,8 @@ use serde_json::json;
 use super::{Ctx, Env, OpError};
 use crate::access::{cap_agent, starting_level, ActorKind, Level};
 use crate::domain::events::Event;
-use crate::ports::store::{Pubkey, StoreError};
-use crate::resolve::{resolve_actor, Actor, MAX_OWNER_CHAIN};
+use crate::ports::store::{AgentInfo, PersonInfo, Pubkey};
+use crate::resolve::MAX_OWNER_CHAIN;
 
 const KIND: &str = "access.changed";
 
@@ -46,17 +46,26 @@ pub async fn list(env: &Env<'_>, ctx: &Ctx) -> Result<Vec<AccessEntry>, OpError>
             .map(|row| (row.pubkey, row.level))
             .collect()
     };
+    Ok(entries(&people, &agents, &stored))
+}
 
+/// The page's rows from what the relay lists and the levels the store holds. Pure, so a
+/// change reads the same levels the page shows.
+fn entries(
+    people: &[PersonInfo],
+    agents: &[AgentInfo],
+    stored: &HashMap<Pubkey, Level>,
+) -> Vec<AccessEntry> {
     let mut entries: Vec<AccessEntry> = people
-        .into_iter()
+        .iter()
         .map(|person| {
             let level = stored
                 .get(&person.pubkey)
                 .copied()
                 .unwrap_or_else(|| starting_level(ActorKind::Person, Some(person.role)));
             AccessEntry {
-                name: person.name.unwrap_or_default(),
-                pubkey: person.pubkey,
+                name: person.name.clone().unwrap_or_default(),
+                pubkey: person.pubkey.clone(),
                 kind: ActorKind::Person,
                 owner: None,
                 level,
@@ -96,7 +105,7 @@ pub async fn list(env: &Env<'_>, ctx: &Ctx) -> Result<Vec<AccessEntry>, OpError>
         // A chain this long is refused when the agent acts; the page shows None.
         Level::None
     };
-    for agent in &agents {
+    for agent in agents {
         entries.push(AccessEntry {
             pubkey: agent.pubkey.clone(),
             name: agent.name.clone(),
@@ -105,16 +114,22 @@ pub async fn list(env: &Env<'_>, ctx: &Ctx) -> Result<Vec<AccessEntry>, OpError>
             level: capped(&agent.pubkey),
         });
     }
-    Ok(entries)
+    entries
 }
 
 /// Sets the level of a person or agent in this community, and returns its entry as it now
 /// stands with the events committed.
 ///
-/// A person may not lower their own level: an admin who did could leave no one able to undo
-/// it. An agent's level may not exceed its owner's, which names both in the refusal. Whether
-/// the caller may set levels at all is the route's check, and whether an agent caller may is
-/// the route's too, since only it knows the requester.
+/// A person may not lower their own level, whether they ask themselves or through an agent
+/// acting for them, and no change may leave the community with no person at Admin: an admin
+/// who did could leave no one able to undo it. An agent's level may not exceed its owner's,
+/// which names both in the refusal. Whether the caller may set levels at all is the route's
+/// check, and whether an agent caller may is the route's too, since only it knows the
+/// requester.
+///
+/// Two admins can change levels at the same moment, so the levels each rule reads are read
+/// after the community's access lock is taken, and the person asking is checked against them
+/// again: an admin lowered a moment ago no longer lowers anyone.
 pub async fn set_level(
     env: &Env<'_>,
     ctx: &Ctx,
@@ -141,12 +156,19 @@ pub async fn set_level(
             "this agent is switched off in Buzz".into(),
         ));
     }
-    if target == ctx.actor.pubkey && level < Level::Admin {
+    // The person behind the request: the one an agent acts for, else the caller.
+    let asking = match (&ctx.requester, ctx.actor.kind) {
+        (Some(person), _) => Some(person.as_str()),
+        (None, ActorKind::Person) => Some(ctx.actor.pubkey.as_str()),
+        (None, ActorKind::Agent) => None,
+    };
+    if level < Level::Admin && (target == ctx.actor.pubkey || asking == Some(target)) {
         return Err(OpError::FailedPrecondition(
             "you cannot lower your own level; ask another admin".into(),
         ));
     }
     let people = env.directory.people(ctx.community).await?;
+    let agents = env.directory.list_agents(ctx.community).await?;
     let name_of = |pubkey: &str| -> Option<String> {
         people
             .iter()
@@ -155,18 +177,48 @@ pub async fn set_level(
     };
     let name = match kind {
         ActorKind::Person => name_of(target).unwrap_or_default(),
-        ActorKind::Agent => env
-            .directory
-            .list_agents(ctx.community)
-            .await?
-            .into_iter()
+        ActorKind::Agent => agents
+            .iter()
             .find(|a| a.pubkey == target)
-            .map(|a| a.name)
+            .map(|a| a.name.clone())
             .unwrap_or_default(),
     };
-    let previous = acts_at(env, ctx, target).await?.level;
+
+    let mut tx = env.store.begin(ctx.community).await?;
+    // From here to the commit another change waits, and reads what this one wrote.
+    tx.access().lock().await?;
+    let stored: HashMap<Pubkey, Level> = tx
+        .access()
+        .list()
+        .await?
+        .into_iter()
+        .map(|row| (row.pubkey, row.level))
+        .collect();
+    let now = entries(&people, &agents, &stored);
+    let level_of = |pubkey: &str| now.iter().find(|e| e.pubkey == pubkey).map(|e| e.level);
+    if let Some(asking) = asking {
+        if level_of(asking).is_some_and(|held| held < Level::Admin) {
+            return Err(OpError::PermissionDenied(
+                "you no longer hold Admin, so you cannot change a level".into(),
+            ));
+        }
+    }
+    if kind == ActorKind::Person {
+        let admins = now
+            .iter()
+            .filter(|e| e.kind == ActorKind::Person && e.pubkey != target)
+            .filter(|e| e.level == Level::Admin)
+            .count()
+            + usize::from(level == Level::Admin);
+        if admins == 0 {
+            return Err(OpError::FailedPrecondition(
+                "that would leave the community with no admin".into(),
+            ));
+        }
+    }
+    let previous = level_of(target).unwrap_or(Level::None);
     if let Some(owner) = &owner {
-        let owner_level = acts_at(env, ctx, owner).await?.level;
+        let owner_level = level_of(owner).unwrap_or(Level::None);
         if level > owner_level {
             let who = if name.is_empty() { target } else { &name };
             let owner_name = name_of(owner).filter(|n| !n.is_empty());
@@ -178,7 +230,6 @@ pub async fn set_level(
         }
     }
 
-    let mut tx = env.store.begin(ctx.community).await?;
     tx.access()
         .set_level(target, level, kind, &ctx.actor.pubkey)
         .await?;
@@ -197,6 +248,14 @@ pub async fn set_level(
         ))
         .await?;
     let events = tx.commit().await?;
+    tracing::info!(
+        actor = %ctx.actor.pubkey,
+        requester = ctx.requester.as_deref().unwrap_or(""),
+        target = %target,
+        previous = previous.as_str(),
+        level = level.as_str(),
+        "access level changed"
+    );
     Ok((
         AccessEntry {
             pubkey: target.to_owned(),
@@ -207,14 +266,4 @@ pub async fn set_level(
         },
         events,
     ))
-}
-
-/// What `pubkey` acts at today. A corrupt owner chain is a failed precondition.
-async fn acts_at(env: &Env<'_>, ctx: &Ctx, pubkey: &str) -> Result<Actor, OpError> {
-    resolve_actor(env.store, env.directory, ctx.community, pubkey)
-        .await
-        .map_err(|e| match e {
-            StoreError::Conflict(message) => OpError::FailedPrecondition(message),
-            other => OpError::Store(other),
-        })
 }

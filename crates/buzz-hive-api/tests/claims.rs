@@ -84,6 +84,13 @@ struct World {
 /// `RUNNER` holds Run and `MEMBER` Read. `BUILDER` and `AGENT` hold Run. A run of `solo`
 /// started by `RUNNER` waits at `builder`'s stage, whose thread is rooted at event 10.
 async fn world() -> World {
+    let w = unrecorded().await;
+    record_threads(&w).await;
+    w
+}
+
+/// [`world`] before the outbox has recorded the stage threads.
+async fn unrecorded() -> World {
     let now = chrono::Utc::now().timestamp();
     let clock = Arc::new(TestClock(AtomicI64::new(now)));
     let thread = |n, author: &str, mentions: &[&str], root, age| {
@@ -115,8 +122,14 @@ async fn world() -> World {
         .with_event(thread(10, HIVE, &[BUILDER], None, 10))
         .with_event(thread(11, HIVE, &[BUILDER], None, 10))
         .with_event(thread(12, HIVE, &[BUILDER], None, 10))
-        // An agent asks another.
-        .with_event(thread(13, AGENT, &[BUILDER], None, 10));
+        // An agent asks another, and an agent asks itself.
+        .with_event(thread(13, AGENT, &[BUILDER], None, 10))
+        .with_event(thread(14, BUILDER, &[BUILDER], None, 10))
+        // A message that sits in no channel.
+        .with_event(RelayEvent {
+            channel_id: None,
+            ..thread(15, RUNNER, &[BUILDER], None, 10)
+        });
     let base = app(MemStore::new()).await;
     let app = App {
         directory: Arc::new(directory),
@@ -153,10 +166,20 @@ async fn world() -> World {
     let (status, run) = call(&app, "StartStage", RUNNER, json!({"cardId": card})).await;
     assert_eq!(status, StatusCode::OK, "{run}");
     let run_id = run["id"].as_str().unwrap().to_owned();
-    // The outbox would record the thread once the relay took the post.
+    World {
+        app,
+        clock,
+        card,
+        run: run_id,
+    }
+}
+
+/// What the outbox does once the relay took a stage task: record the thread it opened.
+async fn record_threads(w: &World) {
+    let (app, card) = (&w.app, &w.card);
     let mut tx = app.store.begin(community()).await.unwrap();
     for (root, agent) in [(10, BUILDER), (11, AGENT)] {
-        let card = uuid::Uuid::parse_str(&card).unwrap();
+        let card = uuid::Uuid::parse_str(card).unwrap();
         let thread = StageThread {
             card_id: card,
             stage: if agent == BUILDER {
@@ -172,12 +195,6 @@ async fn world() -> World {
         tx.runs().record_thread(&thread).await.unwrap();
     }
     tx.commit().await.unwrap();
-    World {
-        app,
-        clock,
-        card,
-        run: run_id,
-    }
 }
 
 async fn claim(app: &App, agent: &str, body: Value) -> (StatusCode, Value) {
@@ -319,11 +336,96 @@ async fn a_stage_task_names_the_person_who_started_the_run() {
 }
 
 #[tokio::test]
-async fn an_agent_that_asks_another_agent_to_act_passes_on_only_what_it_holds() {
+async fn a_stage_task_asked_about_before_its_thread_is_recorded_is_waited_for() {
+    let w = unrecorded().await;
+    // The drain posted the task, an agent that reacts at once asks, and the thread lands after.
+    let late = {
+        let w = World {
+            app: w.app.clone(),
+            clock: w.clock.clone(),
+            card: w.card.clone(),
+            run: w.run.clone(),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            record_threads(&w).await;
+        })
+    };
+    assert!(claim_for_event(&w.app, BUILDER, 10).await.is_ok());
+    late.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_message_an_agent_wrote_names_no_requester() {
     let w = world().await;
-    // `AGENT` is at Run and owned by the Admin; asked by it, `BUILDER` acts at `AGENT`'s level.
-    let held = claim_for_event(&w.app, BUILDER, 13).await.unwrap();
+    // `AGENT` holds Run and is owned by the Admin. If its message named it, `BUILDER` would
+    // act at `AGENT`'s level, which an agent with no person behind it is never given.
+    let (status, body) = claim_for_event(&w.app, BUILDER, 13).await.unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("written by an agent"),
+        "{body}"
+    );
+    // Nor does an agent's message that mentions the agent itself.
+    let (status, body) = claim_for_event(&w.app, BUILDER, 14).await.unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("written by an agent"),
+        "{body}"
+    );
+    // Nor does one that sits in no channel, where nothing shows it is the newest.
+    let (status, body) = claim_for_event(&w.app, BUILDER, 15).await.unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("not in a channel"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_that_names_an_agent_is_refused_even_when_it_is_signed() {
+    let w = world().await;
+    let (named, _) = w
+        .app
+        .minter
+        .sign_claim(AGENT, community(), BUILDER, "chat")
+        .unwrap();
+    let (status, body) = create(&w.app, BUILDER, Some(&named)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("names an agent"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_claim_stops_working_once_the_run_no_longer_holds_the_agents_stage() {
+    let w = world().await;
+    let (status, body) = claim(&w.app, BUILDER, json!({"run_id": w.run})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let held = body["claim"].as_str().unwrap().to_owned();
     assert_eq!(create(&w.app, BUILDER, Some(&held)).await.0, StatusCode::OK);
+
+    let (status, body) = call(&w.app, "StopRun", OWNER, json!({"runId": w.run})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = create(&w.app, BUILDER, Some(&held)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer holds"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

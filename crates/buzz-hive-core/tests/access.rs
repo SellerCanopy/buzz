@@ -169,3 +169,67 @@ async fn a_stranger_and_a_switched_off_agent_have_no_level_to_set() {
         .unwrap_err();
     assert!(matches!(error, OpError::FailedPrecondition(_)), "{error:?}");
 }
+
+#[tokio::test]
+async fn an_agent_acting_for_an_admin_may_not_lower_that_admin() {
+    let f = fixture();
+    let mut agent = ctx_for(AGENT, ActorKind::Agent);
+    agent.requester = Some(ADMIN.to_owned());
+    let error = set_level(&f.env(), &agent, ADMIN, Level::Run)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OpError::FailedPrecondition(_)), "{error:?}");
+    assert_eq!(level_of(&f, ADMIN).await, Level::Admin);
+    assert!(f.store.committed_kinds().is_empty());
+}
+
+#[tokio::test]
+async fn an_admin_lowered_a_moment_ago_no_longer_lowers_anyone() {
+    let f = fixture();
+    set_level(&f.env(), &admin(), MEMBER, Level::Admin)
+        .await
+        .unwrap();
+    let stale = ctx_for(MEMBER, ActorKind::Person);
+    set_level(&f.env(), &admin(), MEMBER, Level::Read)
+        .await
+        .unwrap();
+    let error = set_level(&f.env(), &stale, OTHER, Level::Run)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OpError::PermissionDenied(_)), "{error:?}");
+    assert_eq!(level_of(&f, OTHER).await, Level::Read);
+}
+
+#[tokio::test]
+async fn no_caller_may_leave_the_community_with_no_admin() {
+    let f = fixture();
+    // An agent with no person behind it asks, so only the last-admin rule stands in the way.
+    let error = set_level(
+        &f.env(),
+        &ctx_for(AGENT, ActorKind::Agent),
+        ADMIN,
+        Level::Run,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, OpError::FailedPrecondition(_)), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        "that would leave the community with no admin"
+    );
+    assert_eq!(level_of(&f, ADMIN).await, Level::Admin);
+
+    // With a second admin the first may be lowered by that one.
+    set_level(&f.env(), &admin(), MEMBER, Level::Admin)
+        .await
+        .unwrap();
+    set_level(
+        &f.env(),
+        &ctx_for(MEMBER, ActorKind::Person),
+        ADMIN,
+        Level::Run,
+    )
+    .await
+    .unwrap();
+    assert_eq!(level_of(&f, ADMIN).await, Level::Run);
+}

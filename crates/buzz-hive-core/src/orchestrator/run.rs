@@ -383,8 +383,10 @@ pub(super) async fn stop_in(
     card_id: Uuid,
     only: Option<Uuid>,
 ) -> Result<Run, OpError> {
+    // Only the missing run reads as "ended" when a particular run was named. Any other refusal,
+    // such as a package that failed to load, keeps its own message.
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await.map_err(|e| match e {
-        OpError::FailedPrecondition(_) if only.is_some() => {
+        OpError::FailedPrecondition(m) if only.is_some() && m == NO_RUN_IN_PROGRESS => {
             OpError::FailedPrecondition("the run has ended, so there is nothing to stop".into())
         }
         other => other,
@@ -507,9 +509,23 @@ pub async fn reset_card(
     Ok((card, events))
 }
 
-/// A person holds every running run, one transaction each, and the count of those held. A run
-/// that changed state in the meantime is left alone. An agent may not.
-pub async fn pause_all(env: &Env<'_>, ctx: &Ctx) -> Result<(u32, Vec<Event>), OpError> {
+/// What [`pause_all`] did. Each run is held in its own transaction, so a failure part way
+/// leaves the earlier ones held: the caller publishes `events` either way, then reports `failed`.
+#[derive(Debug)]
+pub struct PausedAll {
+    /// How many runs were held.
+    pub paused: u32,
+    /// How many were left alone because they changed state in the meantime.
+    pub skipped: u32,
+    /// The events of the runs that were held.
+    pub events: Vec<Event>,
+    /// The error that stopped the sweep before it reached every run, if one did.
+    pub failed: Option<OpError>,
+}
+
+/// A person holds every running run, one transaction each. A run that changed state in the
+/// meantime is left alone and counted as skipped. An agent may not.
+pub async fn pause_all(env: &Env<'_>, ctx: &Ctx) -> Result<PausedAll, OpError> {
     people_only(ctx, "pause every run")?;
     let mut tx = env.store.begin(ctx.community).await?;
     let cards: Vec<Uuid> = tx
@@ -521,18 +537,27 @@ pub async fn pause_all(env: &Env<'_>, ctx: &Ctx) -> Result<(u32, Vec<Event>), Op
         .map(|run| run.card_id)
         .collect();
     drop(tx);
-    let (mut paused, mut events) = (0, Vec::new());
+    let mut done = PausedAll {
+        paused: 0,
+        skipped: 0,
+        events: Vec::new(),
+        failed: None,
+    };
     for card in cards {
         match pause_card(env, ctx, card).await {
             Ok((_, committed)) => {
-                paused += 1;
-                events.extend(committed);
+                done.paused += 1;
+                done.events.extend(committed);
             }
-            Err(OpError::FailedPrecondition(_) | OpError::NotFound(_)) => {}
-            Err(other) => return Err(other),
+            Err(OpError::FailedPrecondition(_) | OpError::NotFound(_)) => done.skipped += 1,
+            Err(other) => {
+                tracing::warn!(card = %card, error = %other, "pause all stopped early");
+                done.failed = Some(other);
+                break;
+            }
         }
     }
-    Ok((paused, events))
+    Ok(done)
 }
 
 /// The stage's agent moves the card to `target`, in place of the route its result would give.
@@ -603,6 +628,9 @@ pub async fn move_card(
     Ok((run, events))
 }
 
+/// Why [`locked`] refuses a card that has no run in progress.
+pub(super) const NO_RUN_IN_PROGRESS: &str = "the card has no run in progress";
+
 /// The card and its run, both held until the transaction ends, and the run's package.
 pub(super) async fn locked<'a>(
     env: &Env<'a>,
@@ -618,7 +646,7 @@ pub(super) async fn locked<'a>(
         .runs()
         .active_for_card(card_id)
         .await?
-        .ok_or_else(|| OpError::FailedPrecondition("the card has no run in progress".into()))?;
+        .ok_or_else(|| OpError::FailedPrecondition(NO_RUN_IN_PROGRESS.into()))?;
     let run = tx
         .runs()
         .get_for_update(active.id)

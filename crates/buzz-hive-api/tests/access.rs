@@ -187,9 +187,10 @@ async fn an_agent_at_admin_sets_a_level_only_for_a_person_at_admin() {
     assert_eq!(status, StatusCode::OK, "{body_}");
     assert_eq!(who_am_i(&app, MEMBER).await, "run");
 
-    // Once the person it acts for loses Admin, its reach goes with it.
+    // The person it acts for may not lower their own level, and an agent speaking for them
+    // is no way round that: MEMBER is Admin here, and asks the agent to lower MEMBER.
     assert_eq!(set(&app, OWNER, MEMBER, "admin").await.0, StatusCode::OK);
-    let (status, _) = call_for(
+    let (status, body_) = call_for(
         &app,
         "SetAccessLevel",
         AGENT,
@@ -197,8 +198,27 @@ async fn an_agent_at_admin_sets_a_level_only_for_a_person_at_admin() {
         json!({"pubkey": MEMBER, "level": "read"}),
     )
     .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body_}");
+    assert_eq!(who_am_i(&app, MEMBER).await, "admin");
+    // It may lower someone else for them.
+    let (status, _) = call_for(
+        &app,
+        "SetAccessLevel",
+        AGENT,
+        MEMBER,
+        json!({"pubkey": OWNER, "level": "run"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(who_am_i(&app, MEMBER).await, "read");
+
+    // Once the person it acts for loses Admin, its reach goes with it.
+    assert_eq!(
+        set(&app, OWNER, MEMBER, "read").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(who_am_i(&app, OWNER).await, "run");
+    assert_eq!(set(&app, MEMBER, OWNER, "admin").await.0, StatusCode::OK);
+    assert_eq!(set(&app, OWNER, MEMBER, "read").await.0, StatusCode::OK);
     let (status, _) = call_for(
         &app,
         "SetAccessLevel",

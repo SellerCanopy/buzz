@@ -244,7 +244,9 @@ async fn approval_scenarios(f: &Fixture) {
 
 /// Phase 14: an admin sets a level.
 async fn access_scenarios(f: &Fixture) {
-    let directory = FakeDirectory::new().with_role(BUILDER, RelayRole::Member);
+    let directory = FakeDirectory::new()
+        .with_role("aa", RelayRole::Owner)
+        .with_role(BUILDER, RelayRole::Member);
     let env = Env {
         directory: &directory,
         ..f.env()
