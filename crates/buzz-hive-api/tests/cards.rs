@@ -233,6 +233,7 @@ async fn other_communities_cards_and_events_stay_out_of_view() {
             pubkey: "ee".into(),
             kind: buzz_hive_core::access::ActorKind::Person,
         },
+        requester: None,
     };
     cards::create_card(
         &store,

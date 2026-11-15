@@ -16,7 +16,9 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData, ServerHandler, ServiceExt};
 use serde_json::Value;
 
-pub use client::{CallError, Clock, Config, HiveClient, SystemClock, RENEW_BEFORE_SECS};
+pub use client::{
+    CallError, Clock, Config, HiveClient, SystemClock, CLAIM_CACHE_SECS, RENEW_BEFORE_SECS,
+};
 
 const INSTRUCTIONS: &str = "Tools for Beehive, the workflow board. A stage task in chat names the \
 card, the stage, the visit and the results it accepts. When you finish the stage, call stage_done \

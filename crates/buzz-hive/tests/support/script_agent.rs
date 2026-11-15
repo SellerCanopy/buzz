@@ -1,6 +1,11 @@
 //! A scripted agent that stands in for an LLM: it holds its own key, listens on the relay
 //! for a message that mentions it, and plays a list of tool calls through the real
 //! `buzz-hive-mcp` binary over stdio.
+//!
+//! Like the real harness, it records the id of the message that starts each turn in the file
+//! the shim was told about (`BUZZ_REQUESTER_FILE`), so a call acts for the person that
+//! message names. [`ScriptAgent::ask`] is a person starting a turn; a mention the agent
+//! waits for starts one too.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +54,10 @@ pub struct ScriptAgent {
     /// What each thread has told the agent, by the id of the thread's root event. A real
     /// agent opens one session per thread, so this is the history that session would hold.
     sessions: BTreeMap<String, Vec<String>>,
+    channel: Uuid,
+    /// Where the id of the message that started the turn is kept. Beside the shim's own
+    /// directory, so it goes when the agent does.
+    requester_dir: tempfile::TempDir,
 }
 
 /// The id of the thread `event` belongs to: the root it replies in, or its own id when it
@@ -106,10 +115,12 @@ impl ScriptAgent {
             }
         }
 
+        let requester_dir = tempfile::tempdir().expect("a directory for the requester file");
         let mut child = tokio::process::Command::new(shim_binary())
             .env("BUZZ_PRIVATE_KEY", keys.secret_key().to_secret_hex())
             .env("BUZZ_RELAY_URL", relay_url)
             .env("BUZZ_HIVE_URL", hive_url)
+            .env("BUZZ_REQUESTER_FILE", requester_dir.path().join("turn"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -127,6 +138,8 @@ impl ScriptAgent {
             next_id: 0,
             card: None,
             sessions: BTreeMap::new(),
+            channel,
+            requester_dir,
         };
         let init = agent
             .request(
@@ -221,7 +234,60 @@ impl ScriptAgent {
         }
     }
 
-    /// The next message that mentions this agent.
+    fn requester_path(&self) -> PathBuf {
+        self.requester_dir.path().join("turn")
+    }
+
+    /// Notes `id` as the message that started the turn, the way the harness does: written
+    /// whole and moved into place, so the shim never reads half of it.
+    fn record_requester(&self, id: &str) {
+        let tmp = self.requester_dir.path().join("turn.tmp");
+        std::fs::write(&tmp, id).expect("write the requester file");
+        std::fs::rename(&tmp, self.requester_path()).expect("move the requester file into place");
+    }
+
+    /// Leaves the agent with no turn to act in, as one started by a heartbeat has.
+    pub fn forget_requester(&self) {
+        let _ = std::fs::remove_file(self.requester_path());
+    }
+
+    /// `person` posts `text` in the channel, mentioning this agent, and the agent's turn
+    /// starts from it. Returns the message.
+    pub async fn ask(&mut self, person: &Keys, relay_url: &str, text: &str) -> nostr::Event {
+        let me = self.keys.public_key().to_hex();
+        let event = buzz_sdk::builders::build_message(
+            self.channel,
+            text,
+            None,
+            &[me.as_str()],
+            false,
+            &[],
+            &[],
+        )
+        .expect("build the message")
+        .sign_with_keys(person)
+        .expect("sign the message");
+        let id = event.id.to_hex();
+        let mut conn = NostrWsConnection::connect_authenticated(relay_url, person, None)
+            .await
+            .expect("connect to the relay as the person");
+        let ok = conn.send_event(event).await.expect("post the message");
+        assert!(ok.accepted, "the relay refused the message: {}", ok.message);
+        let _ = conn.disconnect().await;
+        loop {
+            match self.relay.next_event(Duration::from_secs(60)).await {
+                Ok(RelayMessage::Event { event, .. }) if event.id.to_hex() == id => {
+                    self.record_requester(&id);
+                    return *event;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("the agent never saw the message: {e}"),
+            }
+        }
+    }
+
+    /// The next message that mentions this agent. It starts a turn, so it is the one the
+    /// agent's calls act for until the next.
     pub async fn await_mention(&mut self) -> nostr::Event {
         let me = self.keys.public_key().to_hex();
         loop {
@@ -237,6 +303,7 @@ impl ScriptAgent {
                             .entry(thread_of(&event))
                             .or_default()
                             .push(event.content.clone());
+                        self.record_requester(&event.id.to_hex());
                         return *event;
                     }
                 }

@@ -4,7 +4,9 @@ use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
+use crate::domain::inbox::InboxItem;
 use crate::domain::run::Run;
+use crate::domain::timer::{Timer, TimerKind};
 use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
@@ -54,6 +56,16 @@ pub trait Tx: Send {
     fn runs(&mut self) -> &mut dyn RunsRepo;
     fn outbox(&mut self) -> &mut dyn OutboxRepo;
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo;
+    fn timers(&mut self) -> &mut dyn TimersRepo;
+    fn inbox(&mut self) -> &mut dyn InboxRepo;
+    fn usage(&mut self) -> &mut dyn UsageRepo;
+    /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
+    /// [`Tx::release_savepoint`] close the newest one still open.
+    async fn savepoint(&mut self) -> Result<(), StoreError>;
+    /// Undoes everything written since the newest savepoint, events included, and closes it.
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError>;
+    /// Closes the newest savepoint and keeps what was written since.
+    async fn release_savepoint(&mut self) -> Result<(), StoreError>;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -68,6 +80,9 @@ pub trait AccessRepo: Send {
         by: &str,
     ) -> Result<(), StoreError>;
     async fn list(&mut self) -> Result<Vec<AccessRow>, StoreError>;
+    /// Takes this community's access lock until commit, so a change to levels waits for the
+    /// one before it and reads what that one wrote. Nothing else waits on it.
+    async fn lock(&mut self) -> Result<(), StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -251,6 +266,85 @@ pub trait RunsRepo: Send {
     ) -> Result<Option<StageThread>, StoreError>;
     /// Every thread the card's stages opened, in the order they were recorded.
     async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError>;
+    /// The stage thread whose root is the event `root`, whichever card it belongs to.
+    async fn thread_by_root(&mut self, root: &str) -> Result<Option<StageThread>, StoreError>;
+}
+
+/// The timers runs wait on. A timer is a row, written in the transaction that changes the run,
+/// so a restarted service finds every one. Time is the store's own, so every instance and
+/// every restart agree on when a timer is due.
+#[async_trait::async_trait]
+pub trait TimersRepo: Send {
+    /// Sets a timer to fire `after` from now, in place of one of the same run, stage and kind.
+    async fn arm(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+        after: std::time::Duration,
+    ) -> Result<(), StoreError>;
+    /// Drops every timer of the run.
+    async fn clear_run(&mut self, run: uuid::Uuid) -> Result<(), StoreError>;
+    /// The timers whose time has come, soonest first, at most `limit`.
+    async fn due(&mut self, limit: i64) -> Result<Vec<Timer>, StoreError>;
+    /// Removes a timer that is still due. `false` when it is gone, or was armed again for
+    /// later, so a caller that lost the race does nothing.
+    async fn take_due(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<bool, StoreError>;
+    /// Removes a timer, due or not. Nothing happens when it is gone.
+    async fn remove(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<(), StoreError>;
+    /// How long until the soonest timer is due: zero for one already overdue, `None` when
+    /// there are no timers.
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError>;
+}
+
+/// The Needs you items: the places a run waits for a person.
+#[async_trait::async_trait]
+pub trait InboxRepo: Send {
+    async fn insert(&mut self, item: &InboxItem) -> Result<(), StoreError>;
+    /// The item. Every change to an item happens while its card is held, so a caller that
+    /// holds the card reads a settled item.
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<InboxItem>, StoreError>;
+    /// Items of one card, or of every card when `card` is `None`, open ones first and each
+    /// group newest first. Resolved items are left out unless `include_resolved`.
+    async fn list(
+        &mut self,
+        card: Option<uuid::Uuid>,
+        include_resolved: bool,
+    ) -> Result<Vec<InboxItem>, StoreError>;
+    /// Resolves an open item with `answer`, by `by`. `false` when it was already resolved.
+    async fn resolve(&mut self, id: uuid::Uuid, answer: &str, by: &str)
+        -> Result<bool, StoreError>;
+    /// Resolves every open item of the card, and returns them as resolved.
+    async fn resolve_card(
+        &mut self,
+        card: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<Vec<InboxItem>, StoreError>;
+}
+
+/// What the Usage page counts, read in one snapshot.
+#[async_trait::async_trait]
+pub trait UsageRepo: Send {
+    /// The community's runs and durations, and the last `weeks` weeks of what agents started,
+    /// counted from the event log by the actor of each event. The weeks are the database's
+    /// own, the current one last. Events of `engine`, the Beehive account, are not an agent's
+    /// doing, so they are left out: a run auto mode starts again is not one an agent started.
+    async fn usage(
+        &mut self,
+        weeks: u32,
+        engine: &str,
+    ) -> Result<crate::domain::usage::Usage, StoreError>;
 }
 
 /// The relay thread a stage task opened. Its root is the message that mentions the agent.
@@ -383,6 +477,8 @@ pub trait Directory: Send + Sync {
     ) -> Result<Vec<AgentInfo>, StoreError>;
     /// Every agent in the community, by name.
     async fn list_agents(&self, community: CommunityId) -> Result<Vec<AgentInfo>, StoreError>;
+    /// Every person the relay counts as a member, by name. Agents are not listed.
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError>;
     /// Whether the channel exists and is not deleted.
     async fn channel_exists(
         &self,
@@ -396,6 +492,78 @@ pub trait Directory: Send + Sync {
         channel: uuid::Uuid,
         pubkey: &str,
     ) -> Result<bool, StoreError>;
+    /// The message with this id (64 hex characters), `None` when the relay has none.
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError>;
+    /// Whether a message newer than `event` mentions `agent` in the thread rooted at `root`,
+    /// in the channel of `event`. Messages in the same second are ordered by id. A message is in
+    /// the thread when one of its `e` tags names `root`, whatever the tag's marker (see
+    /// [`RelayEvent::in_thread`]). The scenarios in `testing::directory_scenarios` hold every
+    /// implementation to this.
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError>;
+}
+
+/// The relay's kinds that carry a chat message: a stream message, its v2 form, a forum post
+/// and a forum comment. A reaction or an edit names an agent and a thread without asking it
+/// anything, so only these count as a mention.
+pub const MESSAGE_KINDS: &[i32] = &[9, 40002, 45001, 45003];
+
+/// A message the relay holds, as far as Beehive reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEvent {
+    /// 64 hex characters.
+    pub id: String,
+    pub author: Pubkey,
+    pub kind: i32,
+    pub tags: Vec<Vec<String>>,
+    /// Seconds since the epoch.
+    pub created_at: i64,
+    pub channel_id: Option<uuid::Uuid>,
+    pub deleted: bool,
+}
+
+impl RelayEvent {
+    /// Whether a `p` tag names `pubkey`.
+    pub fn mentions(&self, pubkey: &str) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.first().is_some_and(|k| k == "p") && t.get(1).is_some_and(|v| v == pubkey))
+    }
+
+    /// Whether one of the message's `e` tags names `root`, whatever its marker. This is the
+    /// rule the relay query applies to decide whether a message is in a thread, so a fake
+    /// directory uses it too.
+    pub fn in_thread(&self, root: &str) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.first().is_some_and(|k| k == "e") && t.get(1).is_some_and(|v| v == root))
+    }
+
+    /// The id of the thread the message belongs to: the event its `root` marker names, else
+    /// the one its `reply` marker names (a direct reply to the root), else the message itself.
+    pub fn thread_root(&self) -> &str {
+        let marked = |marker: &str| {
+            self.tags
+                .iter()
+                .find(|t| {
+                    t.first().is_some_and(|k| k == "e") && t.get(3).is_some_and(|m| m == marker)
+                })
+                .and_then(|t| t.get(1))
+                .map(String::as_str)
+        };
+        marked("root")
+            .or_else(|| marked("reply"))
+            .unwrap_or(&self.id)
+    }
 }
 
 /// How the relay ties an agent to the person who owns it.
@@ -404,6 +572,15 @@ pub struct AgentLink {
     pub owner: Pubkey,
     /// The agent was switched off in Buzz. It keeps its owner but must not act.
     pub deactivated: bool,
+}
+
+/// A person the relay lists as a member of the community.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonInfo {
+    pub pubkey: Pubkey,
+    /// The display name the person set, when they set one.
+    pub name: Option<String>,
+    pub role: RelayRole,
 }
 
 /// A Buzz agent as the relay lists it.

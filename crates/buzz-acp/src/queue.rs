@@ -1150,6 +1150,20 @@ impl EventQueue {
         true
     }
 
+    /// The event withheld for the steer in flight with id `event_id`, as a batch event.
+    /// `None` when it is not withheld, for example after it was released.
+    pub fn withheld_steer_event<K: IntoScope>(
+        &self,
+        scope: K,
+        event_id: &str,
+    ) -> Option<BatchEvent> {
+        self.withheld_native_steer
+            .get(&scope.into_scope())?
+            .iter()
+            .find(|qe| qe.event.id.to_hex() == event_id)
+            .map(|qe| qe.clone().into_batch_event())
+    }
+
     /// Release a single withheld event back to the front of
     /// `queues[channel_id]`, preserving its original `received_at`.
     ///
@@ -6293,6 +6307,24 @@ mod tests {
             q.withheld_native_steer.get(&conv(ch)).map(|v| v.len()),
             Some(1)
         );
+    }
+
+    /// The event withheld for a steer can be read back while the steer is in flight, and not
+    /// before it is withheld or after it is dropped.
+    #[test]
+    fn test_withheld_steer_event_is_readable_only_while_withheld() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let qe = make_queued(ch, "hello");
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+
+        assert!(q.withheld_steer_event(ch, &event_id).is_none());
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+        let withheld = q.withheld_steer_event(ch, &event_id).expect("withheld");
+        assert_eq!(withheld.event.id.to_hex(), event_id);
+        q.remove_event(ch, &event_id);
+        assert!(q.withheld_steer_event(ch, &event_id).is_none());
     }
 
     /// Earlier events on the same channel must flush normally during the

@@ -360,7 +360,15 @@ async fn a_required_output_left_out_makes_the_run_wait_and_an_optional_one_does_
     assert_eq!(run.state, RunState::Waiting);
     assert_eq!(run.current_stage.as_deref(), Some("draft"));
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(kinds, ["result.reported", "run.waiting", "card.state"]);
+    assert_eq!(
+        kinds,
+        [
+            "result.reported",
+            "run.waiting",
+            "inbox.opened",
+            "card.state"
+        ]
+    );
     let waiting = events.iter().find(|e| e.kind == "run.waiting").unwrap();
     assert_eq!(waiting.payload["condition"], "missing_output");
     assert_eq!(waiting.payload["missing"], json!(["plan"]));

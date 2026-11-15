@@ -14,6 +14,7 @@ pub fn ctx_for(pubkey: &str, kind: ActorKind) -> Ctx {
             pubkey: pubkey.into(),
             kind,
         },
+        requester: None,
     }
 }
 
@@ -31,7 +32,7 @@ use buzz_hive_core::orchestrator::outbox::{drain_outbox, Drained};
 use buzz_hive_core::orchestrator::run::{move_card, stage_done};
 use buzz_hive_core::orchestrator::{Env, OpError};
 use buzz_hive_core::ports::store::{Store, StoreError};
-use buzz_hive_core::testing::{FakeDirectory, FakeRelay, MemStore};
+use buzz_hive_core::testing::{FakeDirectory, FakeRelay, ManualClock, MemStore};
 use buzz_hive_core::workflow::load::{load, Catalog};
 use buzz_hive_core::workflow::source::{MemSource, Source};
 
@@ -131,6 +132,51 @@ pub fn catalog() -> Catalog {
             ]
             .concat(),
         ),
+        // draft saves a plan, a person approves it at gate, and a rejection goes back to draft.
+        (
+            "gated",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n    on:\n      needs_work: draft\n"
+                    .to_owned(),
+                stage("ship", ""),
+            ]
+            .concat(),
+        ),
+        // Worked by two agents the other workflows do not use, to be handed a card.
+        (
+            "relay",
+            "  - id: r1\n    kind: prompt\n    agent: reviewer\n    prompt: Review\n  - id: r2\n    kind: prompt\n    agent: tester\n    prompt: Test\n"
+                .to_owned(),
+        ),
+        // Like gated, but the gate is the last stage, so approving it finishes the workflow.
+        (
+            "endgate",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n"
+                    .to_owned(),
+            ]
+            .concat(),
+        ),
+        // b sends a failure back to a, and no loop limit bounds it.
+        (
+            "unbounded",
+            [stage("a", ""), stage("b", "    on:\n      failed: a\n")].concat(),
+        ),
+        // Like gated, but the stage after the gate names an agent that does not exist, so
+        // approving the gate cannot post its task.
+        (
+            "gatedaway",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n"
+                    .to_owned(),
+                "  - id: ship\n    kind: prompt\n    agent: ghost\n    prompt: Ship it\n"
+                    .to_owned(),
+            ]
+            .concat(),
+        ),
         // A stage that repeats until every item of its plan is checked.
         (
             "ticked",
@@ -172,6 +218,14 @@ impl Fixture {
             catalog: catalog(),
             relay: FakeRelay::new(),
         }
+    }
+
+    /// A fixture whose timers read a clock the test moves.
+    pub fn timed() -> (Self, ManualClock) {
+        let clock = ManualClock::new();
+        let mut fixture = Self::new();
+        fixture.store = MemStore::with_clock(std::sync::Arc::new(clock.clone()));
+        (fixture, clock)
     }
 
     pub fn with_directory(mut self, directory: FakeDirectory) -> Self {

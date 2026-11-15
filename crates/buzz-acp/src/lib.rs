@@ -18,6 +18,7 @@ mod prompt_project;
 mod queue;
 mod recovery_wake;
 mod relay;
+mod requester;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
@@ -4174,6 +4175,11 @@ async fn run_harness(
                 );
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
                     queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
+                    // The steered message may now be the newest one that asks this agent to
+                    // act, so the requester file names it.
+                    if let Some(steered) = queue.withheld_steer_event(&scope, &event_id) {
+                        pool.record_steered_requester(&scope, &pubkey_hex, &[steered]);
+                    }
                     if !pool.record_successful_steer(&scope, event_id.clone(), session_id.clone()) {
                         tracing::warn!(
                             channel = %channel_id,

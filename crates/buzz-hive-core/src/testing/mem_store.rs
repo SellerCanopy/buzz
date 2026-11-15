@@ -5,11 +5,16 @@ use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
+use crate::domain::inbox::InboxItem;
 use crate::domain::run::{Run, RunState};
+use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::usage::{week_start, Usage, UsageWeek};
+use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, Pubkey,
-    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
+    CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow,
+    PersonInfo, Posting, Pubkey, RelayEvent, RunsRepo, SettingsRepo, StageThread, Store,
+    StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -31,6 +36,15 @@ struct State {
     next_outbox_id: i64,
     /// Each artifact with its handoff flag, and its versions in save order.
     artifacts: Vec<MemArtifact>,
+    timers: Vec<(CommunityId, MemTimer)>,
+    /// In the order opened.
+    inbox: Vec<(CommunityId, InboxItem)>,
+}
+
+#[derive(Clone)]
+struct MemTimer {
+    timer: Timer,
+    fire_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone)]
@@ -54,15 +68,31 @@ struct Log {
 
 /// A `Store` held in memory. `begin` copies the state and `commit` swaps the
 /// copy back in, so a dropped `Tx` rolls back.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct MemStore {
     state: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
 }
 
 impl MemStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store whose timers read `clock`, so a test moves time by hand.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            state: Arc::default(),
+            log: Arc::default(),
+            clock,
+        }
     }
 
     /// Puts a card on a community's board, as the newest. Later phases create cards through routes.
@@ -84,8 +114,10 @@ impl Store for MemStore {
             community,
             work,
             pending: Vec::new(),
+            savepoints: Vec::new(),
             shared: self.state.clone(),
             log: self.log.clone(),
+            clock: self.clock.clone(),
         }))
     }
 }
@@ -95,8 +127,11 @@ struct MemTx {
     work: State,
     /// Appended in this transaction, with no seq yet.
     pending: Vec<Event>,
+    /// The state and the pending count at each open savepoint, newest last.
+    savepoints: Vec<(State, usize)>,
     shared: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
+    clock: Arc<dyn Clock>,
 }
 
 #[async_trait::async_trait]
@@ -125,13 +160,44 @@ impl Tx for MemTx {
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
         self
     }
+    fn timers(&mut self) -> &mut dyn TimersRepo {
+        self
+    }
+    fn inbox(&mut self) -> &mut dyn InboxRepo {
+        self
+    }
+    fn usage(&mut self) -> &mut dyn UsageRepo {
+        self
+    }
+    async fn savepoint(&mut self) -> Result<(), StoreError> {
+        self.savepoints
+            .push((self.work.clone(), self.pending.len()));
+        Ok(())
+    }
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError> {
+        let (work, pending) = self
+            .savepoints
+            .pop()
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))?;
+        self.work = work;
+        self.pending.truncate(pending);
+        Ok(())
+    }
+    async fn release_savepoint(&mut self) -> Result<(), StoreError> {
+        self.savepoints
+            .pop()
+            .map(|_| ())
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let MemTx {
             community,
             work,
             pending,
+            savepoints: _,
             shared,
             log,
+            clock: _,
         } = *self;
         *shared.lock().unwrap() = work;
         let mut log = log.lock().unwrap();
@@ -379,6 +445,12 @@ impl AccessRepo for MemTx {
         rows.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
         Ok(rows)
     }
+
+    /// Transactions here work on a copy and never wait on each other, so there is nothing to
+    /// take. Postgres serialises access changes, and its test shows it.
+    async fn lock(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -563,6 +635,15 @@ impl RunsRepo for MemTx {
             .map(|(_, t)| t.clone())
             .collect())
     }
+
+    async fn thread_by_root(&mut self, root: &str) -> Result<Option<StageThread>, StoreError> {
+        Ok(self
+            .work
+            .threads
+            .iter()
+            .find(|(c, t)| *c == self.community && t.root_event_id == root)
+            .map(|(_, t)| t.clone()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -742,6 +823,9 @@ impl CardsRepo for MemTx {
         self.work
             .artifacts
             .retain(|a| !(a.community == community && a.card == id));
+        self.work
+            .inbox
+            .retain(|(c, i)| !(*c == community && i.card_id == id));
         Ok(())
     }
 }
@@ -817,6 +901,253 @@ impl WorkflowsRepo for MemTx {
     }
 }
 
+#[async_trait::async_trait]
+impl TimersRepo for MemTx {
+    async fn arm(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+        after: std::time::Duration,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        let fire_at = self.clock.now() + chrono::Duration::from_std(after).unwrap_or_default();
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind)
+        });
+        self.work.timers.push((
+            community,
+            MemTimer {
+                timer: Timer {
+                    run_id: run,
+                    stage: stage.to_owned(),
+                    kind,
+                },
+                fire_at,
+            },
+        ));
+        Ok(())
+    }
+
+    async fn clear_run(&mut self, run: uuid::Uuid) -> Result<(), StoreError> {
+        let community = self.community;
+        self.work
+            .timers
+            .retain(|(c, t)| !(*c == community && t.timer.run_id == run));
+        Ok(())
+    }
+
+    async fn due(&mut self, limit: i64) -> Result<Vec<Timer>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let mut due: Vec<&MemTimer> = self
+            .work
+            .timers
+            .iter()
+            .filter(|(c, t)| *c == community && t.fire_at <= now)
+            .map(|(_, t)| t)
+            .collect();
+        due.sort_by_key(|t| t.fire_at);
+        Ok(due
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(0))
+            .map(|t| t.timer.clone())
+            .collect())
+    }
+
+    async fn take_due(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<bool, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let before = self.work.timers.len();
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind
+                && t.fire_at <= now)
+        });
+        Ok(self.work.timers.len() < before)
+    }
+
+    async fn remove(
+        &mut self,
+        run: uuid::Uuid,
+        stage: &str,
+        kind: TimerKind,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        self.work.timers.retain(|(c, t)| {
+            !(*c == community
+                && t.timer.run_id == run
+                && t.timer.stage == stage
+                && t.timer.kind == kind)
+        });
+        Ok(())
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        Ok(self
+            .work
+            .timers
+            .iter()
+            .filter(|(c, _)| *c == community)
+            .map(|(_, t)| t.fire_at)
+            .min()
+            .map(|at| (at - now).to_std().unwrap_or_default()))
+    }
+}
+
+#[async_trait::async_trait]
+impl UsageRepo for MemTx {
+    async fn usage(&mut self, weeks: u32, engine: &str) -> Result<Usage, StoreError> {
+        let community = self.community;
+        let mut runs = 0u32;
+        let mut ended = Vec::new();
+        for (c, run) in &self.work.runs {
+            if *c == community {
+                runs += 1;
+                if let Some(end) = run.ended_at {
+                    ended.push((end - run.started_at).num_seconds().max(0) as u64);
+                }
+            }
+        }
+        // Events are stamped with the wall clock, so the weeks are the wall clock's.
+        let this_week = week_start(chrono::Utc::now().date_naive());
+        let mut rows: Vec<UsageWeek> = (0..weeks)
+            .rev()
+            .map(|back| UsageWeek {
+                starts: this_week - chrono::Duration::weeks(i64::from(back)),
+                cards_created_by_agents: 0,
+                runs_started_by_agents: 0,
+            })
+            .collect();
+        let log = self.log.lock().unwrap();
+        for (c, event) in &log.events {
+            if *c != community
+                || event.actor.kind != ActorKind::Agent
+                || event.actor.pubkey == engine
+            {
+                continue;
+            }
+            let starts = week_start(event.at.date_naive());
+            if let Some(row) = rows.iter_mut().find(|row| row.starts == starts) {
+                match event.kind.as_str() {
+                    "card.created" => row.cards_created_by_agents += 1,
+                    "run.started" => row.runs_started_by_agents += 1,
+                    _ => {}
+                }
+            }
+        }
+        Ok(Usage {
+            runs,
+            ended_runs: ended.len() as u32,
+            average_run_seconds: ended
+                .iter()
+                .sum::<u64>()
+                .checked_div(ended.len() as u64)
+                .unwrap_or(0),
+            longest_run_seconds: ended.iter().copied().max().unwrap_or(0),
+            weeks: rows,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl InboxRepo for MemTx {
+    async fn insert(&mut self, item: &InboxItem) -> Result<(), StoreError> {
+        self.work.inbox.push((self.community, item.clone()));
+        Ok(())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<InboxItem>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .inbox
+            .iter()
+            .find(|(c, i)| *c == community && i.id == id)
+            .map(|(_, i)| i.clone()))
+    }
+
+    async fn list(
+        &mut self,
+        card: Option<uuid::Uuid>,
+        include_resolved: bool,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let community = self.community;
+        let mut items: Vec<InboxItem> = self
+            .work
+            .inbox
+            .iter()
+            .filter(|(c, i)| {
+                *c == community
+                    && card.is_none_or(|id| i.card_id == id)
+                    && (include_resolved || i.is_open())
+            })
+            .map(|(_, i)| i.clone())
+            .collect();
+        // Open first, then newest first.
+        items.sort_by(|a, b| {
+            b.is_open()
+                .cmp(&a.is_open())
+                .then(b.opened_at.cmp(&a.opened_at))
+        });
+        Ok(items)
+    }
+
+    async fn resolve(
+        &mut self,
+        id: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<bool, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let Some((_, item)) = self
+            .work
+            .inbox
+            .iter_mut()
+            .find(|(c, i)| *c == community && i.id == id && i.is_open())
+        else {
+            return Ok(false);
+        };
+        item.resolved_at = Some(now);
+        item.resolved_by = Some(by.to_owned());
+        item.answer = Some(answer.to_owned());
+        Ok(true)
+    }
+
+    async fn resolve_card(
+        &mut self,
+        card: uuid::Uuid,
+        answer: &str,
+        by: &str,
+    ) -> Result<Vec<InboxItem>, StoreError> {
+        let community = self.community;
+        let now = self.clock.now();
+        let mut resolved = Vec::new();
+        for (c, item) in &mut self.work.inbox {
+            if *c == community && item.card_id == card && item.is_open() {
+                item.resolved_at = Some(now);
+                item.resolved_by = Some(by.to_owned());
+                item.answer = Some(answer.to_owned());
+                resolved.push(item.clone());
+            }
+        }
+        Ok(resolved)
+    }
+}
+
 impl MemTx {
     fn find_run(&self, id: uuid::Uuid) -> Option<&Run> {
         self.work
@@ -858,10 +1189,12 @@ impl MemTx {
 #[derive(Default, Clone)]
 pub struct FakeDirectory {
     roles: HashMap<Pubkey, RelayRole>,
+    names: HashMap<Pubkey, String>,
     owners: HashMap<Pubkey, Pubkey>,
     deactivated: Vec<Pubkey>,
     agents: Vec<AgentInfo>,
     channels: HashMap<uuid::Uuid, Vec<Pubkey>>,
+    events: Vec<RelayEvent>,
 }
 
 impl FakeDirectory {
@@ -871,6 +1204,12 @@ impl FakeDirectory {
 
     pub fn with_role(mut self, pubkey: &str, role: RelayRole) -> Self {
         self.roles.insert(pubkey.to_owned(), role);
+        self
+    }
+
+    /// The display name a person set.
+    pub fn with_name(mut self, pubkey: &str, name: &str) -> Self {
+        self.names.insert(pubkey.to_owned(), name.to_owned());
         self
     }
 
@@ -893,6 +1232,12 @@ impl FakeDirectory {
             pubkey: pubkey.to_owned(),
             owner: Some(owner.to_owned()),
         });
+        self
+    }
+
+    /// A message the relay holds.
+    pub fn with_event(mut self, event: RelayEvent) -> Self {
+        self.events.push(event);
         self
     }
 
@@ -944,6 +1289,21 @@ impl Directory for FakeDirectory {
         Ok(agents)
     }
 
+    async fn people(&self, _community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        let mut people: Vec<PersonInfo> = self
+            .roles
+            .iter()
+            .filter(|(pubkey, _)| !self.owners.contains_key(*pubkey))
+            .map(|(pubkey, role)| PersonInfo {
+                pubkey: pubkey.clone(),
+                name: self.names.get(pubkey).cloned(),
+                role: *role,
+            })
+            .collect();
+        people.sort_by(|a, b| a.pubkey.cmp(&b.pubkey));
+        Ok(people)
+    }
+
     async fn channel_exists(
         &self,
         _community: CommunityId,
@@ -962,5 +1322,30 @@ impl Directory for FakeDirectory {
             .channels
             .get(&channel)
             .is_some_and(|members| members.iter().any(|m| m == pubkey)))
+    }
+
+    async fn event_by_id(
+        &self,
+        _community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        Ok(self.events.iter().find(|e| e.id == id).cloned())
+    }
+
+    async fn newer_mention(
+        &self,
+        _community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.events.iter().any(|e| {
+            !e.deleted
+                && MESSAGE_KINDS.contains(&e.kind)
+                && e.channel_id == event.channel_id
+                && e.mentions(agent)
+                && e.in_thread(root)
+                && (e.created_at, &e.id) > (event.created_at, &event.id)
+        }))
     }
 }

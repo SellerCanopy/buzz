@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod claim_echo_mcp;
 pub mod script_agent;
 
 use axum::body::Body;
@@ -53,6 +54,8 @@ pub struct World {
     pub agent: Keys,
     pub agent_name: String,
     pub channel: Uuid,
+    /// People added with [`World::add_member`], removed by [`World::cleanup`].
+    people: std::sync::Mutex<Vec<Keys>>,
 }
 
 impl World {
@@ -88,6 +91,7 @@ impl World {
             agent,
             agent_name: format!("e2e-agent-{tag}"),
             channel: Uuid::new_v4(),
+            people: std::sync::Mutex::new(Vec::new()),
         };
         let relay = &world.relay_pool;
         for (keys, name, owned) in [
@@ -142,7 +146,67 @@ impl World {
         world
     }
 
+    /// A person who is a relay member and a member of the channel, so at Read until a level is
+    /// set for them.
+    pub async fn add_member(&self, label: &str) -> Keys {
+        let keys = Keys::generate();
+        let name = format!("e2e-{label}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let relay = &self.relay_pool;
+        sqlx::query(
+            "INSERT INTO public.users (community_id, pubkey, display_name) VALUES ($1, $2, $3)",
+        )
+        .bind(self.community)
+        .bind(pubkey_bytes(&keys))
+        .bind(name)
+        .execute(relay)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO public.relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
+        )
+        .bind(self.community)
+        .bind(keys.public_key().to_hex())
+        .execute(relay)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO public.channel_members (community_id, channel_id, pubkey) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(self.community)
+        .bind(self.channel)
+        .bind(pubkey_bytes(&keys))
+        .execute(relay)
+        .await
+        .unwrap();
+        self.people.lock().unwrap().push(keys.clone());
+        keys
+    }
+
     pub async fn cleanup(&self, card_title: &str) {
+        let people: Vec<Keys> = self.people.lock().unwrap().clone();
+        let hexes: Vec<String> = people.iter().map(|k| k.public_key().to_hex()).collect();
+        let _ = sqlx::query(
+            "DELETE FROM hive.access_levels WHERE community_id = $1 AND pubkey = ANY($2)",
+        )
+        .bind(self.community)
+        .bind(&hexes)
+        .execute(&self.pool)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM public.relay_members WHERE community_id = $1 AND pubkey = ANY($2)",
+        )
+        .bind(self.community)
+        .bind(&hexes)
+        .execute(&self.relay_pool)
+        .await;
+        let _ =
+            sqlx::query("DELETE FROM public.users WHERE community_id = $1 AND pubkey = ANY($2)")
+                .bind(self.community)
+                .bind(people.iter().map(pubkey_bytes).collect::<Vec<_>>())
+                .execute(&self.relay_pool)
+                .await;
+
         let agent = self.agent.public_key().to_hex();
         let owner = self.owner.public_key().to_hex();
         let _ = sqlx::query(

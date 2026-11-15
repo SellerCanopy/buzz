@@ -4,7 +4,9 @@
 //! `bytea` in `users`, so this module converts both ways.
 
 use buzz_hive_core::access::RelayRole;
-use buzz_hive_core::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, StoreError};
+use buzz_hive_core::ports::store::{
+    AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, RelayEvent, StoreError, MESSAGE_KINDS,
+};
 
 use crate::db_error::store_error;
 
@@ -105,6 +107,37 @@ impl Directory for RelayRead {
         Ok(rows.into_iter().map(agent).collect())
     }
 
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        // An agent is a relay member too, and is listed by `list_agents`, not here.
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT m.pubkey, u.display_name, m.role FROM public.relay_members m \
+             LEFT JOIN public.users u \
+               ON u.community_id = m.community_id AND encode(u.pubkey, 'hex') = m.pubkey \
+             WHERE m.community_id = $1 AND u.agent_owner_pubkey IS NULL \
+             ORDER BY lower(u.display_name), m.pubkey",
+        )
+        .bind(community)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(pubkey, name, role)| {
+                let role = match role.as_str() {
+                    "owner" => RelayRole::Owner,
+                    "admin" => RelayRole::Admin,
+                    "member" => RelayRole::Member,
+                    _ => return None,
+                };
+                Some(PersonInfo {
+                    pubkey,
+                    name: name.filter(|n| !n.is_empty()),
+                    role,
+                })
+            })
+            .collect())
+    }
+
     async fn channel_exists(
         &self,
         community: CommunityId,
@@ -142,6 +175,95 @@ impl Directory for RelayRead {
         .await
         .map_err(store_error)
     }
+
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        let Ok(bytes) = hex::decode(id) else {
+            return Ok(None);
+        };
+        let row: Option<(
+            Vec<u8>,
+            Vec<u8>,
+            i32,
+            serde_json::Value,
+            i64,
+            Option<uuid::Uuid>,
+            bool,
+        )> = sqlx::query_as(
+            "SELECT id, pubkey, kind, tags, EXTRACT(EPOCH FROM created_at)::bigint, \
+                        channel_id, deleted_at IS NOT NULL \
+                 FROM public.events WHERE community_id = $1 AND id = $2 LIMIT 1",
+        )
+        .bind(community)
+        .bind(bytes)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(row.map(
+            |(id, author, kind, tags, created_at, channel_id, deleted)| RelayEvent {
+                id: hex::encode(id),
+                author: hex::encode(author),
+                kind,
+                tags: tag_rows(&tags),
+                created_at,
+                channel_id,
+                deleted,
+            },
+        ))
+    }
+
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        let (Ok(id), Some(channel)) = (hex::decode(&event.id), event.channel_id) else {
+            return Ok(false);
+        };
+        // Containment is answered by the tags index. A reaction also names the agent and the
+        // root, so only the kinds that carry a message count.
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.events \
+             WHERE community_id = $1 AND channel_id = $2 AND deleted_at IS NULL \
+               AND kind = ANY($7) \
+               AND created_at >= to_timestamp($3) \
+               AND (created_at, id) > (to_timestamp($3), $4) \
+               AND tags @> $5::jsonb AND tags @> $6::jsonb)",
+        )
+        .bind(community)
+        .bind(channel)
+        .bind(event.created_at as f64)
+        .bind(id)
+        .bind(serde_json::json!([["p", agent]]))
+        .bind(serde_json::json!([["e", root]]))
+        .bind(MESSAGE_KINDS)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_error)
+    }
+}
+
+/// A tags column read as rows of strings. A value that is not a string is dropped.
+fn tag_rows(tags: &serde_json::Value) -> Vec<Vec<String>> {
+    tags.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    row.as_array().map(|cells| {
+                        cells
+                            .iter()
+                            .filter_map(|c| c.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn agent((pubkey, name, owner): (Vec<u8>, String, Vec<u8>)) -> AgentInfo {
@@ -153,7 +275,6 @@ fn agent((pubkey, name, owner): (Vec<u8>, String, Vec<u8>)) -> AgentInfo {
 }
 
 /// Every relay column this crate reads. Checked at startup and by tests/postgres_relay_columns.rs.
-/// Later phases add `events` (Phase 15).
 pub const RELAY_COLUMNS: &[(&str, &str, &str)] = &[
     ("relay_members", "community_id", "uuid"),
     ("relay_members", "pubkey", "text"),
@@ -173,6 +294,14 @@ pub const RELAY_COLUMNS: &[(&str, &str, &str)] = &[
     ("channel_members", "removed_at", "timestamp with time zone"),
     ("communities", "id", "uuid"),
     ("communities", "host", "text"),
+    ("events", "community_id", "uuid"),
+    ("events", "id", "bytea"),
+    ("events", "pubkey", "bytea"),
+    ("events", "created_at", "timestamp with time zone"),
+    ("events", "kind", "integer"),
+    ("events", "tags", "jsonb"),
+    ("events", "channel_id", "uuid"),
+    ("events", "deleted_at", "timestamp with time zone"),
 ];
 
 /// Fail when a relay column this crate reads is missing or has another type.

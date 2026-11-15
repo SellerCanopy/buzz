@@ -15,6 +15,7 @@ use buzz_hive_core::orchestrator::artifacts::MAX_PLAN_ITEM_BYTES;
 use buzz_hive_core::orchestrator::cards::{
     MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
 };
+use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
     MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
@@ -161,6 +162,20 @@ pub const TOOLS: &[Tool] = &[
         schema: set_setting,
     },
     Tool {
+        name: "set_auto_mode",
+        route: "SetAutoMode",
+        needs: Level::Run,
+        description: "Turn auto mode on or off for a card. In auto mode the engine approves a gate whose listed artifacts all have a saved version, starts a failed run again twice, and asks a stage that did not report to carry on twice. It leaves everything else to a person. You may turn it on only for a person at Run or above; with none named the call is refused.",
+        schema: set_auto_mode,
+    },
+    Tool {
+        name: "set_access_level",
+        route: "SetAccessLevel",
+        needs: Level::Admin,
+        description: "Set the level of a person or an agent in Beehive: none, read, run or admin. An agent can never hold a level above its owner's, and you cannot lower your own. You may call it only for a person at Admin; with none named the call is refused.",
+        schema: set_access_level,
+    },
+    Tool {
         name: SAVE_ARTIFACT,
         route: "SaveArtifact",
         needs: Level::Run,
@@ -201,6 +216,41 @@ pub const TOOLS: &[Tool] = &[
         needs: Level::Read,
         description: "Read the work and decisions logged on a card, oldest first. Give after_seq of the last entry you saw to read on.",
         schema: read_history,
+    },
+    Tool {
+        name: "cancel_run",
+        route: "StopRun",
+        needs: Level::Run,
+        description: "Stop a run that has not ended. Its stage's agent is told to stop in the stage's thread, and the card is stopped. Give the run's id from get_card or list_runs.",
+        schema: run_id_only,
+    },
+    Tool {
+        name: "retry_stage",
+        route: "RetryRun",
+        needs: Level::Run,
+        description: "Start the next attempt of a run that failed or was stopped: a new run at the stage the old one ended at, with a new thread. Give the id of the card's newest run. The card must be failed or stopped.",
+        schema: run_id_only,
+    },
+    Tool {
+        name: "ask_gate",
+        route: "AskGate",
+        needs: Level::Run,
+        description: "Ask a person a question and wait for the reply. It opens an item in Needs you and the card waits; the reply arrives in this stage's thread. Pass the card_id, stage and visit from the task. Only the agent the stage task mentioned may call it.",
+        schema: ask_gate,
+    },
+    Tool {
+        name: "approve_gate",
+        route: "Approve",
+        needs: Level::Run,
+        description: "Approve the approval stage the card waits at. Each artifact the stage lists is approved at its latest version, or at the version you name. A listed artifact with no saved version is refused by name, and the gate waits for a person.",
+        schema: approve_gate,
+    },
+    Tool {
+        name: "get_inbox",
+        route: "ListInbox",
+        needs: Level::Read,
+        description: "List what waits for a person in Needs you, open items first. Give a card id to list one card's items.",
+        schema: get_inbox,
     },
     Tool {
         name: "get_hive_health",
@@ -250,6 +300,10 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "the Files tab lists a card's files; a stage task says how to download its inputs",
     ),
     (
+        "ListAutoDecisions",
+        "the Activity tab shows each auto answer with its reason; an agent reads get_inbox for what still waits",
+    ),
+    (
         "SkipStage",
         "a person's call from the board. An agent that could hold, release or skip a card could override the others, so the engine refuses an agent and the shim offers no tool",
     ),
@@ -260,6 +314,46 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "ResumeCard",
         "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "PauseAll",
+        "a person's call from the board, at the Admin level; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "ResetCard",
+        "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "AnswerInbox",
+        "a person's call from Needs you; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "SendBack",
+        "a person's call on an approval gate; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "SendMessage",
+        "a person's way to write to a stage's agent; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "ListActivity",
+        "the Activity tab filters a card's entries; an agent reads them with read_history",
+    ),
+    (
+        "GetFullPayload",
+        "the Activity tab opens one event; an agent has no use for it",
+    ),
+    (
+        "GetUsage",
+        "the Usage page's counts; an agent has no use for them",
+    ),
+    (
+        "ListAccess",
+        "the access page lists everyone with their level; an agent reads list_agents for the agents it may name",
+    ),
+    (
+        "ListPeople",
+        "the access page lists the community's members with their levels; an agent has no use for them",
     ),
     (
         "SetHandoff",
@@ -290,6 +384,14 @@ fn no_arguments() -> Value {
 
 fn card_id_only() -> Value {
     object(vec![("cardId", string("The card's id."))], &["cardId"])
+}
+
+/// The argument that names a run, in the tools that take one. The MCP shim reads it from a
+/// call to fall back to a run claim, so the schemas below are its only owner.
+pub const RUN_ID_ARG: &str = "runId";
+
+fn run_id_only() -> Value {
+    object(vec![(RUN_ID_ARG, string("The run's id."))], &[RUN_ID_ARG])
 }
 
 fn create_card() -> Value {
@@ -401,6 +503,65 @@ fn visit_field() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "The visit the task named, from 1." })
 }
 
+fn ask_gate() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card_id the stage task gave you.")),
+            ("stage", string("The stage the task named.")),
+            ("visit", visit_field()),
+            (
+                "question",
+                string(&format!(
+                    "What you need a person to decide. Up to {MAX_TEXT_CHARS} characters."
+                )),
+            ),
+        ],
+        &["cardId", "stage", "visit", "question"],
+    )
+}
+
+fn approve_gate() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card waiting at an approval stage.")),
+            (
+                "artifacts",
+                json!({
+                    "type": "array",
+                    "description": "Versions to approve. An artifact left out is approved at its latest.",
+                    "items": object(
+                        vec![
+                            ("name", string("The artifact's name.")),
+                            (
+                                "version",
+                                json!({ "type": "integer", "minimum": 1, "description": "The version to approve." }),
+                            ),
+                        ],
+                        &["name", "version"],
+                    ),
+                }),
+            ),
+        ],
+        &["cardId"],
+    )
+}
+
+fn get_inbox() -> Value {
+    object(
+        vec![
+            (
+                "cardId",
+                string("The card's id. Empty lists every card's items."),
+            ),
+            (
+                "includeResolved",
+                json!({ "type": "boolean", "description": "Also list the items already answered." }),
+            ),
+        ],
+        &[],
+    )
+}
+
 fn list_cards() -> Value {
     object(
         vec![(
@@ -419,7 +580,7 @@ fn list_runs() -> Value {
 }
 
 fn get_run() -> Value {
-    object(vec![("runId", string("The run's id."))], &["runId"])
+    run_id_only()
 }
 
 fn add_note() -> Value {
@@ -636,6 +797,39 @@ fn get_settings() -> Value {
     )
 }
 
+fn set_access_level() -> Value {
+    object(
+        vec![
+            (
+                "pubkey",
+                string("The person's or agent's pubkey, 64 hex characters."),
+            ),
+            (
+                "level",
+                json!({
+                    "type": "string",
+                    "enum": ["none", "read", "run", "admin"],
+                    "description": "The level to give.",
+                }),
+            ),
+        ],
+        &["pubkey", "level"],
+    )
+}
+
+fn set_auto_mode() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            (
+                "enabled",
+                json!({ "type": "boolean", "description": "True turns auto mode on, false turns it off." }),
+            ),
+        ],
+        &["cardId", "enabled"],
+    )
+}
+
 fn set_setting() -> Value {
     object(
         vec![
@@ -702,6 +896,7 @@ mod tests {
         has("record_decision", &MAX_REJECTED);
         has("read_history", &MAX_HISTORY_LIMIT);
         has("read_history", &DEFAULT_HISTORY_LIMIT);
+        has("ask_gate", &MAX_TEXT_CHARS);
     }
 
     #[test]

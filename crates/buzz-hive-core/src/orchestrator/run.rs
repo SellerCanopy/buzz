@@ -12,7 +12,7 @@ use super::settings;
 use super::{Ctx, Env, OpError};
 use crate::access::ActorKind;
 use crate::config::LayerKind;
-use crate::domain::card::Card;
+use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
 use crate::domain::run::{Run, RunState};
 use crate::domain::workflow::RESULT_PASSED;
@@ -51,6 +51,20 @@ pub async fn start_run_at(
     parameters: BTreeMap<String, String>,
 ) -> Result<(Run, Vec<Event>), OpError> {
     let mut tx = env.store.begin(ctx.community).await?;
+    let run = start_in(env, ctx, &mut *tx, card_id, stage, parameters).await?;
+    let events = tx.commit().await?;
+    Ok((run, events))
+}
+
+/// [`start_run_at`] inside a transaction the caller holds and commits.
+pub(super) async fn start_in(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    tx: &mut dyn Tx,
+    card_id: Uuid,
+    stage: Option<&str>,
+    parameters: BTreeMap<String, String>,
+) -> Result<Run, OpError> {
     let mut card = tx
         .cards()
         .get_for_update(card_id)
@@ -101,12 +115,10 @@ pub async fn start_run_at(
     .await?;
     check_parameters(env, &mut *tx, &card, &parameters).await?;
 
-    let run = begin_run(
+    begin_run(
         env, ctx, &mut *tx, &mut card, package, stage, parameters, false,
     )
-    .await?;
-    let events = tx.commit().await?;
-    Ok((run, events))
+    .await
 }
 
 /// Refuses a parameter value the workflow does not declare or that breaks its rules.
@@ -206,7 +218,7 @@ pub async fn stage_done(
 }
 
 /// Refuses a report that does not say which stage and visit it is for.
-fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
+pub(super) fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
     if stage.is_empty() {
         return Err(OpError::InvalidArgument(
             "stage is required: the stage the task named".into(),
@@ -221,7 +233,12 @@ fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
 }
 
 /// Refuses a report for a stage or visit the run is no longer at.
-fn check_position(run: &Run, running: &str, stage: &str, visit: u32) -> Result<(), OpError> {
+pub(super) fn check_position(
+    run: &Run,
+    running: &str,
+    stage: &str,
+    visit: u32,
+) -> Result<(), OpError> {
     if stage != running || visit != run.visit {
         return Err(OpError::FailedPrecondition(format!(
             "this report is for stage {stage} visit {visit}, but the run is at stage {running} visit {}; \
@@ -235,7 +252,7 @@ fn check_position(run: &Run, running: &str, stage: &str, visit: u32) -> Result<(
 /// Refuses an agent a call that is a person's to make. An agent acts through the stage task
 /// it was given, so it may report a result or move its own card, and may not hold, release or
 /// skip a card, which would let one agent override the others on a board.
-fn people_only(ctx: &Ctx, what: &str) -> Result<(), OpError> {
+pub(super) fn people_only(ctx: &Ctx, what: &str) -> Result<(), OpError> {
     if ctx.actor.kind == ActorKind::Agent {
         return Err(OpError::PermissionDenied(format!(
             "only a person may {what}; an agent reports with {STAGE_DONE}"
@@ -340,6 +357,209 @@ pub async fn resume_card(
     Ok((run, events))
 }
 
+/// Stops a run that has not ended: its stage's agent is told to stop in the stage's thread, the
+/// run ends, and the card is `stopped`. A person or an agent may stop a run.
+pub async fn stop_run(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    run_id: Uuid,
+) -> Result<(Run, Vec<Event>), OpError> {
+    let mut tx = env.store.begin(ctx.community).await?;
+    let found = tx
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("run {run_id} does not exist")))?;
+    let run = stop_in(env, ctx, &mut *tx, found.card_id, Some(run_id)).await?;
+    let events = tx.commit().await?;
+    Ok((run, events))
+}
+
+/// Stops the card's run in a transaction the caller holds. With `only`, the run must be that one.
+pub(super) async fn stop_in(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    tx: &mut dyn Tx,
+    card_id: Uuid,
+    only: Option<Uuid>,
+) -> Result<Run, OpError> {
+    // Only the missing run reads as "ended" when a particular run was named. Any other refusal,
+    // such as a package that failed to load, keeps its own message.
+    let (mut card, run, package) = locked(env, &mut *tx, card_id).await.map_err(|e| match e {
+        OpError::FailedPrecondition(m) if only.is_some() && m == NO_RUN_IN_PROGRESS => {
+            OpError::FailedPrecondition("the run has ended, so there is nothing to stop".into())
+        }
+        other => other,
+    })?;
+    if only.is_some_and(|id| id != run.id) {
+        return Err(OpError::FailedPrecondition(
+            "the run has ended, so there is nothing to stop".into(),
+        ));
+    }
+    let who = match ctx.actor.kind {
+        ActorKind::Agent => "an agent",
+        _ => "a person",
+    };
+    let facts = facts(&mut *tx, &card, package, run.current_stage.as_deref()).await?;
+    let stepped = step(
+        &run,
+        package,
+        &facts,
+        Input::Cancel {
+            reason: format!("{who} stopped the run"),
+        },
+    );
+    apply(
+        env,
+        ctx,
+        &mut *tx,
+        &mut card,
+        package,
+        stepped,
+        Mode::Update,
+    )
+    .await
+}
+
+/// Starts the next attempt of a run that failed or was stopped: a new run of the card, at the
+/// stage the old one ended at, with the old run's parameters. A new run opens a new thread.
+///
+/// The run must be the card's newest, and the card must be `failed` or `stopped`.
+pub async fn retry_run(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    run_id: Uuid,
+) -> Result<(Run, Vec<Event>), OpError> {
+    let mut tx = env.store.begin(ctx.community).await?;
+    let old = tx
+        .runs()
+        .get(run_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("run {run_id} does not exist")))?;
+    let card = tx
+        .cards()
+        .get_for_update(old.card_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("card {} does not exist", old.card_id)))?;
+    let newest = tx
+        .runs()
+        .list(Some(card.id))
+        .await?
+        .first()
+        .map(|run| run.id);
+    if old.state != RunState::Ended
+        || newest != Some(run_id)
+        || !matches!(card.state, CardState::Failed | CardState::Stopped)
+    {
+        return Err(OpError::FailedPrecondition(format!(
+            "only the newest run of a card that failed or was stopped can be retried; this run is {} and the card is {}",
+            old.state.as_str(),
+            card.state.as_str()
+        )));
+    }
+    let run = start_in(
+        env,
+        ctx,
+        &mut *tx,
+        card.id,
+        old.current_stage.as_deref(),
+        old.parameters.clone(),
+    )
+    .await?;
+    let events = tx.commit().await?;
+    Ok((run, events))
+}
+
+/// A person puts a card back to idle: its run, if it has one, is stopped first. Artifacts are
+/// kept. An agent may not.
+pub async fn reset_card(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    card_id: Uuid,
+) -> Result<(Card, Vec<Event>), OpError> {
+    people_only(ctx, "reset a card")?;
+    let mut tx = env.store.begin(ctx.community).await?;
+    let mut card = tx
+        .cards()
+        .get_for_update(card_id)
+        .await?
+        .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
+    if tx.runs().active_for_card(card_id).await?.is_some() {
+        stop_in(env, ctx, &mut *tx, card_id, None).await?;
+        card = tx
+            .cards()
+            .get(card_id)
+            .await?
+            .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
+    }
+    if card.state != CardState::Idle {
+        let from = card.state;
+        card.state = CardState::Idle;
+        tx.cards().update(&card).await?;
+        let event = Event::new(
+            "card.state",
+            Some(card.id),
+            None,
+            ctx.actor.clone(),
+            serde_json::json!({ "state": card.state.as_str(), "from": from.as_str(), "reason": "a person reset the card" }),
+        );
+        tx.events().append(event).await?;
+    }
+    let events = tx.commit().await?;
+    Ok((card, events))
+}
+
+/// What [`pause_all`] did. Each run is held in its own transaction, so a failure part way
+/// leaves the earlier ones held: the caller publishes `events` either way, then reports `failed`.
+#[derive(Debug)]
+pub struct PausedAll {
+    /// How many runs were held.
+    pub paused: u32,
+    /// How many were left alone because they changed state in the meantime.
+    pub skipped: u32,
+    /// The events of the runs that were held.
+    pub events: Vec<Event>,
+    /// The error that stopped the sweep before it reached every run, if one did.
+    pub failed: Option<OpError>,
+}
+
+/// A person holds every running run, one transaction each. A run that changed state in the
+/// meantime is left alone and counted as skipped. An agent may not.
+pub async fn pause_all(env: &Env<'_>, ctx: &Ctx) -> Result<PausedAll, OpError> {
+    people_only(ctx, "pause every run")?;
+    let mut tx = env.store.begin(ctx.community).await?;
+    let cards: Vec<Uuid> = tx
+        .runs()
+        .list(None)
+        .await?
+        .into_iter()
+        .filter(|run| run.state == RunState::Running)
+        .map(|run| run.card_id)
+        .collect();
+    drop(tx);
+    let mut done = PausedAll {
+        paused: 0,
+        skipped: 0,
+        events: Vec::new(),
+        failed: None,
+    };
+    for card in cards {
+        match pause_card(env, ctx, card).await {
+            Ok((_, committed)) => {
+                done.paused += 1;
+                done.events.extend(committed);
+            }
+            Err(OpError::FailedPrecondition(_) | OpError::NotFound(_)) => done.skipped += 1,
+            Err(other) => {
+                tracing::warn!(card = %card, error = %other, "pause all stopped early");
+                done.failed = Some(other);
+                break;
+            }
+        }
+    }
+    Ok(done)
+}
+
 /// The stage's agent moves the card to `target`, in place of the route its result would give.
 /// A workflow allows it with `side_effects.agent_moves_cards`.
 ///
@@ -408,6 +628,9 @@ pub async fn move_card(
     Ok((run, events))
 }
 
+/// Why [`locked`] refuses a card that has no run in progress.
+pub(super) const NO_RUN_IN_PROGRESS: &str = "the card has no run in progress";
+
 /// The card and its run, both held until the transaction ends, and the run's package.
 pub(super) async fn locked<'a>(
     env: &Env<'a>,
@@ -423,7 +646,7 @@ pub(super) async fn locked<'a>(
         .runs()
         .active_for_card(card_id)
         .await?
-        .ok_or_else(|| OpError::FailedPrecondition("the card has no run in progress".into()))?;
+        .ok_or_else(|| OpError::FailedPrecondition(NO_RUN_IN_PROGRESS.into()))?;
     let run = tx
         .runs()
         .get_for_update(active.id)

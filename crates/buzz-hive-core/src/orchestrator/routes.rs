@@ -15,13 +15,17 @@ use super::lookup::Memo;
 use super::task_message::{render_task, with_card_link, CardText, Handoff};
 use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
+use crate::access::ActorKind;
 use crate::config::{self, Layer, Layers, Resolution};
 use crate::domain::card::{Card, CardState};
 use crate::domain::events::Event;
+use crate::domain::inbox::{InboxItem, ANSWER_SUPERSEDED};
 use crate::domain::run::{Run, RunState};
-use crate::ports::store::{Posting, Tx};
+use crate::domain::timer::TimerKind;
+use crate::domain::workflow::Duration as SettingDuration;
+use crate::ports::store::{Posting, Pubkey, Tx};
 use crate::rules::run::{
-    entry_stage, step, task_key, Effect, Ended, Facts, Input, Note, Round, Step,
+    entry_stage, step, task_key, Effect, Ended, Execution, Facts, Input, Note, Round, Step,
 };
 use crate::tool_names::STAGE_DONE;
 use crate::workflow::load::Package;
@@ -48,26 +52,63 @@ pub(super) async fn facts(
         Some((stage, _)) => artifacts::plan_progress(tx, card.id, stage).await?,
         None => (0, 0),
     };
+    let layers = layers(tx, card, Some(package), &BTreeMap::new()).await?;
+    let mut execution = BTreeMap::new();
+    for stage in &package.workflow.stages {
+        let resolution = config::resolve(&card.workflow, Some(stage), &layers, false);
+        execution.insert(stage.id.clone(), execution_from(&resolution));
+    }
     Ok(Facts {
         // Issue labels arrive with intake (Phase 16).
         labels: Vec::new(),
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
         plan,
+        execution,
+        auto_mode: auto_mode_of(tx, card.id).await?,
     })
 }
 
-/// Every setting of one stage of the card's workflow, through the six layers. `parameters`
-/// are the run's own values.
-pub(super) async fn resolve_settings(
-    env: &Env<'_>,
+/// Whether the card is in auto mode.
+pub(super) async fn auto_mode_of(tx: &mut dyn Tx, card: Uuid) -> Result<bool, OpError> {
+    let value = tx
+        .settings()
+        .get("card", &card.to_string(), config::KEY_AUTO_MODE)
+        .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+/// A stage's timeout and retries from its resolved settings. A value that does not parse was
+/// refused when it was saved, so it falls back to the engine default here.
+fn execution_from(resolution: &Resolution) -> Execution {
+    let wait = |key: &str| {
+        resolution
+            .value(key)
+            .and_then(|v| v.as_str())
+            .and_then(|text| SettingDuration::parse(text).ok())
+            .and_then(|d| u64::try_from(d.nanos()).ok())
+            .map(std::time::Duration::from_nanos)
+            .unwrap_or_default()
+    };
+    Execution {
+        timeout: wait("execution.timeout"),
+        retries: resolution
+            .value("execution.retries.max")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or_default(),
+        backoff: wait("execution.retries.backoff"),
+    }
+}
+
+/// The settings layers of the card's workflow, as stored. `parameters` are the run's own values.
+async fn layers(
     tx: &mut dyn Tx,
     card: &Card,
+    package: Option<&Package>,
     parameters: &BTreeMap<String, String>,
-    stage: Option<&str>,
-) -> Result<Resolution, OpError> {
-    let package = env.catalog.get(&card.workflow);
-    let layers = Layers {
+) -> Result<Layers, OpError> {
+    Ok(Layers {
         user: Layer::new(
             "community settings",
             tx.settings().list("engine", "").await?,
@@ -84,7 +125,20 @@ pub(super) async fn resolve_settings(
         params: package
             .map(|p| p.meta.parameters.clone())
             .unwrap_or_default(),
-    };
+    })
+}
+
+/// Every setting of one stage of the card's workflow, through the six layers. `parameters`
+/// are the run's own values.
+pub(super) async fn resolve_settings(
+    env: &Env<'_>,
+    tx: &mut dyn Tx,
+    card: &Card,
+    parameters: &BTreeMap<String, String>,
+    stage: Option<&str>,
+) -> Result<Resolution, OpError> {
+    let package = env.catalog.get(&card.workflow);
+    let layers = layers(tx, card, package, parameters).await?;
     let stage = stage
         .and_then(|id| package.and_then(|p| p.stage(id)))
         .map(|(s, _)| s);
@@ -105,6 +159,26 @@ pub(super) fn run_layer(parameters: &BTreeMap<String, String>) -> Layer {
             })
             .collect(),
     )
+}
+
+/// The person a run started by `ctx` is for: the person an agent acts for, or the person
+/// who asked. An agent with no claim, and the engine's own account, name no one, so a run
+/// never records an agent as the person it acts for.
+fn requester_of(ctx: &Ctx) -> Option<Pubkey> {
+    ctx.requester
+        .clone()
+        .or_else(|| (ctx.actor.kind == ActorKind::Person).then(|| ctx.actor.pubkey.clone()))
+}
+
+/// `ctx` for a run that someone other than a person starts on a run's behalf, such as auto
+/// mode retrying it or a finished workflow handing its card on: the new run keeps `earlier`'s
+/// requester. A person who asks keeps their own place as the requester.
+pub(super) fn carrying_requester(ctx: &Ctx, earlier: &Run) -> Ctx {
+    let mut carried = ctx.clone();
+    if ctx.actor.kind != ActorKind::Person && carried.requester.is_none() {
+        carried.requester = earlier.requester.clone();
+    }
+    carried
 }
 
 /// Makes a run of `package` for `card`, starts it at `stage` (the first stage when `None`)
@@ -131,7 +205,7 @@ pub(super) async fn begin_run(
         package,
         &facts,
         Input::Start {
-            requester: Some(ctx.actor.pubkey.clone()),
+            requester: requester_of(ctx),
             stage: stage.map(str::to_owned),
             held,
         },
@@ -165,6 +239,9 @@ pub(super) async fn apply(
         directory: &directory,
         ..*env
     };
+    let opens_item = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenInbox { .. }));
     let channel = super::settings::update_channel(tx).await?;
     for effect in &effects {
         if let Effect::PostStageTask {
@@ -180,6 +257,16 @@ pub(super) async fn apply(
                 .await?;
         }
     }
+    // A card in auto mode may answer its own items below, and each answer posts to the next
+    // stage's agent. Ask for the workflow's agents now, before the first append, so those
+    // answers find them here.
+    if auto_mode_of(tx, card.id).await? {
+        if let Some(channel) = channel {
+            ask_directory(env, ctx, package, channel).await?;
+            // An answer auto mode gives may finish the workflow and hand the card on.
+            ask_next(env, ctx, tx, package, channel).await?;
+        }
+    }
     let next = if ended == Some(Ended::Done) && mode == Mode::Update {
         Some(next_workflow(env, ctx, tx, package).await?)
     } else {
@@ -191,6 +278,12 @@ pub(super) async fn apply(
     match mode {
         Mode::Insert => tx.runs().insert(&run).await?,
         Mode::Update => tx.runs().update(&run).await?,
+    }
+    // Every change to a run retires its timers, and the effects that follow set the ones the
+    // new state needs: a stage that waits, ends or is held has none, and one that runs has the
+    // timeout it just started.
+    if !effects.is_empty() {
+        tx.timers().clear_run(run.id).await?;
     }
     let state = card_state(&run, ended);
     let before = card.state;
@@ -213,9 +306,64 @@ pub(super) async fn apply(
             append(tx, ctx, "card.state", &run, payload).await?;
         }
     }
+    // A step that changes a run closes the items that waited on it, and the effects below open
+    // the ones the new state needs. An item a person answered is closed already.
+    if mode == Mode::Insert || !effects.is_empty() {
+        let closed = tx
+            .inbox()
+            .resolve_card(card.id, ANSWER_SUPERSEDED, &ctx.actor.pubkey)
+            .await?;
+        for item in closed {
+            append(
+                tx,
+                ctx,
+                "inbox.resolved",
+                &run,
+                resolved_payload(&item, ANSWER_SUPERSEDED, &ctx.actor.pubkey),
+            )
+            .await?;
+        }
+    }
     for effect in effects {
         match effect {
             Effect::Emit { kind, payload } => append(tx, ctx, kind, &run, payload).await?,
+            Effect::OpenInbox {
+                stage,
+                visit,
+                kind,
+                reason,
+                artifacts,
+            } => {
+                let mut listed = Vec::new();
+                for name in artifacts {
+                    let version = tx.artifacts().version(card.id, &name, None).await?;
+                    listed.push(json!({ "name": name, "version": version.map(|v| v.version) }));
+                }
+                let item = InboxItem::open(
+                    card.id,
+                    run.id,
+                    &stage,
+                    visit,
+                    kind,
+                    &reason,
+                    json!({ "artifacts": listed }),
+                );
+                tx.inbox().insert(&item).await?;
+                append(
+                    tx,
+                    ctx,
+                    "inbox.opened",
+                    &run,
+                    json!({
+                        "id": item.id,
+                        "kind": kind.as_str(),
+                        "stage": stage,
+                        "visit": visit,
+                        "title": reason,
+                    }),
+                )
+                .await?;
+            }
             Effect::PostStatus {
                 card: id,
                 key,
@@ -270,6 +418,16 @@ pub(super) async fn apply(
                 };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
+            Effect::ArmTimeout { stage, after } => {
+                tx.timers()
+                    .arm(run.id, &stage, TimerKind::Timeout, after)
+                    .await?;
+            }
+            Effect::ArmRetry { stage, after } => {
+                tx.timers()
+                    .arm(run.id, &stage, TimerKind::Retry, after)
+                    .await?;
+            }
             Effect::PostReply {
                 card: id,
                 stage,
@@ -284,6 +442,9 @@ pub(super) async fn apply(
                         Posting::StageTask { agent, .. } => agent,
                         _ => return Err(no_thread(&stage)),
                     },
+                    // A stage that was held or never launched has no thread, and nobody to tell
+                    // to stop.
+                    None if matches!(note, Note::Stopped { .. }) => continue,
                     None => return Err(no_thread(&stage)),
                 };
                 let text = match &note {
@@ -301,6 +462,18 @@ pub(super) async fn apply(
                         )
                         .await?
                     }
+                    Note::Retry { reason, attempt } => format!(
+                        "Attempt {attempt} of stage {stage} failed: {reason}. Please try again in this thread, and report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
+                    Note::Stopped { reason } => format!(
+                        "The run was stopped: {reason}. Stop work on stage {stage} and do not report a result."
+                    ),
+                    Note::Answer { text } if text.is_empty() => format!(
+                    "A person asks you to carry on with stage {stage}. Report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
+                    Note::Answer { text } => format!(
+                    "A person answered: {text}\n\nCarry on with stage {stage}, and report the result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
+                    ),
                     Note::Resumed => format!(
                         "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
                     ),
@@ -323,9 +496,73 @@ pub(super) async fn apply(
     // A run that ends in the step that starts it, because its conditions skip every stage,
     // does not hand off, so two workflows that hand off to each other cannot loop.
     if let Some(next) = next {
-        hand_off(env, ctx, tx, card, next).await?;
+        hand_off(env, ctx, tx, card, &run, next).await?;
+    }
+    // A card in auto mode answers the item this step opened, and whatever the answer opens in
+    // turn. The run and the card are then as the answers left them.
+    if opens_item && Box::pin(super::auto::settle(env, ctx, tx, card.id)).await? {
+        if let Some(current) = tx.cards().get(card.id).await? {
+            *card = current;
+        }
+        let latest = match tx.runs().active_for_card(card.id).await? {
+            Some(active) => Some(active),
+            None => tx.runs().get(run.id).await?,
+        };
+        if let Some(latest) = latest {
+            run = latest;
+        }
     }
     Ok(run)
+}
+
+/// Asks the directory for what a step on the workflow's card may need: that the update channel
+/// exists, that the Beehive account and each agent the stages name are in it. A step that goes
+/// on to answer an item, or to start a run, finds the answers here instead of asking after its
+/// first append, which takes the log lock. An agent that cannot be found is left for the step
+/// that needs it to refuse.
+pub(super) async fn ask_directory(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    package: &Package,
+    channel: Uuid,
+) -> Result<(), OpError> {
+    env.directory.channel_exists(ctx.community, channel).await?;
+    env.directory
+        .member_of_channel(ctx.community, channel, env.hive)
+        .await?;
+    for stage in &package.workflow.stages {
+        let Some(name) = stage.agent.as_deref() else {
+            continue;
+        };
+        match find_agent(env, ctx, name, &package.meta.name, &stage.id).await {
+            Ok(agent) => {
+                env.directory
+                    .member_of_channel(ctx.community, channel, &agent)
+                    .await?;
+            }
+            Err(OpError::FailedPrecondition(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(())
+}
+
+/// Asks the directory what the workflow `package` hands finished cards to will need, for a
+/// step that appends before it knows whether the workflow ends. Nothing is asked when the
+/// workflow has no next one, or it is not loaded.
+pub(super) async fn ask_next(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    tx: &mut dyn Tx,
+    package: &Package,
+    channel: Uuid,
+) -> Result<(), OpError> {
+    let options = tx.workflows().options().await?;
+    let next = resolve_options(package, options.get(&package.meta.name)).next;
+    match env.catalog.get(&next) {
+        Some(target) if !next.is_empty() => ask_directory(env, ctx, target, channel).await,
+        _ => Ok(()),
+    }
 }
 
 fn need_channel(channel: Option<Uuid>) -> Result<Uuid, OpError> {
@@ -346,7 +583,8 @@ fn no_thread(stage: &str) -> OpError {
 fn card_state(run: &Run, ended: Option<Ended>) -> CardState {
     match (run.state, ended) {
         (_, Some(Ended::Done)) => CardState::Done,
-        (_, Some(Ended::Stopped)) => CardState::Stopped,
+        (_, Some(Ended::Stopped | Ended::Cancelled)) => CardState::Stopped,
+        (_, Some(Ended::Failed)) => CardState::Failed,
         (RunState::Waiting | RunState::Paused, _) => CardState::Waiting,
         _ => CardState::Running,
     }
@@ -384,6 +622,17 @@ async fn task_text(
         },
         channel: Some(channel),
         visit,
+        // Only the stage's first task carries them: a later round is a reply, not a new brief.
+        sendback: match round {
+            None => run
+                .steps
+                .iter()
+                .rev()
+                .find(|s| s.stage == stage && s.visit == visit)
+                .map(|s| s.sendback.clone())
+                .unwrap_or_default(),
+            Some(_) => String::new(),
+        },
     };
     let mut text = render_task(
         package,
@@ -473,6 +722,7 @@ async fn hand_off(
     ctx: &Ctx,
     tx: &mut dyn Tx,
     card: &mut Card,
+    finished: &Run,
     next: Next<'_>,
 ) -> Result<(), OpError> {
     let (next, target) = match next {
@@ -492,7 +742,7 @@ async fn hand_off(
     tx.events().append(at).await?;
     Box::pin(begin_run(
         env,
-        ctx,
+        &carrying_requester(ctx, finished),
         tx,
         card,
         target,
@@ -546,6 +796,17 @@ async fn note(tx: &mut dyn Tx, ctx: &Ctx, card: &Card, summary: String) -> Resul
     Ok(())
 }
 
+/// The payload of an `inbox.resolved` event.
+pub(super) fn resolved_payload(item: &InboxItem, answer: &str, by: &str) -> serde_json::Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "stage": item.stage,
+        "answer": answer,
+        "by": by,
+    })
+}
+
 pub(super) async fn append(
     tx: &mut dyn Tx,
     ctx: &Ctx,
@@ -553,6 +814,18 @@ pub(super) async fn append(
     run: &Run,
     payload: serde_json::Value,
 ) -> Result<(), OpError> {
+    // One line per transition, so a stuck or misrouted run can be followed from the log. It is
+    // written before the commit: a step that rolls back, such as an auto answer the savepoint
+    // undoes, still shows what it tried.
+    tracing::info!(
+        kind,
+        card = %run.card_id,
+        run = %run.id,
+        stage = payload["stage"].as_str().unwrap_or(""),
+        visit = payload["visit"].as_u64().unwrap_or(0),
+        actor = %ctx.actor.pubkey,
+        "run event"
+    );
     let event = Event::new(
         kind,
         Some(run.card_id),

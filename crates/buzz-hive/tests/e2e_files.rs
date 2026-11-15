@@ -136,6 +136,7 @@ async fn run(world: &World, outsider: &Keys) {
         community: world.community,
         hive_pubkey: adapter.pubkey(),
         outbox: Arc::new(tokio::sync::Notify::new()),
+        timers: Arc::new(tokio::sync::Notify::new()),
     };
     let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -207,6 +208,10 @@ async fn scenario(
         world.channel,
     )
     .await;
+    // A person asks the agent, as a real turn begins. The agent acts for that person.
+    script
+        .ask(&world.owner, &world.relay_url, "please take this card")
+        .await;
     let tools = script.tool_names().await;
     for tool in ["save_artifact", "read_artifact", "update_plan", "log_work"] {
         assert!(tools.iter().any(|name| name == tool), "{tools:?}");

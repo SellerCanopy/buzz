@@ -42,6 +42,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::requester;
 use crate::scope::SessionScope;
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -1286,6 +1287,36 @@ impl AgentPool {
         true
     }
 
+    /// Names the message folded into the running turn in `scope` as who asked, when it
+    /// mentions the agent. The service refuses a requester event once a newer message in its
+    /// thread mentions the agent, so a steer that is not recorded makes every later claim in
+    /// the turn fail. A message that does not mention the agent changes nothing.
+    pub fn record_steered_requester(
+        &self,
+        scope: &SessionScope,
+        agent_pubkey_hex: &str,
+        steered: &[crate::queue::BatchEvent],
+    ) {
+        let Some(event_id) = requester::newest_mention(steered, agent_pubkey_hex) else {
+            return;
+        };
+        let Some(meta) = self
+            .task_map
+            .values()
+            .find(|meta| meta.scope.as_ref() == Some(scope))
+        else {
+            return;
+        };
+        let path = requester::requester_path(agent_pubkey_hex, meta.agent_index, scope);
+        if let Err(error) = requester::record_requester(&path, &event_id) {
+            tracing::warn!(
+                target: "pool::session",
+                "could not record who asked in {}: {error}",
+                path.display()
+            );
+        }
+    }
+
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
         self.result_tx.clone()
     }
@@ -1622,6 +1653,14 @@ async fn create_session_and_apply_model(
         channel.channel_type,
         ctx.session_title.as_deref(),
     );
+    // The tool servers learn who asked from a file the harness rewrites at each turn start.
+    let mcp_servers = match channel.scope {
+        Some(scope) => requester::with_requester_file(
+            mcp_servers,
+            &requester::requester_path(&ctx.agent_keys.public_key().to_hex(), agent.index, scope),
+        ),
+        None => mcp_servers,
+    };
 
     let resp = agent
         .acp
@@ -2802,6 +2841,21 @@ pub async fn run_prompt_task(
             }
         }
     };
+    // A turn that starts from a new prompt names the message that started it. A message
+    // folded into a running turn never reaches this point, so it cannot change who asked.
+    if let (PromptSource::Channel(scope), Some(batch)) = (&source, &batch) {
+        let agent_hex = ctx.agent_keys.public_key().to_hex();
+        if let Some(event_id) = requester::requester_event(&batch.events, &agent_hex) {
+            let path = requester::requester_path(&agent_hex, agent.index, scope);
+            if let Err(error) = requester::record_requester(&path, &event_id) {
+                tracing::warn!(
+                    target: "pool::session",
+                    "could not record who asked in {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -7423,6 +7477,173 @@ done"#
             !prompt_text(2).contains("<base>\nstanding-once\n</base>"),
             "turn after channel ACP success must omit standing context"
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_records_who_asked_in_the_file_its_tool_servers_were_given() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-requester-capture-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        // Every request is answered with both a session and a stop reason, so one script
+        // serves `session/new` and `session/prompt`.
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"sessionId\":\"live\",\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn requester ACP script");
+        let mut agent = OwnedAgent {
+            index: 3,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        let channel_id = Uuid::new_v4();
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.mcp_servers = vec![McpServer {
+            name: "hive".into(),
+            command: "buzz-hive-mcp".into(),
+            args: vec![],
+            env: vec![],
+        }];
+        let agent_hex = ctx.agent_keys.public_key().to_hex();
+        let ctx = Arc::new(ctx);
+        let path = requester::requester_path(&agent_hex, 3, &conv(channel_id));
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let mut asked = Vec::new();
+        for turn in 1..=2 {
+            let event = EventBuilder::new(Kind::Custom(9), format!("please {turn}"))
+                .tags([Tag::public_key(ctx.agent_keys.public_key())])
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            asked.push(event.id.to_hex());
+            let batch = FlushBatch {
+                channel_id,
+                scope: conv(channel_id),
+                events: vec![crate::queue::BatchEvent {
+                    edit: None,
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            run_prompt_task(
+                agent,
+                Some(batch),
+                None,
+                Arc::clone(&ctx),
+                result_tx.clone(),
+                None,
+                format!("turn-{turn}"),
+                Default::default(),
+            )
+            .await;
+            let result = result_rx.recv().await.expect("prompt result");
+            assert!(
+                matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+                "turn {turn} did not finish"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("the requester file"),
+                asked[turn - 1],
+                "turn {turn}: the file names the message that started the turn"
+            );
+            agent = result.agent;
+        }
+        agent.acp.shutdown().await;
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read captured ACP requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request is JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove ACP capture");
+        let new_session = requests
+            .iter()
+            .find(|r| r["method"] == "session/new")
+            .expect("a session was created");
+        let env = new_session["params"]["mcpServers"][0]["env"]
+            .as_array()
+            .expect("the tool server has an environment");
+        let named = env
+            .iter()
+            .find(|var| var["name"] == requester::REQUESTER_FILE_ENV)
+            .expect("the tool server is told where the requester file is");
+        assert_eq!(named["value"], path.display().to_string());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_message_steered_into_a_running_turn_becomes_who_asked_when_it_mentions_the_agent() {
+        let agent_keys = Keys::generate();
+        let agent_hex = agent_keys.public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let steered = |mentions: bool| {
+            let mut builder = EventBuilder::new(Kind::Custom(9), "and one more thing");
+            if mentions {
+                builder = builder.tag(Tag::public_key(agent_keys.public_key()));
+            }
+            crate::queue::BatchEvent {
+                edit: None,
+                event: builder.sign_with_keys(&Keys::generate()).unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }
+        };
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        pool.task_map.insert(
+            tokio::spawn(async {}).id(),
+            TaskMeta {
+                agent_index: 5,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let path = requester::requester_path(&agent_hex, 5, &scope);
+        requester::record_requester(&path, "first").unwrap();
+
+        // A message that does not ask the agent to act leaves the file as it was.
+        pool.record_steered_requester(&scope, &agent_hex, &[steered(false)]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+
+        let mention = steered(true);
+        pool.record_steered_requester(&scope, &agent_hex, std::slice::from_ref(&mention));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            mention.routing_event_id(),
+            "the steered message is who asked now"
+        );
+
+        // A scope with no turn running has no file to update.
+        let other = conv(Uuid::new_v4());
+        pool.record_steered_requester(&other, &agent_hex, &[steered(true)]);
+        assert!(!requester::requester_path(&agent_hex, 5, &other).exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

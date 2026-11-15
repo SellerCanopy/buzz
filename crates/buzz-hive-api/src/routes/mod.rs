@@ -4,9 +4,12 @@
 //! and generated types carry over. `tests/procedures.rs` checks that every rpc in
 //! `engine.proto` is routed, dropped with a reason, or still pending.
 
+mod access;
+mod activity;
 mod agents;
 mod artifacts;
 mod cards;
+mod inbox;
 pub mod poll;
 mod runs;
 mod settings;
@@ -46,7 +49,11 @@ pub const ROUTES: &[(&str, Level)] = &[
     // Run admits a card or workflow setting. The handler asks for Admin when the scope is
     // the community's own.
     ("SetSetting", Level::Run),
+    ("SetAutoMode", Level::Run),
     ("ListAgents", Level::Read),
+    ("ListAccess", Level::Read),
+    ("ListPeople", Level::Read),
+    ("SetAccessLevel", Level::Admin),
     ("SkipStage", Level::Run),
     ("PauseCard", Level::Run),
     ("ResumeCard", Level::Run),
@@ -63,6 +70,20 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("LogWork", Level::Run),
     ("RecordDecision", Level::Run),
     ("ReadHistory", Level::Read),
+    ("StopRun", Level::Run),
+    ("RetryRun", Level::Run),
+    ("PauseAll", Level::Admin),
+    ("ResetCard", Level::Run),
+    ("Approve", Level::Run),
+    ("SendBack", Level::Run),
+    ("SendMessage", Level::Run),
+    ("AskGate", Level::Run),
+    ("ListInbox", Level::Read),
+    ("AnswerInbox", Level::Run),
+    ("ListActivity", Level::Read),
+    ("GetFullPayload", Level::Read),
+    ("GetUsage", Level::Read),
+    ("ListAutoDecisions", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -149,7 +170,11 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListRuns", runs::list_runs);
     let r = route(r, "GetSettings", settings::get_settings);
     let r = route(r, "SetSetting", settings::set_setting);
+    let r = route(r, "SetAutoMode", settings::set_auto_mode);
     let r = route(r, "ListAgents", agents::list_agents);
+    let r = route(r, "ListAccess", access::list_access);
+    let r = route(r, "ListPeople", access::list_people);
+    let r = route(r, "SetAccessLevel", access::set_access_level);
     let r = route(r, "SkipStage", stages::skip_stage);
     let r = route(r, "PauseCard", stages::pause_card);
     let r = route(r, "ResumeCard", stages::resume_card);
@@ -165,5 +190,19 @@ pub fn router() -> Router<App> {
     let r = route(r, "UpdatePlan", artifacts::update_plan);
     let r = route(r, "LogWork", artifacts::log_work);
     let r = route(r, "RecordDecision", artifacts::record_decision);
-    route(r, "ReadHistory", artifacts::read_history)
+    let r = route(r, "ReadHistory", artifacts::read_history);
+    let r = route(r, "StopRun", runs::stop_run);
+    let r = route(r, "RetryRun", runs::retry_run);
+    let r = route(r, "PauseAll", stages::pause_all);
+    let r = route(r, "ResetCard", stages::reset_card);
+    let r = route(r, "Approve", inbox::approve);
+    let r = route(r, "SendBack", inbox::send_back);
+    let r = route(r, "SendMessage", inbox::send_message);
+    let r = route(r, "AskGate", inbox::ask_gate);
+    let r = route(r, "ListInbox", inbox::list_inbox);
+    let r = route(r, "AnswerInbox", inbox::answer_inbox);
+    let r = route(r, "ListActivity", activity::list_activity);
+    let r = route(r, "GetFullPayload", activity::get_full_payload);
+    let r = route(r, "ListAutoDecisions", activity::list_auto_decisions);
+    route(r, "GetUsage", status::get_usage)
 }

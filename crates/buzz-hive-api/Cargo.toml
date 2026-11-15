@@ -11,6 +11,8 @@ description = "HTTP routes and token auth for the Beehive workflow engine"
 buzz-hive-core = { path = "../buzz-hive-core" }
 buzz-auth = { workspace = true }
 async-trait = "0.1"
+# Already in the build through jsonwebtoken. Derives the claim signing key.
+aws-lc-rs = "1"
 pbjson = "0.9"
 pbjson-types = "0.9"
 prost = "0.14"

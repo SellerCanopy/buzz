@@ -168,10 +168,15 @@ async fn a_result_with_no_route_waits_for_a_person_and_the_card_waits() {
     assert_eq!(run.state, RunState::Waiting);
     assert_eq!(
         kinds(&events),
-        ["result.reported", "run.waiting", "card.state"]
+        [
+            "result.reported",
+            "run.waiting",
+            "inbox.opened",
+            "card.state"
+        ]
     );
-    assert_eq!(events[2].payload["state"], "waiting");
-    assert!(events[2].payload["reason"]
+    assert_eq!(events[3].payload["state"], "waiting");
+    assert!(events[3].payload["reason"]
         .as_str()
         .unwrap()
         .contains("reported failed"));

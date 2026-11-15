@@ -89,6 +89,21 @@ pub struct RunStep {
     /// passes. Empty when it follows the stage's own route.
     #[serde(default)]
     pub then: String,
+    /// Attempts at the stage that failed, so the next one is `attempts + 1`. A retry keeps the
+    /// stage's thread and visit.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Why the latest attempt failed, for the note that tells the agent to try again. Empty
+    /// while no attempt has failed.
+    #[serde(default)]
+    pub failure: String,
+    /// The comments a person sent the card back with from an approval stage, which this stage
+    /// gets with its task. Empty when the card did not come back to it.
+    #[serde(default)]
+    pub sendback: String,
+    /// Answers a person has given the stage's agent while the run waited at the stage.
+    #[serde(default)]
+    pub answers: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

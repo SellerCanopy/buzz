@@ -341,7 +341,12 @@ async fn a_person_skips_a_waiting_stage_and_the_card_moves_on() {
     assert_eq!(run.current_stage.as_deref(), Some("b"));
     assert_eq!(
         kinds(&events),
-        ["card.skipped", "stage.routed", "card.state"]
+        [
+            "inbox.resolved",
+            "card.skipped",
+            "stage.routed",
+            "card.state"
+        ]
     );
     assert!(run.steps[0].skipped);
     assert_eq!(card_state(&f, card).await, CardState::Running);

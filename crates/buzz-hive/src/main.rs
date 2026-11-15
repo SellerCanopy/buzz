@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use buzz_hive::{config, dir_source, drain, relay_adapter};
+use buzz_hive::{config, dir_source, drain, relay_adapter, timers};
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
@@ -139,9 +139,23 @@ async fn run() -> Result<(), String> {
         community,
         hive_pubkey: hive_pubkey.clone(),
         outbox: Arc::new(tokio::sync::Notify::new()),
+        timers: Arc::new(tokio::sync::Notify::new()),
     };
     let bus = app.bus.clone();
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut timer_task = relay_adapter.as_ref().map(|_| {
+        let timers = timers::TimerLoop {
+            store: app.store.clone(),
+            directory: app.directory.clone(),
+            catalog: app.catalog.clone(),
+            bus: app.bus.clone(),
+            community,
+            hive: hive_pubkey.clone(),
+            wake: app.timers.clone(),
+            outbox: app.outbox.clone(),
+        };
+        tokio::spawn(timers.run(stopped.clone()))
+    });
     let mut drain = relay_adapter.map(|relay| {
         let drain = drain::Drain {
             store: app.store.clone(),
@@ -178,6 +192,15 @@ async fn run() -> Result<(), String> {
             .is_err()
         {
             tracing::warn!("the outbox drain did not stop in time; it was cut off");
+            task.abort();
+        }
+    }
+    if let Some(task) = timer_task.as_mut() {
+        if tokio::time::timeout(DRAIN_SHUTDOWN_GRACE, &mut *task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the timer loop did not stop in time; it was cut off");
             task.abort();
         }
     }

@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod claims;
 pub mod cors;
 pub mod error;
 pub mod proto;
@@ -28,6 +29,12 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 /// route and every client read it from here.
 pub const AUTH_TOKEN_PATH: &str = "/auth/token";
 
+/// Where an agent trades a chat event or a run for a requester claim.
+pub const CLAIM_PATH: &str = "/hive/v1/claim";
+
+/// The public key claims are signed with, as a JWK set, for servers that check them.
+pub const JWKS_PATH: &str = "/.well-known/jwks.json";
+
 /// Largest request body any route reads.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -36,6 +43,8 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(AUTH_TOKEN_PATH, post(auth::token))
+        .route(CLAIM_PATH, post(claims::claim))
+        .route(JWKS_PATH, get(claims::jwks))
         .merge(routes::router())
 }
 

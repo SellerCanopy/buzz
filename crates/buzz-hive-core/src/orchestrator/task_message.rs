@@ -78,6 +78,9 @@ pub struct Handoff {
     /// The visit the task opens. The agent passes it back with the stage's id, so a report
     /// for an earlier visit cannot move the card on from this one.
     pub visit: u32,
+    /// The comments a person sent the card back with from an approval stage, empty when the
+    /// card did not come back to this stage.
+    pub sendback: String,
 }
 
 /// The id buzz-app registers Beehive under (`PLUGIN_ID` in `src/features/beehive/routes.ts`).
@@ -170,6 +173,7 @@ fn render_with(
     values.insert("issue.title".into(), card.title.to_owned());
     values.insert("issue.body".into(), description.to_owned());
     values.insert("stage.results".into(), results.join(", "));
+    values.insert("sendback.comments".into(), handoff.sendback.clone());
     for (name, value) in params {
         values.insert(format!("params.{name}"), value.clone());
     }
@@ -199,6 +203,16 @@ fn render_with(
     } else {
         parts.push(body);
         parts.push(card_block);
+    }
+    // The comments reach the agent even when the prompt does not ask for them.
+    let asked = find_vars(&text)
+        .iter()
+        .any(|found| found.name == "sendback.comments");
+    if !asked && !handoff.sendback.is_empty() {
+        parts.push(format!(
+            "A person sent the card back with these comments:\n{}",
+            handoff.sendback
+        ));
     }
     parts.push(handoff.brief.clone());
     parts.push(inputs_section(&handoff.inputs));

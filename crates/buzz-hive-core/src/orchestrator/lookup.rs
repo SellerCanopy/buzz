@@ -10,13 +10,16 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::access::RelayRole;
-use crate::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, StoreError};
+use crate::ports::store::{
+    AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, RelayEvent, StoreError,
+};
 
 /// A [`Directory`] that keeps the answers to the lookups a step repeats.
 pub(super) struct Memo<'a> {
     inner: &'a dyn Directory,
     agents: Mutex<HashMap<String, Vec<AgentInfo>>>,
     members: Mutex<HashMap<(uuid::Uuid, String), bool>>,
+    channels: Mutex<HashMap<uuid::Uuid, bool>>,
 }
 
 impl<'a> Memo<'a> {
@@ -25,6 +28,7 @@ impl<'a> Memo<'a> {
             inner,
             agents: Mutex::default(),
             members: Mutex::default(),
+            channels: Mutex::default(),
         }
     }
 }
@@ -65,12 +69,21 @@ impl Directory for Memo<'_> {
         self.inner.list_agents(community).await
     }
 
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        self.inner.people(community).await
+    }
+
     async fn channel_exists(
         &self,
         community: CommunityId,
         channel: uuid::Uuid,
     ) -> Result<bool, StoreError> {
-        self.inner.channel_exists(community, channel).await
+        if let Some(exists) = self.channels.lock().unwrap().get(&channel) {
+            return Ok(*exists);
+        }
+        let exists = self.inner.channel_exists(community, channel).await?;
+        self.channels.lock().unwrap().insert(channel, exists);
+        Ok(exists)
     }
 
     async fn member_of_channel(
@@ -89,5 +102,25 @@ impl Directory for Memo<'_> {
             .await?;
         self.members.lock().unwrap().insert(key, member);
         Ok(member)
+    }
+
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        self.inner.event_by_id(community, id).await
+    }
+
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .newer_mention(community, event, root, agent)
+            .await
     }
 }

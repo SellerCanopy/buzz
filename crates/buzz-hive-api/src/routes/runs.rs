@@ -1,13 +1,14 @@
 //! Run procedures: start a card's workflow, read one run and list runs.
 
 use buzz_hive_core::domain::run::{Run as DomainRun, RunStep as DomainStep};
-use buzz_hive_core::orchestrator::run::start_run_at;
+use buzz_hive_core::orchestrator::run::{retry_run as retry, start_run_at, stop_run as stop};
 use uuid::Uuid;
 
 use crate::app::App;
 use crate::error::HiveError;
 use crate::proto::{
-    GetRunRequest, ListRunsRequest, ListRunsResponse, Run, RunStep, StartStageRequest,
+    GetRunRequest, ListRunsRequest, ListRunsResponse, RetryRunRequest, Run, RunStep,
+    StartStageRequest, StopRunRequest,
 };
 use crate::routes::poll::timestamp;
 use crate::unary::Ctx;
@@ -21,6 +22,29 @@ pub async fn start_stage(app: App, ctx: Ctx, req: StartStageRequest) -> Result<R
     let stage = (!req.stage_id.is_empty()).then_some(req.stage_id.as_str());
     let parameters = req.parameters.into_iter().collect();
     let (run, events) = start_run_at(&op.env(), &ctx.op(), card, stage, parameters).await?;
+    op.settle(&events);
+    Ok(to_proto(run))
+}
+
+/// Stops a run that has not ended. Its stage's agent is told to stop in the stage's thread.
+pub async fn stop_run(app: App, ctx: Ctx, req: StopRunRequest) -> Result<Run, HiveError> {
+    let id = parse_id(&req.run_id, "run_id")?;
+    let op = app.op(true)?;
+    let (run, events) = stop(&op.env(), &ctx.op(), id).await?;
+    op.settle(&events);
+    Ok(to_proto(run))
+}
+
+/// Starts the next attempt of a run that failed or was stopped, as a new run.
+pub async fn retry_run(app: App, ctx: Ctx, req: RetryRunRequest) -> Result<Run, HiveError> {
+    let id = parse_id(&req.run_id, "run_id")?;
+    if !req.overrides_json.is_empty() {
+        return Err(HiveError::InvalidArgument(
+            "overrides_json is not supported yet: a retry keeps the old run's parameters".into(),
+        ));
+    }
+    let op = app.op(true)?;
+    let (run, events) = retry(&op.env(), &ctx.op(), id).await?;
     op.settle(&events);
     Ok(to_proto(run))
 }
@@ -78,8 +102,8 @@ pub(super) fn to_proto(run: DomainRun) -> Run {
         card_id: run.card_id.to_string(),
         stage_id: run.current_stage.unwrap_or_default(),
         state: run.state.as_str().to_owned(),
-        // Retries arrive with Phase 11; every run is its stage's first attempt until then.
-        attempt: 1,
+        // The attempt the current stage is on: one past the failures it has had.
+        attempt: attempt_of(&run.steps),
         started_at: Some(timestamp(run.started_at)),
         ended_at: run.ended_at.map(timestamp),
         visit: i32::try_from(run.visit).unwrap_or(i32::MAX),
@@ -101,5 +125,12 @@ fn step_to_proto(step: DomainStep) -> RunStep {
         held: step.held,
         skipped: step.skipped,
         resumes: count(step.resumes),
+        failure: step.failure,
     }
+}
+
+/// The attempt the run's current stage is on, from 1.
+fn attempt_of(steps: &[DomainStep]) -> i32 {
+    let failed = steps.last().map_or(0, |step| step.attempts);
+    i32::try_from(failed.saturating_add(1)).unwrap_or(i32::MAX)
 }

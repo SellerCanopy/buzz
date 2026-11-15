@@ -2,15 +2,15 @@
 //! a person skips, holds or resumes a stage.
 
 use buzz_hive_core::orchestrator::run::{
-    move_card as move_to, pause_card as hold, resume_card as release, skip_stage as skip,
-    stage_done as report,
+    move_card as move_to, pause_all as hold_all, pause_card as hold, reset_card as reset,
+    resume_card as release, skip_stage as skip, stage_done as report,
 };
 
 use crate::app::App;
 use crate::error::HiveError;
 use crate::proto::{
-    Card, MoveCardRequest, PauseCardRequest, ResumeCardRequest, Run, SkipStageRequest,
-    StageDoneRequest,
+    Card, MoveCardRequest, PauseAllRequest, PauseAllResponse, PauseCardRequest, ResetCardRequest,
+    ResumeCardRequest, Run, SkipStageRequest, StageDoneRequest,
 };
 use crate::routes::cards::{card_of, to_proto as card_to_proto};
 use crate::routes::runs::{parse_id, to_proto};
@@ -94,4 +94,31 @@ pub async fn resume_card(app: App, ctx: Ctx, req: ResumeCardRequest) -> Result<R
     let (run, events) = release(&op.env(), &ctx.op(), id).await?;
     op.settle(&events);
     Ok(to_proto(run))
+}
+
+/// A person holds every running run. The Admin level is the route's.
+pub async fn pause_all(
+    app: App,
+    ctx: Ctx,
+    _req: PauseAllRequest,
+) -> Result<PauseAllResponse, HiveError> {
+    let op = app.op(false)?;
+    let done = hold_all(&op.env(), &ctx.op()).await?;
+    // The runs already held are held, so their events are published even when the sweep failed.
+    op.settle(&done.events);
+    if let Some(error) = done.failed {
+        return Err(error.into());
+    }
+    Ok(PauseAllResponse {
+        paused: i32::try_from(done.paused).unwrap_or(i32::MAX),
+    })
+}
+
+/// A person stops a card's run and puts the card back to idle.
+pub async fn reset_card(app: App, ctx: Ctx, req: ResetCardRequest) -> Result<Card, HiveError> {
+    let id = parse_id(&req.card_id, "card_id")?;
+    let op = app.op(true)?;
+    let (card, events) = reset(&op.env(), &ctx.op(), id).await?;
+    op.settle(&events);
+    Ok(card_to_proto(card, false))
 }

@@ -5,22 +5,29 @@
 
 mod common;
 
-use buzz_hive_core::access::ActorKind;
+use buzz_hive_core::access::Level;
+use buzz_hive_core::access::{ActorKind, RelayRole};
 use buzz_hive_core::domain::artifact::ArtifactContent;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::EVENT_KINDS;
+use buzz_hive_core::orchestrator::access::set_level;
 use buzz_hive_core::orchestrator::activity::log_work;
 use buzz_hive_core::orchestrator::artifacts::{save_artifact, set_handoff};
 use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
 };
+use buzz_hive_core::orchestrator::inbox::{approve, send_back};
 use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
-use buzz_hive_core::testing::MemStore;
-use common::{ctx_for, person, Fixture, BUILDER, CHANNEL};
+use buzz_hive_core::orchestrator::timers;
+use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::testing::ManualClock;
+use buzz_hive_core::testing::{FakeDirectory, MemStore};
+use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
+use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 9;
+const CURRENT_PHASE: u8 = 14;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -189,15 +196,78 @@ async fn artifact_scenarios(f: &Fixture) {
         .unwrap();
 }
 
+/// Phase 11: a stage times out and is scheduled to run again.
+async fn retry_scenarios(f: &Fixture, clock: &ManualClock) {
+    let ctx = person();
+    set_setting(
+        &f.env(),
+        &ctx,
+        &Scope::User,
+        "execution.retries.max",
+        Some(serde_json::json!(1)),
+    )
+    .await
+    .unwrap();
+    begun(f, "solo").await;
+    clock.advance(Duration::from_secs(31 * 60));
+    for timer in timers::due(&f.store, COMMUNITY, 10).await.unwrap() {
+        timers::fire(&f.env(), COMMUNITY, &timer).await.unwrap();
+    }
+}
+
+/// Phase 12: a plan reaches an approval stage, is sent back once and approved the second time.
+async fn approval_scenarios(f: &Fixture) {
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let card = begun(f, "gated").await;
+    for round in 0..2 {
+        save_artifact(
+            &f.env(),
+            &agent,
+            card,
+            "plan",
+            ArtifactContent::Text(format!("version {round}")),
+        )
+        .await
+        .unwrap();
+        f.report(&agent, card, "passed", "ready").await.unwrap();
+        if round == 0 {
+            send_back(&f.env(), &person(), card, "Add a rollback step.")
+                .await
+                .unwrap();
+        } else {
+            approve(&f.env(), &person(), card, &Default::default())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Phase 14: an admin sets a level.
+async fn access_scenarios(f: &Fixture) {
+    let directory = FakeDirectory::new()
+        .with_role("aa", RelayRole::Owner)
+        .with_role(BUILDER, RelayRole::Member);
+    let env = Env {
+        directory: &directory,
+        ..f.env()
+    };
+    set_level(&env, &person(), BUILDER, Level::Run)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
-    let f = Fixture::new();
+    let (f, clock) = Fixture::timed();
     let store = &f.store;
     card_scenarios(store).await;
     run_scenarios(&f).await;
     report_scenarios(&f).await;
     routing_scenarios(&f).await;
     artifact_scenarios(&f).await;
+    retry_scenarios(&f, &clock).await;
+    approval_scenarios(&f).await;
+    access_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

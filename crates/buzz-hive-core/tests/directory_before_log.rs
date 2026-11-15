@@ -17,7 +17,8 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::store::{
     AccessRepo, AgentInfo, AgentLink, ArtifactsRepo, CardsRepo, CommunityId, Directory, EventsRepo,
-    OutboxRepo, RunsRepo, SettingsRepo, Store, StoreError, Tx, WorkflowsRepo,
+    InboxRepo, OutboxRepo, PersonInfo, RelayEvent, RunsRepo, SettingsRepo, Store, StoreError,
+    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
@@ -96,6 +97,24 @@ impl Tx for SpyTx {
     fn artifacts(&mut self) -> &mut dyn ArtifactsRepo {
         self.inner.artifacts()
     }
+    fn timers(&mut self) -> &mut dyn TimersRepo {
+        self.inner.timers()
+    }
+    fn inbox(&mut self) -> &mut dyn InboxRepo {
+        self.inner.inbox()
+    }
+    fn usage(&mut self) -> &mut dyn UsageRepo {
+        self.inner.usage()
+    }
+    async fn savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.savepoint().await
+    }
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.rollback_savepoint().await
+    }
+    async fn release_savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.release_savepoint().await
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         self.inner.commit().await
     }
@@ -159,6 +178,10 @@ impl Directory for SpyDirectory {
         self.spy.lookup("list_agents");
         self.inner.list_agents(community).await
     }
+    async fn people(&self, community: CommunityId) -> Result<Vec<PersonInfo>, StoreError> {
+        self.spy.lookup("people");
+        self.inner.people(community).await
+    }
     async fn channel_exists(
         &self,
         community: CommunityId,
@@ -178,6 +201,26 @@ impl Directory for SpyDirectory {
             .member_of_channel(community, channel, pubkey)
             .await
     }
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        self.spy.lookup("event_by_id");
+        self.inner.event_by_id(community, id).await
+    }
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        self.spy.lookup("newer_mention");
+        self.inner
+            .newer_mention(community, event, root, agent)
+            .await
+    }
 }
 
 struct World {
@@ -189,7 +232,23 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let f = Fixture::new();
+        Self::of(Fixture::new())
+    }
+
+    /// A world where `reviewer` and `tester` are agents in the update channel too.
+    fn with_relay_agents() -> Self {
+        Self::of(
+            Fixture::new().with_directory(
+                buzz_hive_core::testing::FakeDirectory::new()
+                    .with_named_agent("builder", BUILDER, "aa")
+                    .with_named_agent("reviewer", "b2", "aa")
+                    .with_named_agent("tester", "b3", "aa")
+                    .with_channel(CHANNEL, &[HIVE, BUILDER, "b2", "b3"]),
+            ),
+        )
+    }
+
+    fn of(f: Fixture) -> Self {
         let spy = Arc::new(Spy::default());
         Self {
             store: SpyStore {
@@ -298,4 +357,145 @@ async fn starting_reporting_and_handing_off_ask_the_directory_before_the_first_a
     let run = tx.runs().active_for_card(card.id).await.unwrap().unwrap();
     assert_eq!(run.workflow, "second");
     assert_eq!(run.current_stage.as_deref(), Some("s1"));
+}
+
+/// A card on `gated` at its approval stage, with the plan saved. `auto` puts it in auto mode
+/// first, so the step that opens the gate answers it.
+async fn at_a_gate(w: &World, auto: bool) -> Uuid {
+    at_a_gate_of(w, "gated", auto).await
+}
+
+/// Like [`at_a_gate`], on the workflow `workflow`.
+async fn at_a_gate_of(w: &World, workflow: &str, auto: bool) -> Uuid {
+    use buzz_hive_core::domain::artifact::ArtifactContent;
+    use buzz_hive_core::orchestrator::artifacts::save_artifact;
+
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let (card, _) = create_card(
+        &w.store,
+        &person(),
+        NewCard {
+            title: "Fix login".into(),
+            description: String::new(),
+            workflow: workflow.into(),
+        },
+    )
+    .await
+    .unwrap();
+    if auto {
+        set_setting(
+            &w.env(),
+            &person(),
+            &Scope::Card(card.id),
+            "card.auto_mode",
+            Some(json!(true)),
+        )
+        .await
+        .unwrap();
+    }
+    start_run(&w.env(), &person(), card.id).await.unwrap();
+    save_artifact(
+        &w.env(),
+        &agent,
+        card.id,
+        "plan",
+        ArtifactContent::Text("Step one.".into()),
+    )
+    .await
+    .unwrap();
+    w.spy.reset();
+    stage_done(&w.env(), &agent, card.id, "draft", 1, "passed", "")
+        .await
+        .unwrap();
+    card.id
+}
+
+async fn world_with_channel() -> World {
+    channel_set(World::new()).await
+}
+
+async fn channel_set(w: World) -> World {
+    set_setting(
+        &w.env(),
+        &person(),
+        &Scope::User,
+        "update_channel",
+        Some(json!(CHANNEL.to_string())),
+    )
+    .await
+    .unwrap();
+    w
+}
+
+#[tokio::test]
+async fn a_gate_a_card_in_auto_mode_answers_asks_the_directory_before_the_first_append() {
+    let w = world_with_channel().await;
+    at_a_gate(&w, true).await;
+    w.assert_asked_first("stage_done that opens a gate auto mode approves");
+}
+
+#[tokio::test]
+async fn a_persons_answer_to_a_gate_asks_the_directory_before_the_first_append() {
+    let w = world_with_channel().await;
+    let card = at_a_gate(&w, false).await;
+    w.spy.reset();
+    buzz_hive_core::orchestrator::inbox::approve(
+        &w.env(),
+        &person(),
+        card,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    w.assert_asked_first("approve");
+}
+
+/// Finished cards of `endgate` go on to `relay`, which other agents work.
+async fn hand_gated_on_to_relay(w: &World) {
+    let mut tx = w.store.begin(COMMUNITY).await.unwrap();
+    tx.workflows()
+        .set_options(
+            "endgate",
+            &WorkflowOptions {
+                next_workflow: "relay".into(),
+                ..WorkflowOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+async fn on_the_next_workflow(w: &World, card: Uuid) {
+    let mut tx = w.store.begin(COMMUNITY).await.unwrap();
+    let run = tx.runs().active_for_card(card).await.unwrap().unwrap();
+    assert_eq!(run.workflow, "relay", "the card was handed on");
+}
+
+#[tokio::test]
+async fn an_approval_that_finishes_the_workflow_asks_for_the_next_ones_agents_before_the_first_append(
+) {
+    let w = channel_set(World::with_relay_agents()).await;
+    hand_gated_on_to_relay(&w).await;
+    let card = at_a_gate_of(&w, "endgate", false).await;
+    w.spy.reset();
+    buzz_hive_core::orchestrator::inbox::approve(
+        &w.env(),
+        &person(),
+        card,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    w.assert_asked_first("approve, handing off");
+    on_the_next_workflow(&w, card).await;
+}
+
+#[tokio::test]
+async fn auto_mode_handing_a_card_on_asks_for_the_next_workflows_agents_before_the_first_append() {
+    let w = channel_set(World::with_relay_agents()).await;
+    hand_gated_on_to_relay(&w).await;
+    let card = at_a_gate_of(&w, "endgate", true).await;
+    w.assert_asked_first("stage_done that opens a gate auto mode approves, handing off");
+    on_the_next_workflow(&w, card).await;
 }
