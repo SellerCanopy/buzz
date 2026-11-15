@@ -2186,6 +2186,10 @@ mod postgres_tests {
         // exemption honest.
         let push_gateway_exception = crates_dir.join("buzz-push-gateway/src/postgres.rs");
         let push_gateway_migrations = crates_dir.join("buzz-push-gateway/migrations");
+        // The hive store migrates its own `hive` schema, with its own
+        // `_sqlx_migrations` table and advisory lock. It is exempt from the
+        // relay lock, but must still embed and run its migrator exactly once.
+        let hive_exception = crates_dir.join("buzz-hive-store/src/migrate.rs");
         for entry in
             std::fs::read_dir(&push_gateway_migrations).expect("read push gateway migrations")
         {
@@ -2216,6 +2220,12 @@ mod postgres_tests {
                 );
             } else if *path == push_gateway_exception {
                 continue;
+            } else if *path == hive_exception {
+                assert_eq!(
+                    (macro_hits, run_hits, run_to_hits),
+                    (1, 1, 0),
+                    "the hive store must embed its migrator once and run it once"
+                );
             } else {
                 assert_eq!(
                     (macro_hits, run_hits, run_to_hits),
