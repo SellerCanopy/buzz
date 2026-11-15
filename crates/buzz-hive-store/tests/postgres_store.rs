@@ -266,8 +266,11 @@ async fn events_get_a_seq_on_commit_and_a_rolled_back_append_leaves_none() {
         ["card.created", "card.state"],
         "no rolled-back event and nothing from another community"
     );
+    // Postgres keeps microseconds and a Linux clock reads nanoseconds.
+    let mut as_committed = committed[0].clone();
+    as_committed.at = chrono::SubsecRound::trunc_subsecs(as_committed.at, 6);
     assert_eq!(
-        all[0], committed[0],
+        all[0], as_committed,
         "an event reads back as it was committed apart from `at` precision"
     );
     assert_eq!(
