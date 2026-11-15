@@ -1126,6 +1126,28 @@ impl RunsRepo for PgTx {
         Ok(())
     }
 
+    async fn thread_by_root(&mut self, root: &str) -> Result<Option<StageThread>, StoreError> {
+        let row: Option<(uuid::Uuid, String, i32, String, uuid::Uuid)> = sqlx::query_as(
+            "SELECT card_id, stage, visit, agent_pubkey, channel_id FROM hive.stage_threads \
+             WHERE community_id = $1 AND root_event_id = $2",
+        )
+        .bind(self.community)
+        .bind(root)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(row.map(
+            |(card_id, stage, visit, agent_pubkey, channel_id)| StageThread {
+                card_id,
+                stage,
+                visit: visit as u32,
+                root_event_id: root.to_owned(),
+                agent_pubkey,
+                channel_id,
+            },
+        ))
+    }
+
     async fn thread(
         &mut self,
         card: uuid::Uuid,

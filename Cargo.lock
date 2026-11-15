@@ -1289,8 +1289,11 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "jsonwebtoken",
  "nostr 0.44.7",
  "rand 0.10.1",
+ "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",
@@ -1306,6 +1309,7 @@ name = "buzz-hive-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "buzz-auth",
@@ -1361,6 +1365,7 @@ dependencies = [
  "rmcp 3.9.0",
  "rustls",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

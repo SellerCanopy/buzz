@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::access::RelayRole;
-use crate::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, StoreError};
+use crate::ports::store::{
+    AgentInfo, AgentLink, CommunityId, Directory, PersonInfo, RelayEvent, StoreError,
+};
 
 /// A [`Directory`] that keeps the answers to the lookups a step repeats.
 pub(super) struct Memo<'a> {
@@ -100,5 +102,25 @@ impl Directory for Memo<'_> {
             .await?;
         self.members.lock().unwrap().insert(key, member);
         Ok(member)
+    }
+
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        self.inner.event_by_id(community, id).await
+    }
+
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .newer_mention(community, event, root, agent)
+            .await
     }
 }

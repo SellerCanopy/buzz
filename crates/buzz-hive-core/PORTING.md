@@ -367,8 +367,8 @@ spec's title and are confirmed when that phase starts.
 - Setting: `card.auto_mode` stays a card-scope bool (the key already existed from Phase 6).
   A new `SetAutoMode` rpc (Run) sets it and returns the card. It is the one call an agent has,
   as the `set_auto_mode` tool. `SetSetting` for the same key is guarded in the same way. An
-  agent may turn it on only when the person it acts for is at Run or above. Phase 15 supplies
-  that claim, so until then an agent has no requester and is refused. A person at Run or above,
+  agent may turn it on only when the person it acts for is at Run or above, which the Phase 15
+  requester claim says; an agent with no claim is refused. A person at Run or above,
   and turning it off, are always allowed. `GetCard` reports `auto_mode`.
 - Orchestrator: `orchestrator/auto.rs` runs at the end of every step that opens an item and
   when auto mode is turned on for a card that already waits. It answers each item as the
@@ -424,10 +424,49 @@ spec's title and are confirmed when that phase starts.
   would put it above is `failed_precondition` naming the agent, the cap and the owner. An
   admin may not lower their own level. A pubkey that is not in the community is `not_found`
   and a switched-off agent is `failed_precondition`. An agent holding Admin may set a level
-  only for a requester at Admin, so until Phase 15 supplies the requester an agent is refused.
+  only for a requester at Admin, which the Phase 15 requester claim says; an agent with no claim
+  is refused.
   The `set_access_level` tool is the one call an agent has.
 - Directory: `Directory::people()` reads the relay's members with their display names. As in
   Phase 12 it is asked before the first append of a transaction.
 - `Person.level` is a new field of the proto message, so `WhoAmI` and `ListPeople` carry it.
 - Tests: core `tests/access.rs`, `tests/event_coverage.rs` and `tests/directory_before_log.rs`,
   api `tests/access.rs` and `tests/procedures.rs`, store `tests/postgres_directory.rs`.
+
+## Phase 15 deliverables
+
+- Rule for an agent with no claim: it is held to Read. It can read cards, runs and files and
+  cannot act, so an unattended agent (a heartbeat, a timer, a turn with no message) does
+  nothing that needs Run. A person sends no claim, and a claim header a person sends is
+  ignored. `Ctx.requester` is the claim's person for an agent and `None` for a person, and
+  `allow(actor, requester, needed)` takes the lower of the two.
+- Claim: `POST /hive/v1/claim` takes `{event_id}` or `{run_id}` from an agent's bearer token
+  and returns an EdDSA JWT `{sub, community, agent, via: "chat" | "run:<id>", iat, exp}`,
+  valid 5 minutes, key id `beehive-claims-1`. The person's level is not in the claim: it is
+  read from the directory when the claim is used, so a person who loses access takes the
+  agent's reach with them. A bad claim (forged, expired, for another agent or community) is
+  `unauthenticated`. `GET /.well-known/jwks.json` publishes the public key.
+- Signing key: the Ed25519 seed is HMAC-SHA256 of the token secret and a fixed label, so
+  there is no second secret to store. Rotating `BUZZ_HIVE_TOKEN_SECRET` rotates both.
+- By chat (`event_id`): the message exists and is not deleted, is a chat kind (`MESSAGE_KINDS`),
+  mentions the agent, is at most 2 hours old and has no newer message in its thread that
+  mentions the agent. The person is its author. When the author is the Beehive account the
+  message is a stage task: it is looked up through `stage_threads` (migration 0012 indexes
+  `root_event_id`), the stage must belong to this agent, and the person is the `requester`
+  of the run that is at that stage and visit.
+- By run (`run_id`): the run has not ended, is in a stage, and that stage's thread holds this
+  agent. The person is the run's `requester`.
+- Relay reads per claim: two on `public.events` (the message by id, and the newer-mention
+  check), plus the directory reads Beehive already does per call. `deploy/aws/hive-roles.sql`
+  grants `SELECT` on eight `events` columns only; `content` and `sig` stay unreadable.
+- Harness: `buzz-acp` writes the id of the message that starts each turn to
+  `<temp>/buzz-requester/<agent>/<index>/<channel>[-<root>]` and gives every MCP server
+  `BUZZ_REQUESTER_FILE`. A mid-turn mention (steering) does not rewrite it. A heartbeat turn
+  has no file. `buzz-hive-mcp` reads the file on every call, asks for a claim, holds it for 60
+  seconds per message, and sends it as `x-hive-claim`. A refused claim does not stop the call:
+  it goes unclaimed and a permission refusal says why no person is named.
+- Fanout: a claim is held up to 60 seconds per client, so a reconnecting fleet makes at most
+  one claim request per agent per minute of activity.
+- Tests: api `tests/claims.rs`, `tests/access.rs`, `tests/inbox.rs`; shim `tests/shim.rs`;
+  `buzz-acp` `requester.rs` and a pool test; store `tests/postgres_roles.rs`;
+  `buzz-hive/tests/claim_echo.rs` and `e2e_requester.rs` (needs a local relay).

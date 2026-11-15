@@ -7,17 +7,26 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{post, MethodRouter};
 use axum::Json;
-use buzz_hive_core::access::{allow, Level};
-use buzz_hive_core::ports::store::CommunityId;
+use buzz_hive_core::access::{allow, ActorKind, Level};
+use buzz_hive_core::ports::store::{CommunityId, Pubkey};
 use buzz_hive_core::resolve::Actor;
 
 use crate::app::App;
 use crate::error::HiveError;
 
+/// The `x-hive-claim` header: a signed statement of who an agent acts for.
+pub const CLAIM_HEADER: &str = "x-hive-claim";
+
+/// What an agent may do with no claim: read, never act. A person is never capped this way.
+pub const UNCLAIMED_AGENT_LEVEL: Level = Level::Read;
+
 pub struct Ctx {
     pub actor: Actor,
-    /// The level of the person an agent acts for. `None` until requester claims exist (Phase 15).
+    /// The level of the person an agent acts for, read now. `None` for a person. An agent
+    /// with no claim is held to [`UNCLAIMED_AGENT_LEVEL`].
     pub requester: Option<Level>,
+    /// The person the claim names, `None` for a person and for an agent with no claim.
+    pub requester_pubkey: Option<Pubkey>,
     pub community: CommunityId,
 }
 
@@ -30,6 +39,7 @@ impl Ctx {
                 pubkey: self.actor.pubkey.clone(),
                 kind: self.actor.kind,
             },
+            requester: self.requester_pubkey.clone(),
         }
     }
 }
@@ -64,6 +74,25 @@ where
     F: Fn(App, Ctx, Req) -> Fut,
     Fut: Future<Output = Result<Res, HiveError>>,
 {
+    let actor = caller(&app, &headers).await?;
+    let (requester, requester_pubkey) = requester_of(&app, &actor, &headers).await?;
+    let ctx = Ctx {
+        actor,
+        requester,
+        requester_pubkey,
+        community: app.community,
+    };
+    allow(ctx.actor.level, ctx.requester, needs).map_err(|d| {
+        HiveError::PermissionDenied(format!("needs {:?}, you have {:?}", d.needed, d.effective))
+    })?;
+    let bytes: &[u8] = if body.is_empty() { b"{}" } else { &body };
+    let request: Req = serde_json::from_slice(bytes)
+        .map_err(|e| HiveError::InvalidArgument(format!("invalid request body: {e}")))?;
+    f(app, ctx, request).await.map(Json)
+}
+
+/// The actor behind the request's bearer token, at the level it holds now.
+pub(crate) async fn caller(app: &App, headers: &HeaderMap) -> Result<Actor, HiveError> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -75,17 +104,35 @@ where
             "token is for another community".into(),
         ));
     }
-    let actor = app.resolve(&claims.sub).await?;
-    let ctx = Ctx {
-        actor,
-        requester: None,
-        community: app.community,
+    app.resolve(&claims.sub).await
+}
+
+/// The person the caller acts for and their level. A person acts for themselves. An agent
+/// acts for the person its claim names, at that person's level now, so a person who lost
+/// access takes the agent's reach with them. An agent with no claim is held to
+/// [`UNCLAIMED_AGENT_LEVEL`]. A claim that is forged, expired, for another agent or for
+/// another community is refused outright.
+async fn requester_of(
+    app: &App,
+    actor: &Actor,
+    headers: &HeaderMap,
+) -> Result<(Option<Level>, Option<Pubkey>), HiveError> {
+    if actor.kind != ActorKind::Agent {
+        return Ok((None, None));
+    }
+    let Some(header) = headers.get(CLAIM_HEADER) else {
+        return Ok((Some(UNCLAIMED_AGENT_LEVEL), None));
     };
-    allow(ctx.actor.level, ctx.requester, needs).map_err(|d| {
-        HiveError::PermissionDenied(format!("needs {:?}, you have {:?}", d.needed, d.effective))
-    })?;
-    let bytes: &[u8] = if body.is_empty() { b"{}" } else { &body };
-    let request: Req = serde_json::from_slice(bytes)
-        .map_err(|e| HiveError::InvalidArgument(format!("invalid request body: {e}")))?;
-    f(app, ctx, request).await.map(Json)
+    let claim = app.minter.verify_claim(
+        header
+            .to_str()
+            .map_err(|_| HiveError::Unauthenticated("invalid requester claim".into()))?,
+    )?;
+    if claim.community != app.community || claim.agent != actor.pubkey {
+        return Err(HiveError::Unauthenticated(
+            "requester claim was issued to another agent".into(),
+        ));
+    }
+    let requester = app.resolve(&claim.sub).await?;
+    Ok((Some(requester.level), Some(claim.sub)))
 }

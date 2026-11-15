@@ -49,6 +49,7 @@ pub(super) async fn settle(
             pubkey: env.hive.to_owned(),
             kind: ActorKind::Agent,
         },
+        requester: None,
     };
     let mut answered = false;
     for open in tx.inbox().list(Some(card_id), false).await? {

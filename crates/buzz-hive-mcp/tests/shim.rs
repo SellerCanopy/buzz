@@ -42,6 +42,28 @@ struct Fake {
     reject_bearer: Mutex<Option<String>>,
     /// The id of each trade's event.
     event_ids: Mutex<Vec<String>>,
+    /// The body of each claim request.
+    claim_requests: Mutex<Vec<Value>>,
+    /// When set, a claim request is refused with this message.
+    refuse_claims: Mutex<Option<String>>,
+}
+
+async fn claim(
+    State(fake): State<Arc<Fake>>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    fake.claim_requests.lock().unwrap().push(body);
+    if let Some(message) = fake.refuse_claims.lock().unwrap().clone() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"code": "permission_denied", "message": message})),
+        );
+    }
+    let n = fake.claim_requests.lock().unwrap().len();
+    (
+        StatusCode::OK,
+        Json(json!({"claim": format!("claim{n}"), "expires_at": fake.clock.now() + 300})),
+    )
 }
 
 async fn trade(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -92,7 +114,12 @@ async fn procedure(
         ),
         _ => (
             StatusCode::OK,
-            Json(json!({"method": method, "bearer": bearer, "body": body})),
+            Json(json!({
+                "method": method,
+                "bearer": bearer,
+                "body": body,
+                "claim": headers.get("x-hive-claim").and_then(|v| v.to_str().ok()),
+            })),
         ),
     }
 }
@@ -105,9 +132,12 @@ async fn start(clock: Arc<TestClock>) -> (String, Arc<Fake>) {
         reject_once: AtomicBool::new(false),
         reject_bearer: Mutex::new(None),
         event_ids: Mutex::new(Vec::new()),
+        claim_requests: Mutex::new(Vec::new()),
+        refuse_claims: Mutex::new(None),
     });
     let app = Router::new()
         .route(buzz_hive_api::AUTH_TOKEN_PATH, post(trade))
+        .route(buzz_hive_api::CLAIM_PATH, post(claim))
         .route(&buzz_hive_api::routes::path("{method}"), post(procedure))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -117,13 +147,31 @@ async fn start(clock: Arc<TestClock>) -> (String, Arc<Fake>) {
 }
 
 fn client(url: &str, keys: Keys, clock: Arc<TestClock>) -> HiveClient {
+    client_with_file(url, keys, clock, None)
+}
+
+fn client_with_file(
+    url: &str,
+    keys: Keys,
+    clock: Arc<TestClock>,
+    requester_file: Option<std::path::PathBuf>,
+) -> HiveClient {
     HiveClient::new(
         Config {
             hive_url: url.to_owned(),
             keys,
+            requester_file,
         },
         clock,
     )
+}
+
+/// A requester file holding `event_id`, in a directory of its own.
+fn requester_file(event_id: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("turn");
+    std::fs::write(&file, format!("{event_id}\n")).unwrap();
+    (dir, file)
 }
 
 #[test]
@@ -349,4 +397,154 @@ fn config_reads_the_key_and_finds_beehive() {
     assert!(Config::from_env(env(&[("BUZZ_PRIVATE_KEY", "nope")]))
         .unwrap_err()
         .contains("not a valid key"));
+}
+
+#[tokio::test]
+async fn a_call_with_no_requester_file_and_no_run_carries_no_claim() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let reply = client(&url, Keys::generate(), clock)
+        .call("GetCard", json!({"cardId": "c1"}))
+        .await
+        .unwrap();
+    assert_eq!(reply["claim"], Value::Null);
+    assert!(fake.claim_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_call_carries_a_claim_for_the_message_that_started_the_turn() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock.clone(), Some(file));
+
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(reply["claim"], "claim1");
+    assert_eq!(
+        fake.claim_requests.lock().unwrap().as_slice(),
+        [json!({"event_id": "aa11"})]
+    );
+
+    // A burst of calls shares the claim for sixty seconds.
+    client.call("GetCard", json!({})).await.unwrap();
+    clock.advance(59);
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(reply["claim"], "claim1");
+    assert_eq!(fake.claim_requests.lock().unwrap().len(), 1);
+
+    clock.advance(1);
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(reply["claim"], "claim2");
+    assert_eq!(fake.claim_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_new_turn_asks_for_a_new_claim_at_once() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file.clone()));
+    client.call("GetCard", json!({})).await.unwrap();
+
+    std::fs::write(&file, "bb22").unwrap();
+    let reply = client.call("GetCard", json!({})).await.unwrap();
+    assert_eq!(reply["claim"], "claim2");
+    assert_eq!(
+        fake.claim_requests.lock().unwrap().last().unwrap(),
+        &json!({"event_id": "bb22"})
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_names_a_run_claims_from_the_run_when_there_is_no_turn_file() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let reply = client(&url, Keys::generate(), clock)
+        .call("StageDone", json!({"run_id": "r1"}))
+        .await;
+    // The fake refuses StageDone, but the claim was asked for and sent.
+    assert!(reply.is_err());
+    assert_eq!(
+        fake.claim_requests.lock().unwrap().as_slice(),
+        [json!({"run_id": "r1"})]
+    );
+}
+
+#[tokio::test]
+async fn the_message_wins_over_the_run() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let (_dir, file) = requester_file("aa11");
+    let client = client_with_file(&url, Keys::generate(), clock, Some(file));
+    client
+        .call("GetCard", json!({"run_id": "r1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.claim_requests.lock().unwrap().as_slice(),
+        [json!({"event_id": "aa11"})]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_claim_goes_ahead_unclaimed_and_explains_a_refusal() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    *fake.refuse_claims.lock().unwrap() = Some("the message is too old".into());
+    let (_dir, file) = requester_file("aa11");
+    let hive = Hive::new(Arc::new(client_with_file(
+        &url,
+        Keys::generate(),
+        clock,
+        Some(file),
+    )));
+
+    // A read still goes through, with no claim.
+    let ok = hive
+        .forward("get_card", json!({"cardId": "c"}).as_object().cloned())
+        .await
+        .unwrap();
+    let ok = serde_json::to_value(&ok).unwrap();
+    assert_ne!(ok["isError"], true, "{ok}");
+    let echoed: Value = serde_json::from_str(ok["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(echoed["claim"], Value::Null);
+
+    // A refusal for want of a level says why no person is named.
+    let denied = hive
+        .forward(
+            "stage_done",
+            json!({"cardId": "c", "stage": "build", "visit": 1, "result": "passed"})
+                .as_object()
+                .cloned(),
+        )
+        .await
+        .unwrap();
+    let denied = serde_json::to_value(&denied).unwrap();
+    assert_eq!(denied["isError"], true);
+    assert_eq!(
+        denied["content"][0]["text"],
+        "[permission_denied] needs Run, you have Read. No person is named for this turn: the message is too old"
+    );
+}
+
+#[test]
+fn config_reads_the_requester_file_from_the_environment() {
+    let keys = Keys::generate();
+    let hex = keys.secret_key().to_secret_hex();
+    let with = |file: Option<&'static str>| {
+        let hex = hex.clone();
+        Config::from_env(move |name| match name {
+            "BUZZ_PRIVATE_KEY" => Some(hex.clone()),
+            "BUZZ_HIVE_URL" => Some("http://localhost:3100".into()),
+            "BUZZ_REQUESTER_FILE" => file.map(str::to_owned),
+            _ => None,
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        with(Some("/tmp/turn")).requester_file,
+        Some(std::path::PathBuf::from("/tmp/turn"))
+    );
+    assert_eq!(with(Some("  ")).requester_file, None);
+    assert_eq!(with(None).requester_file, None);
 }

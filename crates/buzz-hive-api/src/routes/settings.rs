@@ -91,8 +91,8 @@ pub async fn set_auto_mode(app: App, ctx: Ctx, req: SetAutoModeRequest) -> Resul
 }
 
 /// A person at Run or above may turn auto mode on. An agent may only when the person it acts
-/// for is at Run or above, which the requester claim says (Phase 15). Until a claim exists an
-/// agent has no requester and is refused: auto mode answers gates with no person in the loop.
+/// for is at Run or above, which the requester claim says. An agent with no claim is refused:
+/// auto mode answers gates with no person in the loop.
 fn may_turn_on_auto_mode(ctx: &Ctx) -> Result<(), HiveError> {
     if ctx.actor.kind != ActorKind::Agent || ctx.requester.is_some_and(|level| level >= Level::Run)
     {

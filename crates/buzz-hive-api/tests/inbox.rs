@@ -10,7 +10,7 @@ use buzz_hive_api::App;
 use buzz_hive_core::access::{ActorKind, Level, RelayRole};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use buzz_hive_core::workflow::source::{MemSource, Source, Sources};
-use common::{app, call, community, AGENT, HIVE, MEMBER, OWNER};
+use common::{app, call, call_for, call_unclaimed, community, AGENT, HIVE, MEMBER, OWNER};
 use serde_json::{json, Value};
 
 const BUILDER: &str = "b1";
@@ -409,8 +409,9 @@ async fn usage_counts_only_what_agents_started_and_has_no_cost_figures() {
 #[tokio::test]
 async fn an_agent_with_no_person_behind_it_cannot_turn_on_auto_mode() {
     let (app, card) = at_the_gate().await;
-    // The agent holds Run, so the route admits it; the rule is about who it acts for.
-    let (status, body) = call(
+    // With no claim the agent reads and does not act, so the route refuses it before the
+    // auto mode rule is reached.
+    let (status, body) = call_unclaimed(
         &app,
         "SetAutoMode",
         BUILDER,
@@ -419,11 +420,21 @@ async fn an_agent_with_no_person_behind_it_cannot_turn_on_auto_mode() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(
-        body["message"].as_str().unwrap().contains("Run or above"),
+        body["message"].as_str().unwrap().contains("needs Run"),
         "{body}"
     );
+    // So is an agent that acts for someone who holds only Read.
+    let (status, body) = call_for(
+        &app,
+        "SetAutoMode",
+        BUILDER,
+        MEMBER,
+        json!({"cardId": card, "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     // The setting is the same switch, so it is refused there as well.
-    let (status, body) = call(
+    let (status, body) = call_unclaimed(
         &app,
         "SetSetting",
         BUILDER,
@@ -436,7 +447,7 @@ async fn an_agent_with_no_person_behind_it_cannot_turn_on_auto_mode() {
     assert_ne!(got["autoMode"], true, "the card stayed out of auto mode");
     assert_eq!(inbox(&app, OWNER, &card, false).await.len(), 1);
 
-    // Turning it off needs no person: nothing is answered without one.
+    // Turning it off needs no person at Run or above in the rule, only the route's Run.
     let (status, body) = call(
         &app,
         "SetAutoMode",

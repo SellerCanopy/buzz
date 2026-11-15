@@ -85,8 +85,8 @@ pub async fn set_access_level(
 }
 
 /// A person at Admin may set levels. An agent may only when the person it acts for is at
-/// Admin, which the requester claim says (Phase 15). Until a claim exists an agent has no
-/// requester and is refused: a level an agent grants outlives the request that asked for it.
+/// Admin, which the requester claim says. An agent with no claim is refused: a level an
+/// agent grants outlives the request that asked for it.
 fn may_set_levels(ctx: &Ctx) -> Result<(), HiveError> {
     if ctx.actor.kind != ActorKind::Agent
         || ctx.requester.is_some_and(|level| level >= Level::Admin)

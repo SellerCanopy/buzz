@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use buzz_hive_api::routes::path;
-use buzz_hive_api::AUTH_TOKEN_PATH;
+use buzz_hive_api::unary::CLAIM_HEADER;
+use buzz_hive_api::{AUTH_TOKEN_PATH, CLAIM_PATH};
 use nostr::nips::nip98::{HttpData, HttpMethod};
 use nostr::{EventBuilder, JsonUtil, Keys, Tag, TagKind, Url};
 use serde_json::Value;
@@ -14,6 +15,10 @@ use tokio::sync::Mutex;
 
 /// A token is traded for a new one this long before it expires.
 pub const RENEW_BEFORE_SECS: i64 = 60;
+/// A requester claim is kept this long for the event or run it was fetched for. A person's
+/// level can change, and a newer mention replaces the last, so a claim is asked for again
+/// soon. Beehive reads the person's level on every call, so a held claim never holds a level.
+pub const CLAIM_CACHE_SECS: i64 = 60;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Seconds since the epoch, injectable so a test can move time.
@@ -36,6 +41,9 @@ pub struct Config {
     /// Where Beehive answers, without a trailing slash.
     pub hive_url: String,
     pub keys: Keys,
+    /// The file the agent harness keeps the id of the message that started the current turn
+    /// in (`BUZZ_REQUESTER_FILE`). Without it, no claim is made from a chat message.
+    pub requester_file: Option<std::path::PathBuf>,
 }
 
 // Not derived: the key must never reach a log line.
@@ -44,6 +52,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("hive_url", &self.hive_url)
             .field("agent", &self.keys.public_key().to_hex())
+            .field("requester_file", &self.requester_file)
             .finish_non_exhaustive()
     }
 }
@@ -69,7 +78,14 @@ impl Config {
                     .ok_or("BUZZ_RELAY_URL must start with ws://, wss://, http:// or https://")?
             }
         };
-        Ok(Self { hive_url, keys })
+        let requester_file = get("BUZZ_REQUESTER_FILE")
+            .filter(|v| !v.trim().is_empty())
+            .map(std::path::PathBuf::from);
+        Ok(Self {
+            hive_url,
+            keys,
+            requester_file,
+        })
     }
 }
 
@@ -113,12 +129,33 @@ struct Token {
     expires_at: i64,
 }
 
+/// A requester claim and what it was fetched for.
+struct HeldClaim {
+    /// `event:<id>` or `run:<id>`.
+    basis: String,
+    value: String,
+    fetched_at: i64,
+    expires_at: i64,
+}
+
+/// What asking for a claim came to.
+enum Claim {
+    /// Send this as `x-hive-claim`.
+    Held(String),
+    /// There was nothing to claim from: no turn started yet, and the call names no run.
+    None,
+    /// Beehive refused the claim, with its reason. The call goes ahead without one.
+    Refused(CallError),
+}
+
 pub struct HiveClient {
     http: reqwest::Client,
     base: String,
     keys: Keys,
+    requester_file: Option<std::path::PathBuf>,
     clock: Arc<dyn Clock>,
     token: Mutex<Option<Token>>,
+    claim: Mutex<Option<HeldClaim>>,
 }
 
 impl HiveClient {
@@ -131,35 +168,119 @@ impl HiveClient {
             http,
             base: config.hive_url,
             keys: config.keys,
+            requester_file: config.requester_file,
             clock,
             token: Mutex::new(None),
+            claim: Mutex::new(None),
         }
     }
 
     /// Calls the route with `arguments` as the request body and returns the reply's JSON.
-    /// A call refused as unauthenticated is tried once more on a new token, in case this one
-    /// was cut short. Several calls refused on the same token share one new one.
+    /// A call refused as unauthenticated is tried once more on a new token and a new claim,
+    /// in case either was cut short. Several calls refused on the same token share one new one.
+    ///
+    /// The call carries a requester claim when the turn that made it has one: the person
+    /// who asked is what limits an agent, so an agent that cannot name one acts at Read.
     pub async fn call(&self, route: &str, arguments: Value) -> Result<Value, CallError> {
         let token = self.token(None).await?;
-        match self.send(route, &arguments, &token).await {
+        let claim = self.requester_claim(&arguments, &token, false).await;
+        let first = self.send(route, &arguments, &token, claim.header()).await;
+        match first {
             Err(error) if error.code == "unauthenticated" => {
                 let renewed = self.token(Some(&token)).await?;
-                self.send(route, &arguments, &renewed).await
+                let claim = self.requester_claim(&arguments, &renewed, true).await;
+                self.send(route, &arguments, &renewed, claim.header())
+                    .await
+                    .map_err(|e| claim.explain(e))
             }
-            other => other,
+            other => other.map_err(|e| claim.explain(e)),
         }
     }
 
-    async fn send(&self, route: &str, arguments: &Value, token: &str) -> Result<Value, CallError> {
-        let response = self
+    async fn send(
+        &self,
+        route: &str,
+        arguments: &Value,
+        token: &str,
+        claim: Option<&str>,
+    ) -> Result<Value, CallError> {
+        let mut request = self
             .http
             .post(format!("{}{}", self.base, path(route)))
-            .bearer_auth(token)
+            .bearer_auth(token);
+        if let Some(claim) = claim {
+            request = request.header(CLAIM_HEADER, claim);
+        }
+        let response = request
             .json(arguments)
             .send()
             .await
             .map_err(|e| self.unreachable(e))?;
         read_reply(response).await
+    }
+
+    /// The claim for this call. The message that started the turn comes first, read from the
+    /// harness's file on every call because a new turn rewrites it. A call that names a run
+    /// of its own falls back to that. A claim is held for [`CLAIM_CACHE_SECS`] per basis, so a
+    /// burst of tool calls makes one request. `fresh` skips the held claim.
+    async fn requester_claim(&self, arguments: &Value, token: &str, fresh: bool) -> Claim {
+        let event = self
+            .requester_file
+            .as_ref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .map(|text| text.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        let run = arguments["run_id"].as_str().filter(|id| !id.is_empty());
+        let (basis, body) = match (event, run) {
+            (Some(id), _) => (format!("event:{id}"), serde_json::json!({ "event_id": id })),
+            (None, Some(id)) => (format!("run:{id}"), serde_json::json!({ "run_id": id })),
+            (None, None) => return Claim::None,
+        };
+        let mut held = self.claim.lock().await;
+        let now = self.clock.now();
+        if let Some(claim) = held.as_ref() {
+            if !fresh
+                && claim.basis == basis
+                && now - claim.fetched_at < CLAIM_CACHE_SECS
+                && claim.expires_at - RENEW_BEFORE_SECS > now
+            {
+                return Claim::Held(claim.value.clone());
+            }
+        }
+        *held = None;
+        let reply = self
+            .http
+            .post(format!("{}{CLAIM_PATH}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| self.unreachable(e));
+        let reply = match reply {
+            Ok(response) => read_reply(response).await,
+            Err(error) => Err(error),
+        };
+        match reply {
+            Ok(reply) => match (reply["claim"].as_str(), reply["expires_at"].as_i64()) {
+                (Some(value), Some(expires_at)) => {
+                    *held = Some(HeldClaim {
+                        basis,
+                        value: value.to_owned(),
+                        fetched_at: now,
+                        expires_at,
+                    });
+                    Claim::Held(value.to_owned())
+                }
+                _ => Claim::Refused(CallError::new(
+                    "internal",
+                    "Beehive's claim reply has no claim or expiry",
+                )),
+            },
+            Err(error) => {
+                tracing::warn!(%error, %basis, "no requester claim");
+                Claim::Refused(error)
+            }
+        }
     }
 
     /// A token that is good for at least [`RENEW_BEFORE_SECS`] more, trading for one when
@@ -224,6 +345,27 @@ impl HiveClient {
             "unavailable",
             format!("could not reach Beehive at {}", self.base),
         )
+    }
+}
+
+impl Claim {
+    fn header(&self) -> Option<&str> {
+        match self {
+            Claim::Held(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// A refusal for want of a level, with why there was no claim, so the agent is told what
+    /// to do and not only that it may not.
+    fn explain(&self, mut error: CallError) -> CallError {
+        if let (Claim::Refused(why), "permission_denied") = (self, error.code.as_str()) {
+            error.message = format!(
+                "{}. No person is named for this turn: {}",
+                error.message, why.message
+            );
+        }
+        error
     }
 }
 

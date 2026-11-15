@@ -17,8 +17,8 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::store::{
     AccessRepo, AgentInfo, AgentLink, ArtifactsRepo, CardsRepo, CommunityId, Directory, EventsRepo,
-    InboxRepo, OutboxRepo, PersonInfo, RunsRepo, SettingsRepo, Store, StoreError, TimersRepo, Tx,
-    UsageRepo, WorkflowsRepo,
+    InboxRepo, OutboxRepo, PersonInfo, RelayEvent, RunsRepo, SettingsRepo, Store, StoreError,
+    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
@@ -199,6 +199,26 @@ impl Directory for SpyDirectory {
         self.spy.lookup("member_of_channel");
         self.inner
             .member_of_channel(community, channel, pubkey)
+            .await
+    }
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        self.spy.lookup("event_by_id");
+        self.inner.event_by_id(community, id).await
+    }
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        self.spy.lookup("newer_mention");
+        self.inner
+            .newer_mention(community, event, root, agent)
             .await
     }
 }

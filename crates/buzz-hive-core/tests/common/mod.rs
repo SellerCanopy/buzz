@@ -14,6 +14,7 @@ pub fn ctx_for(pubkey: &str, kind: ActorKind) -> Ctx {
             pubkey: pubkey.into(),
             kind,
         },
+        requester: None,
     }
 }
 

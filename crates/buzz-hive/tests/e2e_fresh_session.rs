@@ -159,6 +159,10 @@ async fn scenario(
         world.channel,
     )
     .await;
+    // A person asks the agent, as a real turn begins. The agent acts for that person.
+    script
+        .ask(&world.owner, &world.relay_url, "please take this card")
+        .await;
 
     // Stage one opens a thread.
     let (replies, mentions) = script

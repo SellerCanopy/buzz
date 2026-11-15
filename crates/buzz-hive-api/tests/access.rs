@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use buzz_hive_api::App;
 use buzz_hive_core::access::{ActorKind, Level, RelayRole};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
-use common::{app, app_with, call, community, AGENT, MEMBER, OWNER};
+use common::{app, app_with, call, call_for, call_unclaimed, community, AGENT, MEMBER, OWNER};
 use serde_json::json;
 
 async fn who_am_i(app: &App, pubkey: &str) -> String {
@@ -156,7 +156,7 @@ async fn a_malformed_request_is_invalid() {
 }
 
 #[tokio::test]
-async fn an_agent_at_admin_with_no_person_behind_it_cannot_set_a_level() {
+async fn an_agent_at_admin_sets_a_level_only_for_a_person_at_admin() {
     let app = app(MemStore::new()).await;
     // The agent's owner is the relay owner, so Admin is within its cap.
     let mut tx = app.store.begin(community()).await.unwrap();
@@ -166,12 +166,46 @@ async fn an_agent_at_admin_with_no_person_behind_it_cannot_set_a_level() {
         .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(who_am_i(&app, AGENT).await, "admin");
+    let body = json!({"pubkey": MEMBER, "level": "run"});
 
-    let (status, body) = set(&app, AGENT, MEMBER, "run").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // With no person named it reads and does not act.
+    let (status, body_) = call_unclaimed(&app, "SetAccessLevel", AGENT, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body_}");
     assert!(
-        body["message"].as_str().unwrap().contains("at Admin"),
-        "{body}"
+        body_["message"].as_str().unwrap().contains("needs Admin"),
+        "{body_}"
     );
     assert_eq!(who_am_i(&app, MEMBER).await, "read");
+
+    // Acting for a person who holds Read, it is held to Read.
+    let (status, body_) = call_for(&app, "SetAccessLevel", AGENT, MEMBER, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body_}");
+    assert_eq!(who_am_i(&app, MEMBER).await, "read");
+
+    // Acting for an Admin, it may.
+    let (status, body_) = call_for(&app, "SetAccessLevel", AGENT, OWNER, body).await;
+    assert_eq!(status, StatusCode::OK, "{body_}");
+    assert_eq!(who_am_i(&app, MEMBER).await, "run");
+
+    // Once the person it acts for loses Admin, its reach goes with it.
+    assert_eq!(set(&app, OWNER, MEMBER, "admin").await.0, StatusCode::OK);
+    let (status, _) = call_for(
+        &app,
+        "SetAccessLevel",
+        AGENT,
+        MEMBER,
+        json!({"pubkey": MEMBER, "level": "read"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(who_am_i(&app, MEMBER).await, "read");
+    let (status, _) = call_for(
+        &app,
+        "SetAccessLevel",
+        AGENT,
+        MEMBER,
+        json!({"pubkey": MEMBER, "level": "admin"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "MEMBER is at Read now");
 }

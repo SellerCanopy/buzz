@@ -263,6 +263,8 @@ pub trait RunsRepo: Send {
     ) -> Result<Option<StageThread>, StoreError>;
     /// Every thread the card's stages opened, in the order they were recorded.
     async fn threads(&mut self, card: uuid::Uuid) -> Result<Vec<StageThread>, StoreError>;
+    /// The stage thread whose root is the event `root`, whichever card it belongs to.
+    async fn thread_by_root(&mut self, root: &str) -> Result<Option<StageThread>, StoreError>;
 }
 
 /// The timers runs wait on. A timer is a row, written in the transaction that changes the run,
@@ -487,6 +489,66 @@ pub trait Directory: Send + Sync {
         channel: uuid::Uuid,
         pubkey: &str,
     ) -> Result<bool, StoreError>;
+    /// The message with this id (64 hex characters), `None` when the relay has none.
+    async fn event_by_id(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError>;
+    /// Whether a message newer than `event` mentions `agent` in the thread rooted at `root`,
+    /// in the channel of `event`. Messages in the same second are ordered by id.
+    async fn newer_mention(
+        &self,
+        community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError>;
+}
+
+/// The relay's kinds that carry a chat message: a stream message, its v2 form, a forum post
+/// and a forum comment. A reaction or an edit names an agent and a thread without asking it
+/// anything, so only these count as a mention.
+pub const MESSAGE_KINDS: &[i32] = &[9, 40002, 45001, 45003];
+
+/// A message the relay holds, as far as Beehive reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEvent {
+    /// 64 hex characters.
+    pub id: String,
+    pub author: Pubkey,
+    pub kind: i32,
+    pub tags: Vec<Vec<String>>,
+    /// Seconds since the epoch.
+    pub created_at: i64,
+    pub channel_id: Option<uuid::Uuid>,
+    pub deleted: bool,
+}
+
+impl RelayEvent {
+    /// Whether a `p` tag names `pubkey`.
+    pub fn mentions(&self, pubkey: &str) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.first().is_some_and(|k| k == "p") && t.get(1).is_some_and(|v| v == pubkey))
+    }
+
+    /// The id of the thread the message belongs to: the event its `root` marker names, else
+    /// the one its `reply` marker names (a direct reply to the root), else the message itself.
+    pub fn thread_root(&self) -> &str {
+        let marked = |marker: &str| {
+            self.tags
+                .iter()
+                .find(|t| {
+                    t.first().is_some_and(|k| k == "e") && t.get(3).is_some_and(|m| m == marker)
+                })
+                .and_then(|t| t.get(1))
+                .map(String::as_str)
+        };
+        marked("root")
+            .or_else(|| marked("reply"))
+            .unwrap_or(&self.id)
+    }
 }
 
 /// How the relay ties an agent to the person who owns it.

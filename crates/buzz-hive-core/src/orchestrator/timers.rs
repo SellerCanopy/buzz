@@ -49,6 +49,7 @@ pub async fn fire(
             pubkey: env.hive.to_owned(),
             kind: ActorKind::Agent,
         },
+        requester: None,
     };
     let stage = timer.stage.as_str();
     let mut tx = env.store.begin(community).await?;

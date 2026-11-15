@@ -13,8 +13,8 @@ use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
     CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow,
-    PersonInfo, Posting, Pubkey, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
-    StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    PersonInfo, Posting, Pubkey, RelayEvent, RunsRepo, SettingsRepo, StageThread, Store,
+    StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -629,6 +629,15 @@ impl RunsRepo for MemTx {
             .map(|(_, t)| t.clone())
             .collect())
     }
+
+    async fn thread_by_root(&mut self, root: &str) -> Result<Option<StageThread>, StoreError> {
+        Ok(self
+            .work
+            .threads
+            .iter()
+            .find(|(c, t)| *c == self.community && t.root_event_id == root)
+            .map(|(_, t)| t.clone()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1179,6 +1188,7 @@ pub struct FakeDirectory {
     deactivated: Vec<Pubkey>,
     agents: Vec<AgentInfo>,
     channels: HashMap<uuid::Uuid, Vec<Pubkey>>,
+    events: Vec<RelayEvent>,
 }
 
 impl FakeDirectory {
@@ -1216,6 +1226,12 @@ impl FakeDirectory {
             pubkey: pubkey.to_owned(),
             owner: Some(owner.to_owned()),
         });
+        self
+    }
+
+    /// A message the relay holds.
+    pub fn with_event(mut self, event: RelayEvent) -> Self {
+        self.events.push(event);
         self
     }
 
@@ -1300,5 +1316,30 @@ impl Directory for FakeDirectory {
             .channels
             .get(&channel)
             .is_some_and(|members| members.iter().any(|m| m == pubkey)))
+    }
+
+    async fn event_by_id(
+        &self,
+        _community: CommunityId,
+        id: &str,
+    ) -> Result<Option<RelayEvent>, StoreError> {
+        Ok(self.events.iter().find(|e| e.id == id).cloned())
+    }
+
+    async fn newer_mention(
+        &self,
+        _community: CommunityId,
+        event: &RelayEvent,
+        root: &str,
+        agent: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.events.iter().any(|e| {
+            !e.deleted
+                && MESSAGE_KINDS.contains(&e.kind)
+                && e.channel_id == event.channel_id
+                && e.mentions(agent)
+                && e.thread_root() == root
+                && (e.created_at, &e.id) > (event.created_at, &event.id)
+        }))
     }
 }

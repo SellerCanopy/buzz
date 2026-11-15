@@ -233,7 +233,11 @@ async fn set_update_channel(app: &App, world: &World) {
 }
 
 /// Creates a card and starts its run through the shim, as an agent would.
-async fn start_card(script: &mut ScriptAgent) -> String {
+async fn start_card(world: &World, script: &mut ScriptAgent) -> String {
+    // A person asks the agent, as a real turn begins. The agent acts for that person.
+    script
+        .ask(&world.owner, &world.relay_url, "please take this card")
+        .await;
     let (replies, _) = script
         .play(vec![
             Step::Call(
@@ -264,7 +268,7 @@ fn finishes_after_a_kill<'a>(
             world.channel,
         )
         .await;
-        let card = start_card(&mut script).await;
+        let card = start_card(world, &mut script).await;
 
         // Killed with the stage open, possibly before its post went out.
         process.kill().await;
@@ -323,7 +327,7 @@ fn times_out_after_a_kill<'a>(
             world.channel,
         )
         .await;
-        let card = start_card(&mut script).await;
+        let card = start_card(world, &mut script).await;
 
         // The service is down while the stage's three seconds run out.
         process.kill().await;

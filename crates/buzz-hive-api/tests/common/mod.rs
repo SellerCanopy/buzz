@@ -77,18 +77,78 @@ pub fn router(app: &App) -> Router {
     buzz_hive_api::finish(buzz_hive_api::routes(), app.clone())
 }
 
+/// Calls `method` as `pubkey`. An agent acts for `OWNER`, who is Admin, so its own level is
+/// the only limit; use [`call_for`] for another person and [`call_unclaimed`] for none.
 pub async fn call(
     app: &App,
     method: &str,
     pubkey: &str,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
+    let is_agent = app
+        .directory
+        .agent_link(app.community, pubkey)
+        .await
+        .unwrap()
+        .is_some();
+    let requester = is_agent.then_some(OWNER);
+    call_with(app, method, pubkey, requester, body).await
+}
+
+/// Calls `method` as the agent `pubkey` acting for `requester`, through a signed claim.
+pub async fn call_for(
+    app: &App,
+    method: &str,
+    pubkey: &str,
+    requester: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    call_with(app, method, pubkey, Some(requester), body).await
+}
+
+/// Calls `method` as `pubkey` and sends no claim, as an agent with nobody behind it would.
+pub async fn call_unclaimed(
+    app: &App,
+    method: &str,
+    pubkey: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    call_with(app, method, pubkey, None, body).await
+}
+
+async fn call_with(
+    app: &App,
+    method: &str,
+    pubkey: &str,
+    requester: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let claim = requester.map(|sub| {
+        app.minter
+            .sign_claim(sub, app.community, pubkey, "chat")
+            .unwrap()
+            .0
+    });
+    send(app, path(method), pubkey, claim.as_deref(), body).await
+}
+
+/// One POST with a token for `pubkey` and, when given, the `x-hive-claim` header.
+pub async fn send(
+    app: &App,
+    route: String,
+    pubkey: &str,
+    claim: Option<&str>,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let (token, _) = app.minter.mint(pubkey, app.community, None).unwrap();
-    let request = Request::post(path(method))
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(body.to_string()))
+    let mut request = Request::post(route).header("authorization", format!("Bearer {token}"));
+    if let Some(claim) = claim {
+        request = request.header(buzz_hive_api::unary::CLAIM_HEADER, claim);
+    }
+    let response = router(app)
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
         .unwrap();
-    let response = router(app).oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

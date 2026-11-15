@@ -208,6 +208,10 @@ async fn scenario(
         world.channel,
     )
     .await;
+    // A person asks the agent, as a real turn begins. The agent acts for that person.
+    script
+        .ask(&world.owner, &world.relay_url, "please take this card")
+        .await;
     let tools = script.tool_names().await;
     for tool in ["save_artifact", "read_artifact", "update_plan", "log_work"] {
         assert!(tools.iter().any(|name| name == tool), "{tools:?}");

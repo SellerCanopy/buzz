@@ -1,7 +1,7 @@
 //! A card in auto mode passes its approval gate with no person. A scripted agent drafts a plan
-//! and reports `passed`; the agent's own call to `set_auto_mode` is refused because no person
-//! stands behind it; a person turns auto mode on, the gate passes by rule with its reason in
-//! Activity, and the agent receives the next stage's task and finishes the card.
+//! and reports `passed`; its call to `set_auto_mode` is refused while no person stands behind
+//! it; once its owner asks it to, the call succeeds, the gate passes by rule with its reason
+//! in Activity, and the agent receives the next stage's task and finishes the card.
 //!
 //! Needs a local relay and the database it uses:
 //!
@@ -40,7 +40,7 @@ const TITLE: &str = "e2e auto mode";
 
 #[tokio::test]
 #[ignore = "requires local relay"]
-async fn auto_mode_passes_a_gate_with_no_person_and_an_agent_cannot_turn_it_on() {
+async fn auto_mode_passes_a_gate_with_no_person_and_an_agent_turns_it_on_only_for_a_person() {
     let world = World::seed().await;
     let result = std::panic::AssertUnwindSafe(run(&world))
         .catch_unwind()
@@ -156,6 +156,10 @@ async fn scenario(
         world.channel,
     )
     .await;
+    // A person asks the agent, as a real turn begins. The agent acts for that person.
+    script
+        .ask(&world.owner, &world.relay_url, "please take this card")
+        .await;
     let tools = script.tool_names().await;
     assert!(
         tools.iter().any(|name| name == "set_auto_mode"),
@@ -191,7 +195,9 @@ async fn scenario(
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["kind"], "approval", "{items:?}");
 
-    // The agent has Run, yet no person stands behind its call, so it cannot turn auto mode on.
+    // The agent has Run, yet no turn is open for it, so no person stands behind its call and
+    // it acts at Read: it cannot turn auto mode on.
+    script.forget_requester();
     let (replies, _) = script
         .play(vec![Step::Call(
             "set_auto_mode",
@@ -200,8 +206,8 @@ async fn scenario(
         .await;
     assert!(replies[0].is_error, "{replies:?}");
     assert!(
-        replies[0].text.contains("Run or above"),
-        "the refusal says why: {}",
+        replies[0].text.starts_with("[permission_denied] "),
+        "the refusal keeps its code: {}",
         replies[0].text
     );
     assert_eq!(
@@ -210,16 +216,24 @@ async fn scenario(
         "the gate still waits"
     );
 
-    // A person turns it on. The gate passes by rule, and ship's task reaches the agent.
-    let (status, got) = call(
-        app,
-        "SetAutoMode",
-        owner,
-        json!({"cardId": card, "enabled": true}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{got}");
-    assert_eq!(got["autoMode"], true, "{got}");
+    // The owner, who holds Admin, asks the agent to turn it on. The agent acts for the owner
+    // at its own level, Run, which is enough. The gate lists a saved document, so it passes
+    // by rule, and ship's task reaches the agent.
+    script
+        .ask(
+            &world.owner,
+            &world.relay_url,
+            "turn auto mode on for this card",
+        )
+        .await;
+    let (replies, _) = script
+        .play(vec![Step::Call(
+            "set_auto_mode",
+            json!({"cardId": "$card", "enabled": true}),
+        )])
+        .await;
+    assert!(!replies[0].is_error, "{replies:?}");
+    assert_eq!(replies[0].json()["autoMode"], true, "{replies:?}");
     assert!(inbox(app, owner, &card).await.is_empty());
     let (replies, mentions) = script
         .play(vec![

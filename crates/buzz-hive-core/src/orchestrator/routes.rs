@@ -184,7 +184,11 @@ pub(super) async fn begin_run(
         package,
         &facts,
         Input::Start {
-            requester: Some(ctx.actor.pubkey.clone()),
+            requester: Some(
+                ctx.requester
+                    .clone()
+                    .unwrap_or_else(|| ctx.actor.pubkey.clone()),
+            ),
             stage: stage.map(str::to_owned),
             held,
         },

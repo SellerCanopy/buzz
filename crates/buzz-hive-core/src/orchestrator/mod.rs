@@ -20,7 +20,7 @@ pub mod usage;
 pub mod workflows;
 
 use crate::domain::events::Actor;
-use crate::ports::store::{CommunityId, Directory, Store, StoreError};
+use crate::ports::store::{CommunityId, Directory, Pubkey, Store, StoreError};
 use crate::workflow::load::Catalog;
 
 /// Who is acting, and in which community.
@@ -28,6 +28,10 @@ use crate::workflow::load::Catalog;
 pub struct Ctx {
     pub community: CommunityId,
     pub actor: Actor,
+    /// The person an agent acts for, from its requester claim. A run the agent starts keeps
+    /// this pubkey as its requester, so the agents that work it act at that person's level.
+    /// `None` for a person, and for an agent with no claim.
+    pub requester: Option<Pubkey>,
 }
 
 /// What the operations that reach past the store need.
