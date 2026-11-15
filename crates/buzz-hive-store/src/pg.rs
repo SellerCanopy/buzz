@@ -9,11 +9,13 @@ use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
-    StoredPackage, Tx, WorkflowsRepo,
+    OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread, Store,
+    StoreError, StoredPackage, Tx, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
+
+use crate::db_error::store_error;
 
 pub struct PgStore {
     pool: PgPool,
@@ -26,14 +28,10 @@ impl PgStore {
     }
 }
 
-fn unavailable(error: sqlx::Error) -> StoreError {
-    StoreError::Unavailable(error.to_string())
-}
-
 #[async_trait::async_trait]
 impl Store for PgStore {
     async fn begin(&self, community: CommunityId) -> Result<Box<dyn Tx>, StoreError> {
-        let tx = self.pool.begin().await.map_err(unavailable)?;
+        let tx = self.pool.begin().await.map_err(store_error)?;
         Ok(Box::new(PgTx {
             community,
             tx,
@@ -80,7 +78,7 @@ impl Tx for PgTx {
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let PgTx { tx, appended, .. } = *self;
-        tx.commit().await.map_err(unavailable)?;
+        tx.commit().await.map_err(store_error)?;
         Ok(appended)
     }
 }
@@ -107,7 +105,7 @@ impl AccessRepo for PgTx {
         .bind(pubkey)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(|(level, kind)| {
             decode_row(pubkey.to_owned(), level, kind).map(|r| (r.level, r.kind))
         })
@@ -134,7 +132,7 @@ impl AccessRepo for PgTx {
         .bind(by)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -146,7 +144,7 @@ impl AccessRepo for PgTx {
         .bind(self.community)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter()
             .map(|(pubkey, level, kind)| decode_row(pubkey, level, kind))
             .collect()
@@ -171,7 +169,7 @@ impl SettingsRepo for PgTx {
         .bind(key)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)
+        .map_err(store_error)
     }
 
     async fn set(
@@ -193,7 +191,7 @@ impl SettingsRepo for PgTx {
         .bind(value)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -208,7 +206,7 @@ impl SettingsRepo for PgTx {
         .bind(key)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -226,7 +224,7 @@ impl SettingsRepo for PgTx {
         .bind(scope_id)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows.into_iter().collect())
     }
 }
@@ -270,7 +268,7 @@ impl CardsRepo for PgTx {
         .bind(archived)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter().map(decode_card).collect()
     }
 
@@ -281,7 +279,7 @@ impl CardsRepo for PgTx {
                 .bind(id)
                 .fetch_optional(&mut *self.tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(store_error)?;
         row.map(decode_card).transpose()
     }
 
@@ -293,7 +291,7 @@ impl CardsRepo for PgTx {
         .bind(id)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(decode_card).transpose()
     }
 
@@ -314,7 +312,7 @@ impl CardsRepo for PgTx {
         .bind(&card.created_by)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         if inserted.rows_affected() == 0 {
             return Err(StoreError::Conflict(format!("card {} exists", card.id)));
         }
@@ -334,7 +332,7 @@ impl CardsRepo for PgTx {
         .bind(&card.workflow)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         not_found_if_none(updated.rows_affected(), card.id)
     }
 
@@ -349,7 +347,7 @@ impl CardsRepo for PgTx {
         .bind(archived)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         not_found_if_none(updated.rows_affected(), id)
     }
 
@@ -359,7 +357,7 @@ impl CardsRepo for PgTx {
             .bind(id)
             .execute(&mut *self.tx)
             .await
-            .map_err(unavailable)?;
+            .map_err(store_error)?;
         not_found_if_none(deleted.rows_affected(), id)
     }
 }
@@ -408,11 +406,16 @@ impl EventsRepo for PgTx {
         if !self.locked_log {
             // `bigserial` hands out seq before commit, so without this a reader could see
             // seq 6 while seq 5 is still uncommitted and move past it for good. Holding
-            // the lock to commit makes seq order the same as commit order.
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive.events'))")
-                .execute(&mut *self.tx)
-                .await
-                .map_err(unavailable)?;
+            // the lock to commit makes seq order the same as commit order. A reader follows
+            // one community's events, so the lock is per community: another community's
+            // writers do not queue behind this one.
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtext('hive.events'), hashtext($1::text))",
+            )
+            .bind(self.community)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
             self.locked_log = true;
         }
         event.seq = sqlx::query_scalar(
@@ -430,7 +433,7 @@ impl EventsRepo for PgTx {
         .bind(event.at)
         .fetch_one(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         self.appended.push(event);
         Ok(())
     }
@@ -445,7 +448,7 @@ impl EventsRepo for PgTx {
         .bind(limit.max(0))
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter().map(decode_event).collect()
     }
 
@@ -454,7 +457,7 @@ impl EventsRepo for PgTx {
             .bind(self.community)
             .fetch_one(&mut *self.tx)
             .await
-            .map_err(unavailable)
+            .map_err(store_error)
     }
 
     async fn of_card(
@@ -477,7 +480,7 @@ impl EventsRepo for PgTx {
         .bind(limit.max(0))
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter().map(decode_event).collect()
     }
 }
@@ -552,7 +555,7 @@ impl ArtifactsRepo for PgTx {
         .bind(name)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         match existing {
             Some(other) if other != kind.as_str() => {
                 return Err(StoreError::Conflict(format!(
@@ -572,7 +575,7 @@ impl ArtifactsRepo for PgTx {
                 .bind(handoff)
                 .execute(&mut *self.tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(store_error)?;
             }
         }
         let (body, sha256, size, media_type, media_ref) = match &save.content {
@@ -613,7 +616,7 @@ impl ArtifactsRepo for PgTx {
         .bind(&save.created_by)
         .fetch_one(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         decode_version(card, row)
     }
 
@@ -629,7 +632,7 @@ impl ArtifactsRepo for PgTx {
         .bind(card)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter()
             .filter_map(|(name, kind, handoff, latest)| Some((name, kind, handoff, latest?)))
             .map(|(name, kind, handoff, latest)| {
@@ -659,7 +662,7 @@ impl ArtifactsRepo for PgTx {
         .bind(name)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter().map(|r| decode_version(card, r)).collect()
     }
 
@@ -679,7 +682,7 @@ impl ArtifactsRepo for PgTx {
         .bind(version)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(|r| decode_version(card, r)).transpose()
     }
 
@@ -699,7 +702,7 @@ impl ArtifactsRepo for PgTx {
         .bind(handoff)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         if done.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("artifact {name}")));
         }
@@ -722,7 +725,7 @@ impl ArtifactsRepo for PgTx {
         .bind(visit as i32)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)
+        .map_err(store_error)
     }
 }
 
@@ -747,7 +750,7 @@ impl WorkflowsRepo for PgTx {
         .bind(created_by)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         sqlx::query(
             "INSERT INTO hive.workflow_packages (community_id, name, builtin, current_hash) \
              VALUES ($1, $2, $3, $4) \
@@ -760,7 +763,7 @@ impl WorkflowsRepo for PgTx {
         .bind(hash)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -772,7 +775,7 @@ impl WorkflowsRepo for PgTx {
         .bind(self.community)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows
             .into_iter()
             .map(|(name, builtin, current_hash)| StoredPackage {
@@ -797,7 +800,7 @@ impl WorkflowsRepo for PgTx {
         .bind(hash)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)
+        .map_err(store_error)
     }
 
     async fn options(
@@ -809,7 +812,7 @@ impl WorkflowsRepo for PgTx {
         .bind(self.community)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter()
             .map(|(name, value)| {
                 serde_json::from_value(value)
@@ -835,7 +838,7 @@ impl WorkflowsRepo for PgTx {
         .bind(value)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 }
@@ -939,7 +942,7 @@ impl RunsRepo for PgTx {
         .bind(run.ended_at)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         // `ON CONFLICT DO NOTHING` with no target covers the id and the one-active-run index,
         // and leaves the transaction usable, which a raised unique violation would not.
         if inserted.rows_affected() == 0 {
@@ -958,7 +961,7 @@ impl RunsRepo for PgTx {
                 .bind(id)
                 .fetch_optional(&mut *self.tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(store_error)?;
         row.map(decode_run).transpose()
     }
 
@@ -970,7 +973,7 @@ impl RunsRepo for PgTx {
         .bind(id)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(decode_run).transpose()
     }
 
@@ -991,7 +994,7 @@ impl RunsRepo for PgTx {
         .bind(run.ended_at)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         if updated.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("run {}", run.id)));
         }
@@ -1007,7 +1010,7 @@ impl RunsRepo for PgTx {
         .bind(card)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         rows.into_iter().map(decode_run).collect()
     }
 
@@ -1019,7 +1022,7 @@ impl RunsRepo for PgTx {
         .bind(card)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(decode_run).transpose()
     }
 
@@ -1042,7 +1045,7 @@ impl RunsRepo for PgTx {
         .bind(card)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows
             .into_iter()
             .map(|(stage, visit)| (stage, visit.max(0) as u32))
@@ -1065,7 +1068,7 @@ impl RunsRepo for PgTx {
         .bind(thread.channel_id)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -1085,7 +1088,7 @@ impl RunsRepo for PgTx {
         .bind(visit as i32)
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(
             row.map(|(root_event_id, agent_pubkey, channel_id)| StageThread {
                 card_id: card,
@@ -1107,7 +1110,7 @@ impl RunsRepo for PgTx {
         .bind(card)
         .fetch_all(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows
             .into_iter()
             .map(
@@ -1133,13 +1136,14 @@ type OutboxDbRow = (
     Option<chrono::DateTime<chrono::Utc>>,
     i32,
     Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
 );
 
 /// `SELECT` for [`OutboxDbRow`] followed by `$tail`.
 macro_rules! select_outbox {
     ($tail:literal) => {
         concat!(
-            "SELECT id, key, card_id, effect, created_at, done_at, attempts, last_error \
+            "SELECT id, key, card_id, effect, created_at, done_at, attempts, last_error, claimed_at \
              FROM hive.outbox ",
             $tail
         )
@@ -1147,7 +1151,7 @@ macro_rules! select_outbox {
 }
 
 fn decode_outbox(row: OutboxDbRow) -> Result<OutboxRow, StoreError> {
-    let (id, key, card_id, effect, created_at, done_at, attempts, last_error) = row;
+    let (id, key, card_id, effect, created_at, done_at, attempts, last_error, claimed_at) = row;
     let posting: Posting = serde_json::from_value(effect)
         .map_err(|e| StoreError::Conflict(format!("stored post {key}: {e}")))?;
     Ok(OutboxRow {
@@ -1157,6 +1161,7 @@ fn decode_outbox(row: OutboxDbRow) -> Result<OutboxRow, StoreError> {
         posting,
         created_at,
         done_at,
+        claimed_at,
         attempts,
         last_error,
     })
@@ -1182,36 +1187,56 @@ impl OutboxRepo for PgTx {
         .bind(effect)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(inserted.rows_affected() == 1)
     }
 
-    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError> {
-        let row: Option<OutboxDbRow> = sqlx::query_as(select_outbox!(
-            "WHERE community_id = $1 AND done_at IS NULL AND NOT (card_id = ANY($2)) \
-             ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
-        ))
+    async fn claim_next(
+        &mut self,
+        skip_cards: &[uuid::Uuid],
+        lease: std::time::Duration,
+    ) -> Result<Option<OutboxRow>, StoreError> {
+        // Only a card's oldest pending post is offered, so a later post never goes ahead of
+        // one that is in flight or failed. SKIP LOCKED keeps two claimers off the same row.
+        let row: Option<OutboxDbRow> = sqlx::query_as(
+            "UPDATE hive.outbox SET claimed_at = now() WHERE id = ( \
+               SELECT o.id FROM hive.outbox o \
+               WHERE o.community_id = $1 AND o.done_at IS NULL \
+                 AND NOT (o.card_id = ANY($2)) \
+                 AND (o.claimed_at IS NULL OR o.claimed_at < now() - make_interval(secs => $3)) \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM hive.outbox e \
+                   WHERE e.community_id = o.community_id AND e.card_id = o.card_id \
+                     AND e.done_at IS NULL AND e.id < o.id) \
+               ORDER BY o.id LIMIT 1 FOR UPDATE SKIP LOCKED) \
+             RETURNING id, key, card_id, effect, created_at, done_at, attempts, last_error, \
+                       claimed_at",
+        )
         .bind(self.community)
         .bind(skip_cards)
+        .bind(lease.as_secs_f64())
         .fetch_optional(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         row.map(decode_outbox).transpose()
     }
 
     async fn mark_done(&mut self, id: i64) -> Result<(), StoreError> {
-        sqlx::query("UPDATE hive.outbox SET done_at = now() WHERE community_id = $1 AND id = $2")
-            .bind(self.community)
-            .bind(id)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(unavailable)?;
+        sqlx::query(
+            "UPDATE hive.outbox SET done_at = now(), claimed_at = NULL \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
         Ok(())
     }
 
     async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError> {
         sqlx::query(
-            "UPDATE hive.outbox SET attempts = attempts + 1, last_error = $3 \
+            "UPDATE hive.outbox SET attempts = attempts + 1, last_error = $3, claimed_at = NULL \
              WHERE community_id = $1 AND id = $2",
         )
         .bind(self.community)
@@ -1219,7 +1244,7 @@ impl OutboxRepo for PgTx {
         .bind(error)
         .execute(&mut *self.tx)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(())
     }
 
@@ -1229,8 +1254,20 @@ impl OutboxRepo for PgTx {
                 .bind(self.community)
                 .fetch_all(&mut *self.tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(store_error)?;
         rows.into_iter().map(decode_outbox).collect()
+    }
+
+    async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError> {
+        let (pending, failed): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE attempts > 0) FROM hive.outbox \
+             WHERE community_id = $1 AND done_at IS NULL",
+        )
+        .bind(self.community)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(OutboxBacklog { pending, failed })
     }
 
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
@@ -1240,7 +1277,7 @@ impl OutboxRepo for PgTx {
                 .bind(key)
                 .fetch_optional(&mut *self.tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(store_error)?;
         row.map(decode_outbox).transpose()
     }
 }

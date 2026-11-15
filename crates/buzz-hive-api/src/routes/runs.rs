@@ -2,7 +2,6 @@
 
 use buzz_hive_core::domain::run::{Run as DomainRun, RunStep as DomainStep};
 use buzz_hive_core::orchestrator::run::start_run_at;
-use buzz_hive_core::orchestrator::Env;
 use uuid::Uuid;
 
 use crate::app::App;
@@ -18,19 +17,11 @@ use crate::unary::Ctx;
 /// wakes.
 pub async fn start_stage(app: App, ctx: Ctx, req: StartStageRequest) -> Result<Run, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let hive = app.require_hive()?.to_owned();
-    let catalog = app.catalog.load();
-    let env = Env {
-        store: app.store.as_ref(),
-        directory: app.directory.as_ref(),
-        catalog: &catalog,
-        hive: &hive,
-    };
+    let op = app.op(true)?;
     let stage = (!req.stage_id.is_empty()).then_some(req.stage_id.as_str());
     let parameters = req.parameters.into_iter().collect();
-    let (run, events) = start_run_at(&env, &ctx.op(), card, stage, parameters).await?;
-    app.bus.publish(&events);
-    app.outbox.notify_one();
+    let (run, events) = start_run_at(&op.env(), &ctx.op(), card, stage, parameters).await?;
+    op.settle(&events);
     Ok(to_proto(run))
 }
 

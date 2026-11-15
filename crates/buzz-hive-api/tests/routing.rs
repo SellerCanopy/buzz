@@ -104,7 +104,7 @@ async fn a_passed_result_moves_the_card_to_the_next_stage() {
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": card, "result": "passed", "summary": "built"}),
+        json!({"cardId": card, "stage": "build", "visit": 1, "result": "passed", "summary": "built"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{run}");
@@ -123,7 +123,7 @@ async fn a_passed_result_moves_the_card_to_the_next_stage() {
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": card, "result": "passed"}),
+        json!({"cardId": card, "stage": "review", "visit": 1, "result": "passed"}),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -131,12 +131,34 @@ async fn a_passed_result_moves_the_card_to_the_next_stage() {
         &app,
         "StageDone",
         REVIEWER,
-        json!({"cardId": card, "result": "passed"}),
+        json!({"cardId": card, "stage": "review", "visit": 1, "result": "passed"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{run}");
     assert_eq!(run["state"], "ended");
     assert_eq!(state(&app, &card).await, "done");
+}
+
+#[tokio::test]
+async fn an_agent_is_refused_holding_resuming_and_skipping_a_card() {
+    let app = ready().await;
+    let card = card(&app, "two").await;
+    call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+    for method in ["PauseCard", "ResumeCard", "SkipStage"] {
+        for agent in [BUILDER, AGENT] {
+            let (status, body) = call(&app, method, agent, json!({"cardId": card})).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {body}");
+            assert_eq!(body["code"], "permission_denied", "{method}");
+        }
+    }
+    // The card still runs, and no tool offers these calls to an agent.
+    assert_eq!(state(&app, &card).await, "running");
+    for name in ["skip_stage", "pause_card", "resume_card"] {
+        assert!(
+            buzz_hive_api::tools::TOOLS.iter().all(|t| t.name != name),
+            "{name} is still a tool"
+        );
+    }
 }
 
 #[tokio::test]
@@ -152,7 +174,7 @@ async fn a_person_holds_resumes_and_skips() {
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": card, "result": "passed"}),
+        json!({"cardId": card, "stage": "build", "visit": 1, "result": "passed"}),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "a held card takes no report");
@@ -232,7 +254,7 @@ async fn an_agent_may_not_move_a_card_unless_the_workflow_allows_it() {
         &app,
         "MoveCard",
         BUILDER,
-        json!({"cardId": card, "stageId": "review"}),
+        json!({"cardId": card, "stageId": "review", "stage": "build", "visit": 1}),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -240,6 +262,23 @@ async fn an_agent_may_not_move_a_card_unless_the_workflow_allows_it() {
         .as_str()
         .unwrap()
         .contains("agent_moves_cards"));
+}
+
+#[tokio::test]
+async fn a_move_without_its_stage_and_visit_is_refused_before_anything_else() {
+    let app = ready().await;
+    let card = card(&app, "two").await;
+    call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+    for body in [
+        json!({"cardId": card, "stageId": "review"}),
+        json!({"cardId": card, "stageId": "review", "stage": "build"}),
+        json!({"cardId": card, "stageId": "review", "stage": "build", "visit": 0}),
+        json!({"cardId": card, "stageId": "review", "visit": 1}),
+    ] {
+        let (status, got) = call(&app, "MoveCard", BUILDER, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {got}");
+        assert_eq!(got["code"], "invalid_argument");
+    }
 }
 
 #[tokio::test]
@@ -255,7 +294,7 @@ async fn get_card_returns_the_stage_threads_in_visit_order_and_the_stage_it_is_i
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": id, "result": "passed"}),
+        json!({"cardId": id, "stage": "build", "visit": 1, "result": "passed"}),
     )
     .await;
     // The drain records a thread when the relay takes the post. Stage names sort the other

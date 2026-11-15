@@ -7,7 +7,10 @@ use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::run::{Run, RunState, RunStep};
 use buzz_hive_core::ports::store::{CommunityId, Posting, StageThread, Store, StoreError};
 use buzz_hive_store::pg::PgStore;
+use std::time::Duration;
 use uuid::Uuid;
+
+const LEASE: Duration = Duration::from_secs(60);
 
 async fn store(prefix: &str) -> (PgStore, support::Scratch, sqlx::PgPool) {
     let (relay_pool, guard) = support::scratch_relay_db(prefix).await;
@@ -128,6 +131,109 @@ async fn a_run_round_trips_and_a_card_has_one_active_run() {
         .is_empty());
 }
 
+/// An event on `card` of `kind`, with a summary to tell it apart.
+fn event(card: u128, kind: &str, summary: &str) -> buzz_hive_core::domain::events::Event {
+    buzz_hive_core::domain::events::Event::new(
+        kind,
+        Some(Uuid::from_u128(card)),
+        None,
+        buzz_hive_core::domain::events::Actor {
+            pubkey: "aa".into(),
+            kind: buzz_hive_core::access::ActorKind::Person,
+        },
+        serde_json::json!({ "type": "note", "summary": summary, "detail": "" }),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_cards_events_of_one_kind_come_back_in_order_and_only_its_own() {
+    let (store, _guard, _relay) = store("hive_of_card").await;
+    let one = CommunityId::from_u128(1);
+    let two = CommunityId::from_u128(2);
+    let mut tx = store.begin(one).await.unwrap();
+    for n in [1, 2, 3] {
+        tx.cards().insert(&card(n)).await.unwrap();
+    }
+    // Written interleaved, so the order is the log's and not the card's.
+    for (card, kind, summary) in [
+        (1, "activity.added", "first"),
+        (2, "activity.added", "other card"),
+        (1, "run.started", "not a note"),
+        (1, "activity.added", "second"),
+        (1, "activity.added", "third"),
+    ] {
+        tx.events()
+            .append(event(card, kind, summary))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let summaries = |events: &[buzz_hive_core::domain::events::Event]| -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e.payload["summary"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let mut tx = store.begin(one).await.unwrap();
+    let all = tx
+        .events()
+        .of_card(Uuid::from_u128(1), "activity.added", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(summaries(&all), ["first", "second", "third"]);
+    assert!(all.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(all.iter().all(|e| e.card_id == Some(Uuid::from_u128(1))));
+
+    // After a seq, and under a limit, from the oldest.
+    let after = tx
+        .events()
+        .of_card(Uuid::from_u128(1), "activity.added", all[0].seq, 10)
+        .await
+        .unwrap();
+    assert_eq!(summaries(&after), ["second", "third"]);
+    let limited = tx
+        .events()
+        .of_card(Uuid::from_u128(1), "activity.added", 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(summaries(&limited), ["first", "second"]);
+    assert!(tx
+        .events()
+        .of_card(Uuid::from_u128(1), "activity.added", 0, 0)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The other kind, the other card, a card with no events, and another community.
+    let started = tx
+        .events()
+        .of_card(Uuid::from_u128(1), "run.started", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(summaries(&started), ["not a note"]);
+    let other = tx
+        .events()
+        .of_card(Uuid::from_u128(2), "activity.added", 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(summaries(&other), ["other card"]);
+    assert!(tx
+        .events()
+        .of_card(Uuid::from_u128(3), "activity.added", 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let mut tx = store.begin(two).await.unwrap();
+    assert!(tx
+        .events()
+        .of_card(Uuid::from_u128(1), "activity.added", 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn runs_stay_in_their_community() {
@@ -215,11 +321,16 @@ async fn the_outbox_keeps_one_row_per_key_and_drains_in_order() {
 
     // A card in the skip list is passed over.
     let mut tx = store.begin(community).await.unwrap();
-    let head = tx.outbox().next(&[]).await.unwrap().unwrap();
+    let head = tx.outbox().claim_next(&[], LEASE).await.unwrap().unwrap();
     assert_eq!(head.key, "k1");
     drop(tx);
     let mut tx = store.begin(community).await.unwrap();
-    let next = tx.outbox().next(&[one]).await.unwrap().unwrap();
+    let next = tx
+        .outbox()
+        .claim_next(&[one], LEASE)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(next.key, "k2");
     tx.outbox()
         .mark_failed(next.id, "relay down")
@@ -235,7 +346,16 @@ async fn the_outbox_keeps_one_row_per_key_and_drains_in_order() {
     tx.commit().await.unwrap();
 
     let mut tx = store.begin(community).await.unwrap();
-    assert_eq!(tx.outbox().next(&[]).await.unwrap().unwrap().key, "k2");
+    assert_eq!(
+        tx.outbox()
+            .claim_next(&[], LEASE)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        "k2",
+        "a failed post is free to claim again"
+    );
 
     // A row is found by its key whether or not it is done, and only in its community.
     let done = tx.outbox().by_key("k1").await.unwrap().unwrap();
@@ -276,26 +396,126 @@ async fn the_outbox_keeps_one_row_per_key_and_drains_in_order() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn a_second_worker_skips_a_row_the_first_holds() {
+async fn a_second_worker_never_takes_a_later_post_of_a_card_whose_earlier_post_is_in_flight() {
     let (store, _guard, _relay) = store("hive_outbox_lock").await;
     let community = CommunityId::from_u128(1);
     let mut tx = store.begin(community).await.unwrap();
     tx.cards().insert(&card(1)).await.unwrap();
-    tx.outbox()
-        .enqueue("k1", Uuid::from_u128(1), &status("first"))
+    tx.cards().insert(&card(2)).await.unwrap();
+    for (key, owner) in [("k1", 1), ("k2", 1), ("k3", 2)] {
+        tx.outbox()
+            .enqueue(key, Uuid::from_u128(owner), &status(key))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // The first worker claims k1 and ends its transaction, as the drain does before it sends.
+    let mut first = store.begin(community).await.unwrap();
+    assert_eq!(
+        first
+            .outbox()
+            .claim_next(&[], LEASE)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        "k1"
+    );
+    first.commit().await.unwrap();
+
+    // k2 is the same card's next post, so it waits behind k1. Card two is free.
+    let mut second = store.begin(community).await.unwrap();
+    assert_eq!(
+        second
+            .outbox()
+            .claim_next(&[], LEASE)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        "k3"
+    );
+    second.commit().await.unwrap();
+    let mut third = store.begin(community).await.unwrap();
+    assert!(third
+        .outbox()
+        .claim_next(&[], LEASE)
         .await
-        .unwrap();
-    tx.outbox()
-        .enqueue("k2", Uuid::from_u128(1), &status("second"))
-        .await
-        .unwrap();
+        .unwrap()
+        .is_none());
+
+    // Once k1's lease has run out, k1 is offered again, and still k2 is not.
+    assert_eq!(
+        third
+            .outbox()
+            .claim_next(&[], Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        "k1"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_claim_still_uncommitted_is_skipped_not_waited_for() {
+    let (store, _guard, _relay) = store("hive_outbox_uncommitted").await;
+    let community = CommunityId::from_u128(1);
+    let mut tx = store.begin(community).await.unwrap();
+    tx.cards().insert(&card(1)).await.unwrap();
+    for key in ["k1", "k2"] {
+        tx.outbox()
+            .enqueue(key, Uuid::from_u128(1), &status(key))
+            .await
+            .unwrap();
+    }
     tx.commit().await.unwrap();
 
     let mut first = store.begin(community).await.unwrap();
-    assert_eq!(first.outbox().next(&[]).await.unwrap().unwrap().key, "k1");
-    // The first worker holds k1, so the second takes k2 instead of waiting or posting k1 twice.
+    assert_eq!(
+        first
+            .outbox()
+            .claim_next(&[], LEASE)
+            .await
+            .unwrap()
+            .unwrap()
+            .key,
+        "k1"
+    );
+    // The row is locked by the first transaction. The second neither waits for it nor takes k2.
     let mut second = store.begin(community).await.unwrap();
-    assert_eq!(second.outbox().next(&[]).await.unwrap().unwrap().key, "k2");
+    let taken = tokio::time::timeout(
+        Duration::from_secs(5),
+        second.outbox().claim_next(&[], LEASE),
+    )
+    .await
+    .expect("a claim must not wait for another claimer's transaction")
+    .unwrap();
+    assert!(taken.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn one_cards_failure_does_not_block_another() {
+    let (store, _guard, _relay) = store("hive_outbox_two_cards").await;
+    buzz_hive_core::testing::outbox_scenarios::one_cards_failure_does_not_block_another(
+        &store,
+        CommunityId::from_u128(1),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_stopped_drain_sends_nothing() {
+    let (store, _guard, _relay) = store("hive_outbox_stop").await;
+    buzz_hive_core::testing::outbox_scenarios::a_stopped_drain_sends_nothing(
+        &store,
+        CommunityId::from_u128(1),
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -23,7 +23,20 @@ pub struct Config {
     /// `BUZZ_HIVE_RELAY_URL`, the relay's WebSocket address, such as `ws://relay:3000`.
     /// Required with `BUZZ_HIVE_NOSTR_KEY`.
     pub relay_url: Option<String>,
+    /// `BUZZ_HIVE_DB_MAX_CONNECTIONS`, default 10. Connections for Beehive's own tables.
+    pub db_max_connections: u32,
+    /// `BUZZ_HIVE_RELAY_DB_MAX_CONNECTIONS`, default 5. Connections for the read-only
+    /// lookups in the relay's tables. It is a separate pool so a lookup never waits behind
+    /// the transactions that are waiting for it.
+    pub relay_db_max_connections: u32,
+    /// `BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS`, default 10. How long a call waits for a free
+    /// database connection.
+    pub db_acquire_timeout: std::time::Duration,
 }
+
+/// Longest any one statement may run, and the longest a statement waits for a lock.
+pub const DB_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const DB_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
@@ -62,6 +75,15 @@ impl Config {
                 return Err("BUZZ_HIVE_RELAY_URL must start with ws:// or wss://".into());
             }
         }
+        let count = |name: &str, default: u64, max: u64| -> Result<u64, String> {
+            let Some(value) = optional(name) else {
+                return Ok(default);
+            };
+            match value.parse::<u64>() {
+                Ok(n) if (1..=max).contains(&n) => Ok(n),
+                _ => Err(format!("{name} must be a whole number from 1 to {max}")),
+            }
+        };
         Ok(Self {
             database_url: required("BUZZ_HIVE_DATABASE_URL")?,
             listen,
@@ -76,6 +98,13 @@ impl Config {
                 .map(Into::into),
             nostr_key,
             relay_url,
+            db_max_connections: count("BUZZ_HIVE_DB_MAX_CONNECTIONS", 10, 200)? as u32,
+            relay_db_max_connections: count("BUZZ_HIVE_RELAY_DB_MAX_CONNECTIONS", 5, 200)? as u32,
+            db_acquire_timeout: std::time::Duration::from_secs(count(
+                "BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS",
+                10,
+                300,
+            )?),
         })
     }
 }
@@ -187,6 +216,37 @@ mod tests {
         pairs.push(("BUZZ_HIVE_WORKFLOWS_DIR", "/srv/workflows"));
         let config = Config::from_lookup(env(&pairs)).unwrap();
         assert_eq!(config.workflows_dir, Some("/srv/workflows".into()));
+    }
+
+    #[test]
+    fn the_pools_have_defaults_and_can_be_sized() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert_eq!(config.db_max_connections, 10);
+        assert_eq!(config.relay_db_max_connections, 5);
+        assert_eq!(config.db_acquire_timeout.as_secs(), 10);
+
+        let mut pairs = FULL.to_vec();
+        pairs.push(("BUZZ_HIVE_DB_MAX_CONNECTIONS", "20"));
+        pairs.push(("BUZZ_HIVE_RELAY_DB_MAX_CONNECTIONS", "8"));
+        pairs.push(("BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS", "3"));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.db_max_connections, 20);
+        assert_eq!(config.relay_db_max_connections, 8);
+        assert_eq!(config.db_acquire_timeout.as_secs(), 3);
+    }
+
+    #[test]
+    fn a_bad_pool_size_names_the_variable() {
+        for (name, bad) in [
+            ("BUZZ_HIVE_DB_MAX_CONNECTIONS", "0"),
+            ("BUZZ_HIVE_RELAY_DB_MAX_CONNECTIONS", "many"),
+            ("BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS", "-1"),
+        ] {
+            let mut pairs = FULL.to_vec();
+            pairs.push((name, bad));
+            let error = Config::from_lookup(env(&pairs)).err().unwrap();
+            assert!(error.contains(name), "{name}: {error}");
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::orchestrator::workflows::record_builtins;
 use buzz_hive_core::workflow::builtin::builtin_source;
 use buzz_hive_core::workflow::source::{CatalogSource, Source, Sources};
+use buzz_hive_store::migrate::PoolConfig;
 use buzz_hive_store::pg::PgStore;
 use buzz_hive_store::relay_read::{verify_relay_columns, RelayRead};
 
@@ -30,17 +31,48 @@ async fn main() {
 async fn run() -> Result<(), String> {
     let config = config::Config::from_env()?;
 
-    let pool = buzz_hive_store::migrate::connect(&config.database_url)
-        .await
-        .map_err(|e| format!("cannot connect to the database: {e}"))?;
-    buzz_hive_store::migrate::migrate(&pool)
+    // Migrations run on their own small pool with no statement timeout, because a migration
+    // may legitimately take long. It is closed before the service pools open.
+    let migrator = buzz_hive_store::migrate::connect_with(
+        &config.database_url,
+        &PoolConfig {
+            max_connections: 2,
+            ..PoolConfig::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("cannot connect to the database: {e}"))?;
+    buzz_hive_store::migrate::migrate(&migrator)
         .await
         .map_err(|e| format!("migration failed: {e}"))?;
-    verify_relay_columns(&pool)
+    migrator.close().await;
+
+    // Two pools. A request holds a connection of the first for its transaction and may then
+    // look something up in the relay's tables. Sharing one pool let ten such requests hold
+    // every connection while each waited for an eleventh.
+    let timeouts = |max_connections| PoolConfig {
+        max_connections,
+        acquire_timeout: config.db_acquire_timeout,
+        statement_timeout: Some(config::DB_STATEMENT_TIMEOUT),
+        lock_timeout: Some(config::DB_LOCK_TIMEOUT),
+    };
+    let pool = buzz_hive_store::migrate::connect_with(
+        &config.database_url,
+        &timeouts(config.db_max_connections),
+    )
+    .await
+    .map_err(|e| format!("cannot connect to the database: {e}"))?;
+    let relay_pool = buzz_hive_store::migrate::connect_with(
+        &config.database_url,
+        &timeouts(config.relay_db_max_connections),
+    )
+    .await
+    .map_err(|e| format!("cannot connect to the database: {e}"))?;
+    verify_relay_columns(&relay_pool)
         .await
         .map_err(|e| e.to_string())?;
 
-    let relay = RelayRead::new(pool.clone());
+    let relay = RelayRead::new(relay_pool);
     let community = relay
         .community_for_host(&config.community_host)
         .await
@@ -101,6 +133,7 @@ async fn run() -> Result<(), String> {
             Arc::new(SystemClock),
         )?),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        auth_limit: buzz_hive_api::rate::auth_limiter(),
         bus: Bus::new(0),
         catalog,
         community,
@@ -109,7 +142,7 @@ async fn run() -> Result<(), String> {
     };
     let bus = app.bus.clone();
     let (stop, stopped) = tokio::sync::watch::channel(false);
-    let drain = relay_adapter.map(|relay| {
+    let mut drain = relay_adapter.map(|relay| {
         let drain = drain::Drain {
             store: app.store.clone(),
             directory: app.directory.clone(),
@@ -121,26 +154,38 @@ async fn run() -> Result<(), String> {
         };
         tokio::spawn(drain.run(stopped))
     });
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(&app), app);
+    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", config.listen))?;
     tracing::info!(listen = %config.listen, %community, account = %hive_pubkey, "buzz-hive started");
-    axum::serve(listener, router)
+    let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown().await;
             // Parked polls would otherwise hold the shutdown for up to 25 seconds.
             bus.close();
         })
         .await
-        .map_err(|e| format!("server error: {e}"))?;
+        .map_err(|e| format!("server error: {e}"));
+    // Stop the drain on every exit, a server error included, then give it a moment to finish
+    // the post it is sending. Its claim on a post it leaves behind runs out by itself, and the
+    // post is sent again as the same relay event.
     let _ = stop.send(true);
-    if let Some(drain) = drain {
-        let _ = drain.await;
+    if let Some(task) = drain.as_mut() {
+        if tokio::time::timeout(DRAIN_SHUTDOWN_GRACE, &mut *task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the outbox drain did not stop in time; it was cut off");
+            task.abort();
+        }
     }
-    Ok(())
+    served
 }
+
+/// How long shutdown waits for the drain to finish the post in flight.
+const DRAIN_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Resolves on SIGTERM or Ctrl-C.
 async fn shutdown() {

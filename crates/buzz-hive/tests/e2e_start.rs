@@ -48,7 +48,7 @@ async fn call(app: &App, method: &str, pubkey: &str, body: Value) -> (StatusCode
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_string()))
         .unwrap();
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(app), app.clone());
+    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -190,6 +190,7 @@ async fn a_started_run_posts_the_status_and_the_task_and_the_relay_returns_both(
             TokenMinter::new(b"0123456789abcdef0123456789abcdef", Arc::new(SystemClock)).unwrap(),
         ),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        auth_limit: buzz_hive_api::rate::auth_limiter(),
         bus: Bus::new(0),
         catalog: Arc::new(Sources(vec![Source::new("e2e", false, files)])),
         community,

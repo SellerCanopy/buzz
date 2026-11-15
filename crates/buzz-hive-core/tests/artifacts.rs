@@ -19,8 +19,7 @@ use buzz_hive_core::orchestrator::artifacts::{
     update_plan,
 };
 use buzz_hive_core::orchestrator::cards::{create_card, NewCard};
-use buzz_hive_core::orchestrator::outbox::drain_outbox;
-use buzz_hive_core::orchestrator::run::{skip_stage, stage_done, start_run};
+use buzz_hive_core::orchestrator::run::{skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::OpError;
 use buzz_hive_core::ports::store::Store;
@@ -56,7 +55,7 @@ async fn started(workflow: &str) -> (Fixture, Uuid) {
     .await
     .unwrap();
     start_run(&f.env(), &person(), card.id).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     (f, card.id)
 }
 
@@ -301,10 +300,10 @@ async fn the_next_task_names_what_stage_one_saved() {
     assert!(draft.contains(&format!("--channel {CHANNEL}")), "{draft}");
     assert!(draft.contains("kind `file`"), "{draft}");
 
-    stage_done(&f.env(), &builder(), card, "passed", "drafted")
+    f.report(&builder(), card, "passed", "drafted")
         .await
         .unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     let review = last_task(&f);
     assert!(review.contains("Input artifacts:"), "{review}");
     assert!(
@@ -321,10 +320,8 @@ async fn the_next_task_names_what_stage_one_saved() {
 
     // Review declares no outputs. The stage after it declares no inputs, so it gets what is
     // handed on: the plan and the logo, not the notes, whose handoff is off.
-    stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.report(&builder(), card, "passed", "").await.unwrap();
+    f.drain().await.unwrap();
     let ship = last_task(&f);
     assert!(ship.contains("- `plan` (text, version 1"), "{ship}");
     assert!(
@@ -339,10 +336,8 @@ async fn a_long_input_is_named_not_written_and_a_missing_one_is_said() {
     let (f, card) = started("docs").await;
     let long = "y".repeat(8 * 1024);
     save(&f, card, "plan", text(&long)).await;
-    stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.report(&builder(), card, "passed", "").await.unwrap();
+    f.drain().await.unwrap();
     let review = last_task(&f);
     assert!(
         review.contains("- `plan` (text, version 1, 8 KiB): too long to write here. Read it with the Beehive tool `read_artifact`."),
@@ -358,7 +353,8 @@ async fn a_long_input_is_named_not_written_and_a_missing_one_is_said() {
 async fn a_required_output_left_out_makes_the_run_wait_and_an_optional_one_does_not() {
     let (f, card) = started("docs").await;
     // plan is required, logo and notes are not.
-    let (run, events) = stage_done(&f.env(), &builder(), card, "passed", "all done")
+    let (run, events) = f
+        .report(&builder(), card, "passed", "all done")
         .await
         .unwrap();
     assert_eq!(run.state, RunState::Waiting);
@@ -378,7 +374,7 @@ async fn a_required_output_left_out_makes_the_run_wait_and_an_optional_one_does_
     );
     assert_eq!(card_state(&f, card).await, CardState::Waiting);
     // No second stage task was queued.
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     assert_eq!(
         f.relay
             .posts()
@@ -397,7 +393,8 @@ async fn a_required_output_left_out_makes_the_run_wait_and_an_optional_one_does_
 #[tokio::test]
 async fn a_result_other_than_passed_does_not_need_the_outputs() {
     let (f, card) = started("docs").await;
-    let (run, events) = stage_done(&f.env(), &builder(), card, "failed", "could not")
+    let (run, events) = f
+        .report(&builder(), card, "failed", "could not")
         .await
         .unwrap();
     assert!(events
@@ -410,9 +407,7 @@ async fn a_result_other_than_passed_does_not_need_the_outputs() {
 async fn a_saved_output_lets_the_stage_pass() {
     let (f, card) = started("docs").await;
     save(&f, card, "plan", text("x")).await;
-    let (run, _) = stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap();
+    let (run, _) = f.report(&builder(), card, "passed", "").await.unwrap();
     assert_eq!(run.current_stage.as_deref(), Some("review"));
     assert_eq!(run_state(&f, card).await, RunState::Running);
 }
@@ -526,7 +521,8 @@ async fn the_plan_is_counted_from_its_latest_version_and_update_plan_ticks_items
 
     // The round that just ended left one item open, so the stage runs another round. When every
     // item is checked, the next passed ends the stage.
-    let (run, _) = stage_done(&f.env(), &builder(), card, "passed", "round 1")
+    let (run, _) = f
+        .report(&builder(), card, "passed", "round 1")
         .await
         .unwrap();
     assert_eq!(run.state, RunState::Running);
@@ -534,7 +530,8 @@ async fn the_plan_is_counted_from_its_latest_version_and_update_plan_ticks_items
     update_plan(&f.env(), &builder(), card, "two", true)
         .await
         .unwrap();
-    let (run, _) = stage_done(&f.env(), &builder(), card, "passed", "round 2")
+    let (run, _) = f
+        .report(&builder(), card, "passed", "round 2")
         .await
         .unwrap();
     assert_eq!(run.state, RunState::Ended, "{run:?}");
@@ -632,6 +629,43 @@ async fn work_and_decisions_become_the_brief_and_the_history() {
         record_decision(&f.env(), &builder(), card, "ok", "", &[], "", 0).await,
         Err(OpError::InvalidArgument(_))
     ));
+    // A rejected option and its reason are capped like the rest of the entry.
+    let rejected = |option: String, reason: String| vec![Rejected { option, reason }];
+    for (option, reason) in [
+        ("x".repeat(121), "fine".to_owned()),
+        ("fine".to_owned(), "x".repeat(301)),
+    ] {
+        assert!(
+            matches!(
+                record_decision(
+                    &f.env(),
+                    &builder(),
+                    card,
+                    "ok",
+                    "why",
+                    &rejected(option, reason),
+                    "",
+                    0
+                )
+                .await,
+                Err(OpError::InvalidArgument(_))
+            ),
+            "an over-long option or reason is refused"
+        );
+    }
+    // Exactly at the limits counts characters, not bytes.
+    record_decision(
+        &f.env(),
+        &builder(),
+        card,
+        "ok",
+        "why",
+        &rejected("é".repeat(120), "é".repeat(300)),
+        "",
+        0,
+    )
+    .await
+    .unwrap();
     // Only the stage's agent logs.
     let other = ctx_for("cc", ActorKind::Agent);
     assert!(matches!(

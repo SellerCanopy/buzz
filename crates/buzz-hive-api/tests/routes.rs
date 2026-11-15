@@ -1,59 +1,26 @@
 //! The procedures served in Phase 3: `GetStatus`, `WhoAmI` and `ListCards`.
 
-use std::sync::Arc;
+mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::routes::{path, ROUTES};
-use buzz_hive_api::token::{SystemClock, TokenMinter};
-use buzz_hive_api::{ApiConfig, App};
+use buzz_hive_api::App;
 use buzz_hive_core::access::RelayRole;
-use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::ports::store::CommunityId;
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
-use buzz_hive_core::workflow::builtin::builtin_source;
-use buzz_hive_core::workflow::source::Sources;
+use common::{app_with, community, router, AGENT, MEMBER, OWNER, STRANGER};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const OWNER: &str = "aa";
-const MEMBER: &str = "bb";
-const STRANGER: &str = "cc";
-const AGENT: &str = "dd";
-
-fn community() -> CommunityId {
-    CommunityId::from_u128(1)
-}
-
+/// Here the agent belongs to `MEMBER`, who can only read, so the agent starts at None.
 fn app(store: MemStore) -> App {
     let directory = FakeDirectory::new()
         .with_role(OWNER, RelayRole::Owner)
         .with_role(MEMBER, RelayRole::Member)
         .with_agent(AGENT, MEMBER);
-    App {
-        config: Arc::new(ApiConfig {
-            public_url: "http://hive.test".into(),
-            allowed_origins: Vec::new(),
-        }),
-        store: Arc::new(store),
-        directory: Arc::new(directory),
-        minter: Arc::new(
-            TokenMinter::new(b"0123456789abcdef0123456789abcdef", Arc::new(SystemClock)).unwrap(),
-        ),
-        replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
-        bus: Bus::new(0),
-        catalog: Arc::new(Sources(vec![builtin_source()])),
-        community: community(),
-        hive_pubkey: "ee".into(),
-        outbox: Arc::new(tokio::sync::Notify::new()),
-    }
-}
-
-fn router(app: &App) -> Router {
-    buzz_hive_api::finish(buzz_hive_api::routes(app), app.clone())
+    app_with(directory, store)
 }
 
 async fn call(

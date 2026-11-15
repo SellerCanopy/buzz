@@ -80,7 +80,7 @@ async fn the_agent_of_the_stage_ends_the_run_and_the_card_is_done() {
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": card, "result": "passed", "summary": "all green"}),
+        json!({"cardId": card, "stage": "only", "visit": 1, "result": "passed", "summary": "all green"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{run}");
@@ -110,7 +110,7 @@ async fn another_agent_with_run_is_refused_with_permission_denied() {
             &app,
             "StageDone",
             who,
-            json!({"cardId": card, "result": "passed"}),
+            json!({"cardId": card, "stage": "only", "visit": 1, "result": "passed"}),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{who}: {body}");
@@ -130,7 +130,7 @@ async fn a_result_the_stage_does_not_have_names_the_ones_it_does() {
         &app,
         "StageDone",
         BUILDER,
-        json!({"cardId": card, "result": "great"}),
+        json!({"cardId": card, "stage": "only", "visit": 1, "result": "great"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -143,10 +143,16 @@ async fn a_result_the_stage_does_not_have_names_the_ones_it_does() {
         "{body}"
     );
     for bad in [
-        json!({"cardId": card}),
-        json!({"cardId": card, "result": ""}),
-        json!({"cardId": "nope", "result": "passed"}),
-        json!({"result": "passed"}),
+        json!({"cardId": card, "stage": "only", "visit": 1}),
+        json!({"cardId": card, "stage": "only", "visit": 1, "result": ""}),
+        json!({"cardId": "nope", "stage": "only", "visit": 1, "result": "passed"}),
+        json!({"stage": "only", "visit": 1, "result": "passed"}),
+        // The stage and the visit are required.
+        json!({"cardId": card, "visit": 1, "result": "passed"}),
+        json!({"cardId": card, "stage": "", "visit": 1, "result": "passed"}),
+        json!({"cardId": card, "stage": "only", "result": "passed"}),
+        json!({"cardId": card, "stage": "only", "visit": 0, "result": "passed"}),
+        json!({"cardId": card, "stage": "only", "visit": -1, "result": "passed"}),
     ] {
         let (status, body) = call(&app, "StageDone", BUILDER, bad.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
@@ -154,9 +160,26 @@ async fn a_result_the_stage_does_not_have_names_the_ones_it_does() {
 }
 
 #[tokio::test]
+async fn a_report_for_another_stage_or_visit_is_refused_and_the_card_keeps_running() {
+    let (app, card) = running().await;
+    for (stage, visit) in [("elsewhere", 1), ("only", 2)] {
+        let (status, body) = call(
+            &app,
+            "StageDone",
+            BUILDER,
+            json!({"cardId": card, "stage": stage, "visit": visit, "result": "passed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stage} {visit}: {body}");
+        assert_eq!(body["code"], "failed_precondition");
+    }
+    assert_eq!(card_state(&app, &card).await, "running");
+}
+
+#[tokio::test]
 async fn a_second_report_after_the_run_ended_is_refused() {
     let (app, card) = running().await;
-    let body = json!({"cardId": card, "result": "passed"});
+    let body = json!({"cardId": card, "stage": "only", "visit": 1, "result": "passed"});
     let (status, _) = call(&app, "StageDone", BUILDER, body.clone()).await;
     assert_eq!(status, StatusCode::OK);
     let (status, refused) = call(&app, "StageDone", BUILDER, body).await;
@@ -172,7 +195,7 @@ async fn a_read_member_cannot_report() {
         &app,
         "StageDone",
         MEMBER,
-        json!({"cardId": card, "result": "passed"}),
+        json!({"cardId": card, "stage": "only", "visit": 1, "result": "passed"}),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");

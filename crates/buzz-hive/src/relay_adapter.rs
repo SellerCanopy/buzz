@@ -7,11 +7,11 @@
 
 use buzz_hive_core::ports::relay::{ChannelId, Delivery, EventId, Relay, RelayError};
 use buzz_hive_core::ports::store::Pubkey;
-use buzz_ws_client::{HeaderMap, WsClientError};
+use buzz_ws_client::{HeaderMap, OkResponse, WsClientError};
 use nostr::{Event, Keys, Timestamp};
 
 /// The relay's limit for a message, in bytes.
-pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
+pub const MAX_CONTENT_BYTES: usize = buzz_hive_core::orchestrator::task_message::MAX_POST_BYTES;
 
 /// Added in place of the text cut off, so a reader sees that the message is not whole.
 pub const TRUNCATED: &str = "\n\n(truncated, see the card)";
@@ -94,12 +94,7 @@ impl RelayAdapter {
         )
         .await
         .map_err(failure)?;
-        // A repeat of an event the relay already holds is the outcome a retry wants.
-        if ok.accepted || ok.message.starts_with("duplicate") {
-            Ok(id)
-        } else {
-            Err(RelayError::Rejected(ok.message))
-        }
+        judge(id, ok)
     }
 }
 
@@ -152,13 +147,34 @@ pub fn fit(text: &str) -> String {
     format!("{}{TRUNCATED}", &text[..end])
 }
 
-/// Whether a failed post is worth trying again unchanged.
+/// What the relay's answer to a post means. A repeat of an event the relay already holds
+/// (`duplicate: already have it`) is the outcome a retry wants, so the post is done. Any other
+/// refusal is final.
+fn judge(id: EventId, ok: OkResponse) -> Result<EventId, RelayError> {
+    if ok.accepted || ok.message.starts_with("duplicate") {
+        Ok(id)
+    } else {
+        Err(RelayError::Rejected(ok.message))
+    }
+}
+
+/// Whether a failed post is worth trying again unchanged. The relay refusing the event or
+/// the account is final: the same post would be refused again. A connection that did not
+/// complete, or an answer that was not understood, may be gone by the next attempt. Each
+/// variant is named, so a new one has to be decided here.
 fn failure(error: WsClientError) -> RelayError {
     match error {
         WsClientError::EventRejected(_)
         | WsClientError::AuthFailed(_)
         | WsClientError::PolicyClose(_) => RelayError::Rejected(error.to_string()),
-        other => RelayError::Unavailable(other.to_string()),
+        WsClientError::WebSocket(_)
+        | WsClientError::Json(_)
+        | WsClientError::EventBuilder(_)
+        | WsClientError::Url(_)
+        | WsClientError::Timeout
+        | WsClientError::ConnectionClosed
+        | WsClientError::UnexpectedMessage(_)
+        | WsClientError::NoAuthChallenge => RelayError::Unavailable(error.to_string()),
     }
 }
 
@@ -307,6 +323,88 @@ mod tests {
         let cut = fit(&wide);
         assert!(cut.len() <= MAX_CONTENT_BYTES);
         assert!(cut.ends_with("(truncated, see the card)"));
+    }
+
+    fn answer(accepted: bool, message: &str) -> OkResponse {
+        OkResponse {
+            event_id: "ab".repeat(32),
+            accepted,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn an_accepted_post_and_a_duplicate_of_one_are_both_done() {
+        let id = "ab".repeat(32);
+        assert_eq!(judge(id.clone(), answer(true, "")).unwrap(), id);
+        // The wording the relay uses for an event it already holds, which a replay after a
+        // crash between the send and the done mark meets.
+        let again = answer(false, "duplicate: already have it");
+        assert_eq!(judge(id.clone(), again).unwrap(), id);
+    }
+
+    #[test]
+    fn any_other_refusal_is_final() {
+        for message in [
+            "blocked: not a member",
+            "invalid: bad signature",
+            "rate-limited: slow down",
+            "",
+            "not a duplicate: duplicate",
+        ] {
+            match judge("ab".repeat(32), answer(false, message)) {
+                Err(RelayError::Rejected(got)) => assert_eq!(got, message),
+                other => panic!("{message:?}: want a final refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_by_the_relay_is_final_and_a_failed_connection_is_tried_again() {
+        let rejected = [
+            WsClientError::EventRejected("blocked".into()),
+            WsClientError::AuthFailed("no".into()),
+            WsClientError::PolicyClose("policy".into()),
+        ];
+        for error in rejected {
+            let text = error.to_string();
+            match failure(error) {
+                RelayError::Rejected(got) => assert_eq!(got, text),
+                other => panic!("{text}: want a final refusal, got {other:?}"),
+            }
+        }
+        let unavailable = [
+            WsClientError::Json(serde_json::from_str::<u8>("x").unwrap_err()),
+            WsClientError::EventBuilder("x".into()),
+            WsClientError::Url("x".into()),
+            WsClientError::Timeout,
+            WsClientError::ConnectionClosed,
+            WsClientError::UnexpectedMessage("x".into()),
+            WsClientError::NoAuthChallenge,
+        ];
+        for error in unavailable {
+            let text = error.to_string();
+            match failure(error) {
+                RelayError::Unavailable(got) => assert_eq!(got, text),
+                other => panic!("{text}: want a retry, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_reached_leaves_the_post_to_be_tried_again() {
+        // A port nothing listens on: the listener is closed before the post is sent.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let adapter = RelayAdapter::new(Keys::generate(), format!("ws://127.0.0.1:{port}"));
+        let event = adapter
+            .build(channel(), "hello", &[], &delivery(1_700_000_000))
+            .unwrap();
+        let error = adapter.publish(event).await.unwrap_err();
+        assert!(matches!(error, RelayError::Unavailable(_)), "{error}");
     }
 
     #[test]

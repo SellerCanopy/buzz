@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use buzz_hive_api::routes::path;
+use buzz_hive_api::AUTH_TOKEN_PATH;
 use nostr::nips::nip98::{HttpData, HttpMethod};
-use nostr::{EventBuilder, JsonUtil, Keys, Url};
+use nostr::{EventBuilder, JsonUtil, Keys, Tag, TagKind, Url};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 /// A token is traded for a new one this long before it expires.
 pub const RENEW_BEFORE_SECS: i64 = 60;
-const ROUTE_PREFIX: &str = "/kiln.engine.v1.EngineService/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Seconds since the epoch, injectable so a test can move time.
@@ -137,27 +138,22 @@ impl HiveClient {
 
     /// Calls the route with `arguments` as the request body and returns the reply's JSON.
     /// A call refused as unauthenticated is tried once more on a new token, in case this one
-    /// was cut short.
+    /// was cut short. Several calls refused on the same token share one new one.
     pub async fn call(&self, route: &str, arguments: Value) -> Result<Value, CallError> {
-        let first = self.call_once(route, &arguments, false).await;
-        match first {
+        let token = self.token(None).await?;
+        match self.send(route, &arguments, &token).await {
             Err(error) if error.code == "unauthenticated" => {
-                self.call_once(route, &arguments, true).await
+                let renewed = self.token(Some(&token)).await?;
+                self.send(route, &arguments, &renewed).await
             }
             other => other,
         }
     }
 
-    async fn call_once(
-        &self,
-        route: &str,
-        arguments: &Value,
-        fresh: bool,
-    ) -> Result<Value, CallError> {
-        let token = self.token(fresh).await?;
+    async fn send(&self, route: &str, arguments: &Value, token: &str) -> Result<Value, CallError> {
         let response = self
             .http
-            .post(format!("{}{ROUTE_PREFIX}{route}", self.base))
+            .post(format!("{}{}", self.base, path(route)))
             .bearer_auth(token)
             .json(arguments)
             .send()
@@ -167,14 +163,16 @@ impl HiveClient {
     }
 
     /// A token that is good for at least [`RENEW_BEFORE_SECS`] more, trading for one when
-    /// there is none or `fresh` is set. One trade runs at a time.
-    async fn token(&self, fresh: bool) -> Result<String, CallError> {
+    /// there is none. `rejected` is a token Beehive just refused: the held token is kept only
+    /// when it is a different one, because another call may already have traded for it. One
+    /// trade runs at a time.
+    async fn token(&self, rejected: Option<&str>) -> Result<String, CallError> {
         let mut held = self.token.lock().await;
-        if !fresh {
-            if let Some(token) = held.as_ref() {
-                if token.expires_at - RENEW_BEFORE_SECS > self.clock.now() {
-                    return Ok(token.value.clone());
-                }
+        if let Some(token) = held.as_ref() {
+            if token.expires_at - RENEW_BEFORE_SECS > self.clock.now()
+                && rejected != Some(token.value.as_str())
+            {
+                return Ok(token.value.clone());
             }
         }
         let traded = self.trade().await?;
@@ -184,10 +182,17 @@ impl HiveClient {
     }
 
     async fn trade(&self) -> Result<Token, CallError> {
-        let url = format!("{}/auth/token", self.base);
+        let url = format!("{}{AUTH_TOKEN_PATH}", self.base);
         let parsed = Url::parse(&url)
             .map_err(|e| CallError::new("invalid_argument", format!("{url} is not a URL: {e}")))?;
+        // Events carry whole seconds, so two trades in one second would be the same event, and
+        // Beehive refuses an event it has seen. The nonce makes each trade its own.
+        let nonce = Tag::custom(
+            TagKind::custom("nonce"),
+            [uuid::Uuid::new_v4().simple().to_string()],
+        );
         let event = EventBuilder::http_auth(HttpData::new(parsed, HttpMethod::POST))
+            .tag(nonce)
             .sign_with_keys(&self.keys)
             .map_err(|e| CallError::new("internal", format!("could not sign the request: {e}")))?;
         let header = format!(

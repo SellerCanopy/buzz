@@ -4,11 +4,11 @@
 use buzz_hive_core::domain::artifact::{
     ArtifactContent, ArtifactInfo as DomainInfo, ArtifactVersion as DomainVersion,
 };
+use buzz_hive_core::orchestrator::activity;
 use buzz_hive_core::orchestrator::artifacts::{
     list_artifacts as list, list_files as files, list_versions as versions, read_artifact as read,
     save_artifact as save, set_handoff as handoff, update_plan as plan,
 };
-use buzz_hive_core::orchestrator::{activity, Env};
 
 use crate::app::App;
 use crate::error::HiveError;
@@ -24,22 +24,6 @@ use crate::routes::cards::to_activity;
 use crate::routes::poll::timestamp;
 use crate::routes::runs::parse_id;
 use crate::unary::Ctx;
-
-/// Runs `$body` with an `Env` named `$env`.
-macro_rules! with_env {
-    ($app:ident, $env:ident, $body:expr) => {{
-        // Nothing here posts, so a service with no relay account still serves these.
-        let hive = $app.hive_pubkey.clone();
-        let catalog = $app.catalog.load();
-        let $env = Env {
-            store: $app.store.as_ref(),
-            directory: $app.directory.as_ref(),
-            catalog: &catalog,
-            hive: &hive,
-        };
-        $body
-    }};
-}
 
 fn info_to_proto(info: DomainInfo) -> ArtifactInfo {
     ArtifactInfo {
@@ -93,7 +77,7 @@ pub async fn list_artifacts(
     req: ListArtifactsRequest,
 ) -> Result<ListArtifactsResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let artifacts = with_env!(app, env, list(&env, &ctx.op(), card).await?);
+    let artifacts = list(&app.op(false)?.env(), &ctx.op(), card).await?;
     Ok(ListArtifactsResponse {
         artifacts: artifacts.into_iter().map(info_to_proto).collect(),
     })
@@ -105,7 +89,7 @@ pub async fn list_artifact_versions(
     req: ListArtifactVersionsRequest,
 ) -> Result<ListArtifactVersionsResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let found = with_env!(app, env, versions(&env, &ctx.op(), card, &req.name).await?);
+    let found = versions(&app.op(false)?.env(), &ctx.op(), card, &req.name).await?;
     Ok(ListArtifactVersionsResponse {
         versions: found
             .into_iter()
@@ -121,11 +105,14 @@ pub async fn read_artifact(
     req: ReadArtifactRequest,
 ) -> Result<ArtifactVersion, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let found = with_env!(
-        app,
-        env,
-        read(&env, &ctx.op(), card, &req.name, req.version).await?
-    );
+    let found = read(
+        &app.op(false)?.env(),
+        &ctx.op(),
+        card,
+        &req.name,
+        req.version,
+    )
+    .await?;
     Ok(version_to_proto(found, true))
 }
 
@@ -135,7 +122,7 @@ pub async fn list_card_files(
     req: ListCardFilesRequest,
 ) -> Result<ListCardFilesResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let found = with_env!(app, env, files(&env, &ctx.op(), card).await?);
+    let found = files(&app.op(false)?.env(), &ctx.op(), card).await?;
     let files = found
         .into_iter()
         .filter_map(|v| {
@@ -170,12 +157,9 @@ pub async fn set_handoff(
     req: SetHandoffRequest,
 ) -> Result<ArtifactInfo, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let (info, events) = with_env!(
-        app,
-        env,
-        handoff(&env, &ctx.op(), card, &req.name, req.handoff).await?
-    );
-    app.bus.publish(&events);
+    let op = app.op(false)?;
+    let (info, events) = handoff(&op.env(), &ctx.op(), card, &req.name, req.handoff).await?;
+    op.settle(&events);
     Ok(info_to_proto(info))
 }
 
@@ -207,12 +191,9 @@ pub async fn save_artifact(
             )))
         }
     };
-    let (version, events) = with_env!(
-        app,
-        env,
-        save(&env, &ctx.op(), card, &req.name, content).await?
-    );
-    app.bus.publish(&events);
+    let op = app.op(false)?;
+    let (version, events) = save(&op.env(), &ctx.op(), card, &req.name, content).await?;
+    op.settle(&events);
     Ok(version_to_proto(version, false))
 }
 
@@ -222,12 +203,9 @@ pub async fn update_plan(
     req: UpdatePlanRequest,
 ) -> Result<UpdatePlanResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let (update, events) = with_env!(
-        app,
-        env,
-        plan(&env, &ctx.op(), card, &req.item, req.done).await?
-    );
-    app.bus.publish(&events);
+    let op = app.op(false)?;
+    let (update, events) = plan(&op.env(), &ctx.op(), card, &req.item, req.done).await?;
+    op.settle(&events);
     Ok(UpdatePlanResponse {
         plan: update.plan,
         checked: i32::try_from(update.checked).unwrap_or(i32::MAX),
@@ -241,20 +219,17 @@ pub async fn log_work(
     req: LogWorkRequest,
 ) -> Result<LogWorkResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let event = with_env!(
-        app,
-        env,
-        activity::log_work(
-            &env,
-            &ctx.op(),
-            card,
-            &req.summary,
-            &req.detail,
-            &req.plan_item
-        )
-        .await?
-    );
-    app.bus.publish(std::slice::from_ref(&event));
+    let op = app.op(false)?;
+    let event = activity::log_work(
+        &op.env(),
+        &ctx.op(),
+        card,
+        &req.summary,
+        &req.detail,
+        &req.plan_item,
+    )
+    .await?;
+    op.settle(std::slice::from_ref(&event));
     Ok(LogWorkResponse {
         entry: Some(to_activity(event)),
     })
@@ -274,22 +249,19 @@ pub async fn record_decision(
             reason: r.reason,
         })
         .collect();
-    let event = with_env!(
-        app,
-        env,
-        activity::record_decision(
-            &env,
-            &ctx.op(),
-            card,
-            &req.summary,
-            &req.why,
-            &rejected,
-            &req.detail,
-            req.supersedes,
-        )
-        .await?
-    );
-    app.bus.publish(std::slice::from_ref(&event));
+    let op = app.op(false)?;
+    let event = activity::record_decision(
+        &op.env(),
+        &ctx.op(),
+        card,
+        &req.summary,
+        &req.why,
+        &rejected,
+        &req.detail,
+        req.supersedes,
+    )
+    .await?;
+    op.settle(std::slice::from_ref(&event));
     Ok(RecordDecisionResponse {
         entry: Some(to_activity(event)),
     })
@@ -301,11 +273,14 @@ pub async fn read_history(
     req: ReadHistoryRequest,
 ) -> Result<ReadHistoryResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let entries = with_env!(
-        app,
-        env,
-        activity::read_history(&env, &ctx.op(), card, req.after_seq, i64::from(req.limit)).await?
-    );
+    let entries = activity::read_history(
+        &app.op(false)?.env(),
+        &ctx.op(),
+        card,
+        req.after_seq,
+        i64::from(req.limit),
+    )
+    .await?;
     Ok(ReadHistoryResponse {
         entries: entries.into_iter().map(to_activity).collect(),
     })
@@ -317,10 +292,6 @@ pub async fn get_brief(
     req: GetBriefRequest,
 ) -> Result<GetBriefResponse, HiveError> {
     let card = parse_id(&req.card_id, "card_id")?;
-    let text = with_env!(
-        app,
-        env,
-        activity::get_brief(&env, &ctx.op(), card, &req.stage_id).await?
-    );
+    let text = activity::get_brief(&app.op(false)?.env(), &ctx.op(), card, &req.stage_id).await?;
     Ok(GetBriefResponse { text })
 }

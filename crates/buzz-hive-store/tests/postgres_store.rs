@@ -286,6 +286,39 @@ async fn events_get_a_seq_on_commit_and_a_rolled_back_append_leaves_none() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn one_communitys_open_append_does_not_block_another_community() {
+    use std::time::Duration;
+
+    let (store, _guard, _relay) = store("hive_store_lock_scope").await;
+    let mut holder = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    holder
+        .events()
+        .append(event("card.created", None))
+        .await
+        .unwrap();
+    // The first community's transaction is still open and holds its log lock.
+    let mut other = store.begin(CommunityId::from_u128(2)).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        other.events().append(event("card.created", None)),
+    )
+    .await
+    .expect("a second community must not wait for the first")
+    .unwrap();
+    other.commit().await.unwrap();
+
+    // The same community still queues, so its seqs stay in commit order.
+    let mut same = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(300),
+        same.events().append(event("card.created", None)),
+    )
+    .await;
+    assert!(blocked.is_err(), "the same community must wait its turn");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn an_unlisted_event_kind_is_refused() {
     let (store, _guard, _relay) = store("hive_store_kind").await;
     let mut tx = store.begin(CommunityId::from_u128(1)).await.unwrap();

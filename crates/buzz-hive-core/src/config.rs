@@ -143,7 +143,6 @@ pub const KEYS: &[Key] = &[
         Default::Bool(false),
     )),
     card(key("card.auto_mode", ValueType::Bool, Default::Bool(false))),
-    card(key("card.loop_limit", ValueType::Count, Default::Count(10))),
     engine(key("default_repo", ValueType::Text, Default::Text(""))),
     engine(key(KEY_UPDATE_CHANNEL, ValueType::Channel, Default::Unset)),
 ];
@@ -809,7 +808,6 @@ mod tests {
             ("execution.retries.max", json!(3), true),
             ("execution.retries.max", json!(-1), false),
             ("execution.retries.max", json!(1.5), false),
-            ("card.loop_limit", json!(10), true),
             ("card.auto_mode", json!(true), true),
             ("card.auto_mode", json!("yes"), false),
             ("side_effects.labels_on_finish", json!([]), true),

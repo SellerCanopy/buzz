@@ -38,6 +38,10 @@ struct Fake {
     /// The pubkey and `u` tag of each trade's event.
     signers: Mutex<Vec<(String, String)>>,
     reject_once: AtomicBool,
+    /// Every ListRuns that carries this bearer is refused as unauthenticated.
+    reject_bearer: Mutex<Option<String>>,
+    /// The id of each trade's event.
+    event_ids: Mutex<Vec<String>>,
 }
 
 async fn trade(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -54,6 +58,7 @@ async fn trade(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> (StatusCode
         .find(|t| t.as_slice().first().map(String::as_str) == Some("u"))
         .and_then(|t| t.as_slice().get(1).cloned())
         .unwrap();
+    fake.event_ids.lock().unwrap().push(event.id.to_hex());
     fake.signers
         .lock()
         .unwrap()
@@ -77,6 +82,10 @@ async fn procedure(
             StatusCode::FORBIDDEN,
             Json(json!({"code": "permission_denied", "message": "needs Run, you have Read"})),
         ),
+        "ListRuns" if fake.reject_bearer.lock().unwrap().as_deref() == Some(bearer.as_str()) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code": "unauthenticated", "message": "token expired"})),
+        ),
         "ListRuns" if fake.reject_once.swap(false, Ordering::SeqCst) => (
             StatusCode::UNAUTHORIZED,
             Json(json!({"code": "unauthenticated", "message": "token expired"})),
@@ -94,10 +103,12 @@ async fn start(clock: Arc<TestClock>) -> (String, Arc<Fake>) {
         trades: AtomicUsize::new(0),
         signers: Mutex::new(Vec::new()),
         reject_once: AtomicBool::new(false),
+        reject_bearer: Mutex::new(None),
+        event_ids: Mutex::new(Vec::new()),
     });
     let app = Router::new()
-        .route("/auth/token", post(trade))
-        .route("/kiln.engine.v1.EngineService/{method}", post(procedure))
+        .route(buzz_hive_api::AUTH_TOKEN_PATH, post(trade))
+        .route(&buzz_hive_api::routes::path("{method}"), post(procedure))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -190,6 +201,43 @@ async fn a_refusal_for_the_token_is_retried_once_on_a_new_one() {
 }
 
 #[tokio::test]
+async fn calls_refused_on_the_same_token_share_one_new_token() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let client = Arc::new(client(&url, Keys::generate(), clock));
+    client.call("GetCard", json!({})).await.unwrap();
+    // Beehive now refuses the held token, `Bearer t1`.
+    *fake.reject_bearer.lock().unwrap() = Some("Bearer t1".into());
+
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.call("ListRuns", json!({})).await })
+        })
+        .collect();
+    for call in calls {
+        let reply = call.await.unwrap().unwrap();
+        assert_eq!(reply["bearer"], "Bearer t2");
+    }
+    // The first trade, and one more for all four refused calls.
+    assert_eq!(fake.trades.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn each_trade_signs_a_different_event_even_within_one_second() {
+    let clock = TestClock::at(1_000);
+    let (url, fake) = start(clock.clone()).await;
+    let client = client(&url, Keys::generate(), clock.clone());
+    client.call("GetCard", json!({})).await.unwrap();
+    // Past the renewal window, so the next call trades again, probably in the same second.
+    clock.advance(LIFETIME);
+    client.call("GetCard", json!({})).await.unwrap();
+    let ids = fake.event_ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "a repeated event id would be refused");
+}
+
+#[tokio::test]
 async fn a_forwarded_error_keeps_its_connect_code_in_the_tool_result() {
     let clock = TestClock::at(1_000);
     let (url, _fake) = start(clock.clone()).await;
@@ -198,7 +246,7 @@ async fn a_forwarded_error_keeps_its_connect_code_in_the_tool_result() {
     let result = hive
         .forward(
             "stage_done",
-            json!({"cardId": "c", "result": "passed"})
+            json!({"cardId": "c", "stage": "build", "visit": 1, "result": "passed"})
                 .as_object()
                 .cloned(),
         )

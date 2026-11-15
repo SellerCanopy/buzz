@@ -1,47 +1,25 @@
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine as _;
+use buzz_hive_api::rate::RateLimiter;
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
-use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::unary::unary;
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::access::{ActorKind, Level, RelayRole};
-use buzz_hive_core::bus::Bus;
 use buzz_hive_core::ports::store::{CommunityId, Store};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
-use buzz_hive_core::workflow::builtin::builtin_source;
-use buzz_hive_core::workflow::source::Sources;
 use nostr::nips::nip98::{HttpData, HttpMethod};
-use nostr::{EventBuilder, JsonUtil, Keys, Timestamp, Url};
+use nostr::{EventBuilder, JsonUtil, Keys, Tag, TagKind, Timestamp, Url};
 use tower::ServiceExt;
 
+use common::{app_with as app, community, router};
+
 const PUBLIC_URL: &str = "http://hive.test";
-const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
-
-fn community() -> CommunityId {
-    CommunityId::from_u128(1)
-}
-
-fn app(directory: FakeDirectory, store: MemStore) -> App {
-    App {
-        config: Arc::new(ApiConfig {
-            public_url: PUBLIC_URL.into(),
-            allowed_origins: Vec::new(),
-        }),
-        store: Arc::new(store),
-        directory: Arc::new(directory),
-        minter: Arc::new(TokenMinter::new(SECRET, Arc::new(SystemClock)).unwrap()),
-        replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
-        bus: Bus::new(0),
-        catalog: Arc::new(Sources(vec![builtin_source()])),
-        community: community(),
-        hive_pubkey: "ee".into(),
-        outbox: Arc::new(tokio::sync::Notify::new()),
-    }
-}
 
 fn sign(keys: &Keys, url: &str, age_secs: u64) -> String {
     let event = EventBuilder::http_auth(HttpData::new(Url::parse(url).unwrap(), HttpMethod::POST))
@@ -68,10 +46,6 @@ async fn send(router: &Router, request: Request<Body>) -> (StatusCode, serde_jso
     (status, serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
-fn router(app: App) -> Router {
-    buzz_hive_api::finish(buzz_hive_api::routes(&app), app)
-}
-
 fn member(keys: &Keys) -> FakeDirectory {
     FakeDirectory::new().with_role(&keys.public_key().to_hex(), RelayRole::Member)
 }
@@ -80,7 +54,7 @@ fn member(keys: &Keys) -> FakeDirectory {
 async fn a_valid_event_returns_a_token_for_that_pubkey() {
     let keys = Keys::generate();
     let app = app(member(&keys), MemStore::new());
-    let router = router(app.clone());
+    let router = router(&app);
     let (status, body) = send(
         &router,
         token_request(&sign(&keys, "http://hive.test/auth/token", 0)),
@@ -103,7 +77,7 @@ async fn a_trailing_slash_on_the_public_url_is_ignored() {
         allowed_origins: Vec::new(),
     });
     let (status, _) = send(
-        &router(app),
+        &router(&app),
         token_request(&sign(&keys, "http://hive.test/auth/token", 0)),
     )
     .await;
@@ -119,7 +93,7 @@ async fn an_agent_gets_a_token_that_names_its_owner() {
         .with_agent(&agent.public_key().to_hex(), &owner.public_key().to_hex());
     let app = app(directory, MemStore::new());
     let (status, body) = send(
-        &router(app.clone()),
+        &router(&app),
         token_request(&sign(&agent, "http://hive.test/auth/token", 0)),
     )
     .await;
@@ -131,7 +105,7 @@ async fn an_agent_gets_a_token_that_names_its_owner() {
 #[tokio::test]
 async fn an_event_for_another_url_is_unauthenticated() {
     let keys = Keys::generate();
-    let router = router(app(member(&keys), MemStore::new()));
+    let router = router(&app(member(&keys), MemStore::new()));
     let (status, body) = send(
         &router,
         token_request(&sign(&keys, "http://hive.test/other", 0)),
@@ -144,7 +118,7 @@ async fn an_event_for_another_url_is_unauthenticated() {
 #[tokio::test]
 async fn a_stale_event_is_unauthenticated() {
     let keys = Keys::generate();
-    let router = router(app(member(&keys), MemStore::new()));
+    let router = router(&app(member(&keys), MemStore::new()));
     let (status, body) = send(
         &router,
         token_request(&sign(&keys, "http://hive.test/auth/token", 120)),
@@ -157,7 +131,7 @@ async fn a_stale_event_is_unauthenticated() {
 #[tokio::test]
 async fn a_replayed_event_is_unauthenticated() {
     let keys = Keys::generate();
-    let router = router(app(member(&keys), MemStore::new()));
+    let router = router(&app(member(&keys), MemStore::new()));
     let header = sign(&keys, "http://hive.test/auth/token", 0);
     let (first, _) = send(&router, token_request(&header)).await;
     assert_eq!(first, StatusCode::OK);
@@ -170,7 +144,7 @@ async fn a_replayed_event_is_unauthenticated() {
 #[tokio::test]
 async fn a_missing_or_malformed_header_is_unauthenticated() {
     let keys = Keys::generate();
-    let router = router(app(member(&keys), MemStore::new()));
+    let router = router(&app(member(&keys), MemStore::new()));
     for header in [
         "",
         "Bearer abc",
@@ -186,7 +160,7 @@ async fn a_missing_or_malformed_header_is_unauthenticated() {
 #[tokio::test]
 async fn a_stranger_is_permission_denied() {
     let stranger = Keys::generate();
-    let router = router(app(FakeDirectory::new(), MemStore::new()));
+    let router = router(&app(FakeDirectory::new(), MemStore::new()));
     let (status, body) = send(
         &router,
         token_request(&sign(&stranger, "http://hive.test/auth/token", 0)),
@@ -200,7 +174,7 @@ async fn a_stranger_is_permission_denied() {
 async fn a_forged_event_does_not_burn_the_real_ones_id() {
     // Verify first, mark second: a tampered copy fails and the real event still works.
     let keys = Keys::generate();
-    let router = router(app(member(&keys), MemStore::new()));
+    let router = router(&app(member(&keys), MemStore::new()));
     let header = sign(&keys, "http://hive.test/auth/token", 0);
     let json = String::from_utf8(
         base64::engine::general_purpose::STANDARD
@@ -223,14 +197,10 @@ async fn a_forged_event_does_not_burn_the_real_ones_id() {
 // ---- the unary wrapper ----
 
 fn echo_router(app: App, needs: Level) -> Router {
-    let route = unary(
-        app.clone(),
-        needs,
-        |_app, ctx, req: serde_json::Value| async move {
-            Ok(serde_json::json!({ "who": ctx.actor.pubkey, "got": req }))
-        },
-    );
-    buzz_hive_api::finish(buzz_hive_api::routes(&app).route("/test/echo", route), app)
+    let route = unary(needs, |_app, ctx, req: serde_json::Value| async move {
+        Ok(serde_json::json!({ "who": ctx.actor.pubkey, "got": req }))
+    });
+    buzz_hive_api::finish(buzz_hive_api::routes().route("/test/echo", route), app)
 }
 
 fn bearer(app: &App, pubkey: &str) -> String {
@@ -385,7 +355,7 @@ async fn a_body_over_16_mib_is_refused_and_one_at_the_limit_is_read() {
 
 #[tokio::test]
 async fn healthz_answers_without_auth() {
-    let router = router(app(FakeDirectory::new(), MemStore::new()));
+    let router = router(&app(FakeDirectory::new(), MemStore::new()));
     let response = router
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
@@ -400,7 +370,7 @@ async fn the_finished_router_answers_a_preflight_only_for_a_configured_origin() 
         public_url: PUBLIC_URL.into(),
         allowed_origins: vec!["https://app.example.org".into()],
     });
-    let router = router(app);
+    let router = router(&app);
     let preflight = |origin: &str| {
         Request::builder()
             .method("OPTIONS")
@@ -424,4 +394,190 @@ async fn the_finished_router_answers_a_preflight_only_for_a_configured_origin() 
         .await
         .unwrap();
     assert!(other.headers().get("access-control-allow-origin").is_none());
+}
+
+// ---- who may sign in, and how fast ----
+
+fn url() -> String {
+    format!("{PUBLIC_URL}/auth/token")
+}
+
+#[tokio::test]
+async fn a_person_the_relay_no_longer_lists_gets_no_token_whatever_level_is_stored() {
+    let keys = Keys::generate();
+    let hex = keys.public_key().to_hex();
+    let store = MemStore::new();
+    let mut tx = store.begin(community()).await.unwrap();
+    tx.access()
+        .set_level(&hex, Level::Admin, ActorKind::Person, "aa")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // The relay lists no role for this key: the person was removed.
+    let app = app(FakeDirectory::new(), store);
+    let (status, body) = send(&router(&app), token_request(&sign(&keys, &url(), 0))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "permission_denied");
+}
+
+#[tokio::test]
+async fn a_deactivated_agent_gets_no_token_even_with_a_stored_level() {
+    let owner = Keys::generate().public_key().to_hex();
+    let agent = Keys::generate();
+    let hex = agent.public_key().to_hex();
+    let store = MemStore::new();
+    let mut tx = store.begin(community()).await.unwrap();
+    tx.access()
+        .set_level(&hex, Level::Run, ActorKind::Agent, &owner)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let directory = FakeDirectory::new()
+        .with_role(&owner, RelayRole::Member)
+        .with_agent(&hex, &owner)
+        .with_deactivated(&hex);
+    let app = app(directory, store);
+    let (status, body) = send(&router(&app), token_request(&sign(&agent, &url(), 0))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn a_token_minted_before_removal_stops_working_once_the_relay_drops_the_member() {
+    let keys = Keys::generate();
+    let hex = keys.public_key().to_hex();
+    let app = app(member(&keys), MemStore::new());
+    let bearer = bearer(&app, &hex);
+    let (status, _) = send(
+        &echo_router(app.clone(), Level::Read),
+        echo_request(Some(&bearer), Body::from("{}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The same token, after the relay has dropped the member.
+    let gone = App {
+        directory: Arc::new(FakeDirectory::new()),
+        ..app
+    };
+    let (status, body) = send(
+        &echo_router(gone, Level::Read),
+        echo_request(Some(&bearer), Body::from("{}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn a_stranger_does_not_take_a_slot_in_the_replay_guard() {
+    let member_keys = Keys::generate();
+    let mut app = app(member(&member_keys), MemStore::new());
+    // Room for a single id.
+    app.replay = Arc::new(ReplayGuard::with_capacity(REPLAY_TTL, 1));
+    let router = router(&app);
+    for _ in 0..3 {
+        let stranger = Keys::generate();
+        let (status, _) = send(&router, token_request(&sign(&stranger, &url(), 0))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, body) = send(&router, token_request(&sign(&member_keys, &url(), 0))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_full_replay_guard_refuses_new_ids_instead_of_growing() {
+    let first = Keys::generate();
+    let second = Keys::generate();
+    let directory = member(&first).with_role(&second.public_key().to_hex(), RelayRole::Member);
+    let mut app = app(directory, MemStore::new());
+    app.replay = Arc::new(ReplayGuard::with_capacity(REPLAY_TTL, 1));
+    let router = router(&app);
+    let (status, _) = send(&router, token_request(&sign(&first, &url(), 0))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(&router, token_request(&sign(&second, &url(), 0))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "unavailable");
+}
+
+#[tokio::test]
+async fn sign_ins_beyond_the_rate_limit_get_429_before_any_lookup() {
+    let keys = Keys::generate();
+    let mut app = app(member(&keys), MemStore::new());
+    // Two at once, and none refilled during the test.
+    app.auth_limit = Arc::new(RateLimiter::new(0, 2));
+    let router = router(&app);
+    for age in 0..2 {
+        let (status, _) = send(&router, token_request(&sign(&keys, &url(), age))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = send(&router, token_request(&sign(&keys, &url(), 2))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "resource_exhausted");
+}
+
+#[tokio::test]
+async fn a_forged_event_does_not_spend_the_rate_limit() {
+    let keys = Keys::generate();
+    let mut app = app(member(&keys), MemStore::new());
+    app.auth_limit = Arc::new(RateLimiter::new(0, 1));
+    let router = router(&app);
+    let (status, _) = send(&router, token_request("Nostr bm90IGpzb24=")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&router, token_request(&sign(&keys, &url(), 0))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn every_response_carries_a_request_id_and_keeps_a_plain_one_from_the_caller() {
+    let router = router(&app(FakeDirectory::new(), MemStore::new()));
+    let response = router
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(!response.headers()["x-request-id"].is_empty());
+    let kept = router
+        .clone()
+        .oneshot(
+            Request::get("/healthz")
+                .header("x-request-id", "trace-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kept.headers()["x-request-id"], "trace-123");
+    let replaced = router
+        .oneshot(
+            Request::get("/healthz")
+                .header("x-request-id", "has spaces and \"quotes\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        replaced.headers()["x-request-id"],
+        "has spaces and \"quotes\""
+    );
+}
+
+#[tokio::test]
+async fn an_event_with_a_nonce_tag_is_accepted_and_two_nonces_are_two_events() {
+    let keys = Keys::generate();
+    let router = router(&app(member(&keys), MemStore::new()));
+    let signed = |nonce: &str| {
+        let event =
+            EventBuilder::http_auth(HttpData::new(Url::parse(&url()).unwrap(), HttpMethod::POST))
+                .tag(Tag::custom(TagKind::custom("nonce"), [nonce]))
+                .sign_with_keys(&keys)
+                .unwrap();
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(event.as_json())
+        )
+    };
+    // Both are signed in the same second, and neither is a replay of the other.
+    let (first, body) = send(&router, token_request(&signed("one"))).await;
+    assert_eq!(first, StatusCode::OK, "{body}");
+    let (second, body) = send(&router, token_request(&signed("two"))).await;
+    assert_eq!(second, StatusCode::OK, "{body}");
 }

@@ -137,6 +137,40 @@ d="$(stage operators)"
 echo "RELAY_OPERATOR_PUBKEYS=$(printf 'a%.0s' $(seq 1 64))" >> "$d/deploy/compose/.env"
 if check_render "$d" >/dev/null 2>&1; then bad "mutant survives: operator pubkeys in .env"; else pass "mutant fails: operator pubkeys in .env"; fi
 
+# The role setup refuses a database URL that names another database than the relay's. Run
+# the rendered entrypoint with a stub psql: it must reach psql for the same name and stop
+# before psql for a different one.
+check_database_guard() {
+  local dir="$1" script bin="$1/guard-bin"
+  # "docker compose config" prints a literal dollar sign as $$, which "up" turns back.
+  script="$(render "$dir" 2> /dev/null | jq -r '.services["hive-db-init"].entrypoint[2]' | sed 's/\$\$/$/g')" || return 1
+  mkdir -p "$bin"
+  printf '#!/bin/sh\necho reached > "%s/psql.ran"\n' "$dir" > "$bin/psql"
+  chmod +x "$bin/psql"
+  rm -f "$dir/psql.ran"
+  PATH="$bin:$PATH" BUZZ_HIVE_DATABASE_URL="postgres://buzz_hive:p@postgres:5432/other" \
+    PGDATABASE=buzz sh -c "$script" > /dev/null 2>&1 && return 1
+  [ ! -e "$dir/psql.ran" ] || return 1
+  PATH="$bin:$PATH" BUZZ_HIVE_DATABASE_URL="postgres://buzz_hive:p@postgres:5432/buzz" \
+    PGDATABASE=buzz sh -c "$script" > /dev/null 2>&1 || return 1
+  [ -e "$dir/psql.ran" ]
+}
+d="$(stage guard)"
+if check_database_guard "$d"; then
+  pass "the role setup stops when the database URL names another database"
+else
+  bad "the role setup stops when the database URL names another database"
+fi
+d="$(stage guard-mutant)"
+sed -E 's#^ +\*/"\$\$PGDATABASE"\) ;;$#          *) ;;#' "$REPO_ROOT/deploy/aws/compose.hive.yml" > "$d/deploy/aws/compose.hive.yml"
+if cmp -s "$REPO_ROOT/deploy/aws/compose.hive.yml" "$d/deploy/aws/compose.hive.yml"; then
+  bad "mutation 'guard removed' changed nothing"
+elif check_database_guard "$d"; then
+  bad "mutant survives: database guard removed"
+else
+  pass "mutant fails: database guard removed"
+fi
+
 # A missing password fails the render instead of starting with an empty one.
 d="$(stage no-password)"
 grep -v '^POSTGRES_PASSWORD=' "$d/deploy/compose/.env" > "$d/env.tmp" && mv "$d/env.tmp" "$d/deploy/compose/.env"

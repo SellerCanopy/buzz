@@ -1,4 +1,5 @@
-//! `deploy/aws/hive-roles.sql` gives the `buzz_hive` role its schema and read access, and nothing more.
+//! `deploy/aws/hive-roles.sql` gives the `buzz_hive` role its schema and read access to the
+//! relay columns the service reads, and nothing more.
 
 mod support;
 
@@ -83,6 +84,37 @@ async fn the_hive_role_owns_its_schema_and_only_reads_the_relay() {
     buzz_hive_store::relay_read::verify_relay_columns(&pool)
         .await
         .expect("relay columns visible to buzz_hive");
+
+    // The grants are by column: the role may read exactly the columns the service reads
+    // and no other column of those tables.
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND table_name IN ('communities', 'channels', 'channel_members', 'relay_members', 'users')",
+    )
+    .fetch_all(&admin_pool)
+    .await
+    .unwrap();
+    assert!(
+        columns.iter().any(|(t, c)| t == "users" && c == "pubkey"),
+        "the relay schema was not read"
+    );
+    for (table, column) in &columns {
+        let readable: bool =
+            sqlx::query_scalar("SELECT has_column_privilege('buzz_hive', $1, $2, 'SELECT')")
+                .bind(format!("public.{table}"))
+                .bind(column)
+                .fetch_one(&admin_pool)
+                .await
+                .unwrap();
+        let wanted = buzz_hive_store::relay_read::RELAY_COLUMNS
+            .iter()
+            .any(|(t, c, _)| t == table && c == column);
+        assert_eq!(
+            readable, wanted,
+            "public.{table}.{column}: readable by buzz_hive {readable}, listed in RELAY_COLUMNS {wanted}"
+        );
+    }
     let directory = buzz_hive_store::relay_read::RelayRead::new(pool.clone());
     let none = directory
         .relay_role(uuid::Uuid::from_u128(1), &"ab".repeat(32))

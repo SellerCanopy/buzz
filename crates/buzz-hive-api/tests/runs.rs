@@ -335,3 +335,32 @@ async fn a_service_with_no_relay_account_says_so() {
         );
     }
 }
+
+#[tokio::test]
+async fn get_status_counts_what_is_running_and_the_posts_still_waiting() {
+    let app = with_directory(ready()).await;
+    let (_, before) = call(&app, "GetStatus", MEMBER, json!({})).await;
+    assert_eq!(before["running"], serde_json::Value::Null, "{before}");
+    assert_eq!(before["outboxPending"], serde_json::Value::Null, "{before}");
+
+    let card = make_card(&app).await;
+    let (status, body) = set_channel(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "StartStage", OWNER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Nothing drains the outbox in this test, so the posts the start queued are all waiting.
+    let (status, after) = call(&app, "GetStatus", MEMBER, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["running"], "1", "{after}");
+    assert!(
+        after["outboxPending"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            > 0
+    );
+    assert!(after["headSeq"].as_str().unwrap().parse::<i64>().unwrap() > 0);
+    assert_eq!(after["outboxFailed"], serde_json::Value::Null, "{after}");
+}

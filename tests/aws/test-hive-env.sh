@@ -8,6 +8,7 @@ NOT_FOUND="An error occurred (ParameterNotFound) when calling the GetParameter o
 DENIED="An error occurred (AccessDeniedException) when calling the GetParameter operation: not authorized"
 TOKEN="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 PASSWORD="fedcba9876543210fedcba98"
+NOSTR_KEY="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 OUT_FILE="$WORK/env.hive"
 
 write_aws_env
@@ -20,8 +21,8 @@ setup() {
     echo 254 > "$STUB_DIR/ssm-get-parameter.rc"
     echo "$NOT_FOUND" > "$STUB_DIR/ssm-get-parameter.err"
   fi
-  printf '/buzz/hive/BUZZ_HIVE_TOKEN_SECRET\t%s\n/buzz/hive/BUZZ_HIVE_DB_PASSWORD\t%s\n' \
-    "$TOKEN" "$PASSWORD" > "$STUB_DIR/ssm-get-parameters-by-path.out"
+  printf '/buzz/hive/BUZZ_HIVE_TOKEN_SECRET\t%s\n/buzz/hive/BUZZ_HIVE_DB_PASSWORD\t%s\n/buzz/hive/BUZZ_HIVE_NOSTR_KEY\t%s\n' \
+    "$TOKEN" "$PASSWORD" "$NOSTR_KEY" > "$STUB_DIR/ssm-get-parameters-by-path.out"
 }
 
 # run_env <scripts-dir>: sets RC; output goes to $WORK/out and $WORK/err.
@@ -30,15 +31,16 @@ run_env() {
   bash "$1/hive-env.sh" "$OUT_FILE" > "$WORK/out" 2> "$WORK/err" || RC=$?
 }
 
-scenario_creates_both_when_absent() {
+scenario_creates_all_when_absent() {
   setup absent
   run_env "$1"
   [ "$RC" -eq 0 ] || return 1
-  [ "$(log_count '^aws ssm put-parameter')" -eq 2 ] || return 1
+  [ "$(log_count '^aws ssm put-parameter')" -eq 3 ] || return 1
+  grep -qE '^aws ssm put-parameter --name /buzz/hive/BUZZ_HIVE_NOSTR_KEY --type SecureString ' "$STUB_LOG" || return 1
   grep -qE '^aws ssm put-parameter --name /buzz/hive/BUZZ_HIVE_TOKEN_SECRET --type SecureString ' "$STUB_LOG" || return 1
   grep -qE '^aws ssm put-parameter --name /buzz/hive/BUZZ_HIVE_DB_PASSWORD --type SecureString ' "$STUB_LOG" || return 1
-  [ "$(log_count '--value file://')" -eq 2 ] || return 1
-  local want="64 48" got="" line
+  [ "$(log_count '--value file://')" -eq 3 ] || return 1
+  local want="64 48 64" got="" line
   while IFS= read -r line; do
     [[ "$line" =~ ^[0-9a-f]+$ ]] || return 1
     got="$got ${#line}"
@@ -85,11 +87,28 @@ scenario_file_is_private_and_complete() {
   grep -qxF "BUZZ_HIVE_DATABASE_URL=postgres://buzz_hive:$PASSWORD@postgres:5432/buzz" "$OUT_FILE" || return 1
   grep -qxF "BUZZ_HIVE_DB_PASSWORD=$PASSWORD" "$OUT_FILE" || return 1
   grep -qxF "BUZZ_HIVE_TOKEN_SECRET=$TOKEN" "$OUT_FILE" || return 1
+  grep -qxF "BUZZ_HIVE_NOSTR_KEY=$NOSTR_KEY" "$OUT_FILE" || return 1
+  grep -qxF "BUZZ_HIVE_RELAY_URL=ws://relay:3000" "$OUT_FILE" || return 1
   grep -qxF "BUZZ_HIVE_PUBLIC_URL=https://$DOMAIN" "$OUT_FILE" || return 1
   grep -qxF "BUZZ_HIVE_COMMUNITY_HOST=$DOMAIN" "$OUT_FILE" || return 1
   grep -qxF "BUZZ_HIVE_ALLOWED_ORIGINS=https://$DOMAIN" "$OUT_FILE" || return 1
   # Nothing but the file may hold the secrets.
-  ! grep -qF -e "$TOKEN" -e "$PASSWORD" "$WORK/out" "$WORK/err" "$STUB_LOG"
+  ! grep -qF -e "$TOKEN" -e "$PASSWORD" -e "$NOSTR_KEY" "$WORK/out" "$WORK/err" "$STUB_LOG"
+}
+
+# The database name and relay address come from the settings, not from the script.
+scenario_settings_choose_database_and_relay() {
+  setup present
+  POSTGRES_DB=hive_main BUZZ_HIVE_RELAY_URL=wss://relay.example.org run_env "$1"
+  [ "$RC" -eq 0 ] || return 1
+  grep -qxF "BUZZ_HIVE_DATABASE_URL=postgres://buzz_hive:$PASSWORD@postgres:5432/hive_main" "$OUT_FILE" || return 1
+  grep -qxF "BUZZ_HIVE_RELAY_URL=wss://relay.example.org" "$OUT_FILE" || return 1
+  setup present
+  POSTGRES_DB='bad name;' run_env "$1"
+  [ "$RC" -ne 0 ] && [ ! -e "$OUT_FILE" ] || return 1
+  setup present
+  BUZZ_HIVE_RELAY_URL=http://relay:3000 run_env "$1"
+  [ "$RC" -ne 0 ] && [ ! -e "$OUT_FILE" ]
 }
 
 scenario_generated_values_not_printed() {
@@ -114,8 +133,8 @@ scenario_missing_value_writes_nothing() {
 
 scenario_unsafe_value_writes_nothing() {
   setup present
-  printf '/buzz/hive/BUZZ_HIVE_TOKEN_SECRET\t%s\n/buzz/hive/BUZZ_HIVE_DB_PASSWORD\tbad pass$word\n' \
-    "$TOKEN" > "$STUB_DIR/ssm-get-parameters-by-path.out"
+  printf '/buzz/hive/BUZZ_HIVE_TOKEN_SECRET\t%s\n/buzz/hive/BUZZ_HIVE_DB_PASSWORD\tbad pass$word\n/buzz/hive/BUZZ_HIVE_NOSTR_KEY\t%s\n' \
+    "$TOKEN" "$NOSTR_KEY" > "$STUB_DIR/ssm-get-parameters-by-path.out"
   run_env "$1"
   [ "$RC" -ne 0 ] || return 1
   [ ! -e "$OUT_FILE" ] || return 1
@@ -123,12 +142,13 @@ scenario_unsafe_value_writes_nothing() {
 }
 
 R="$REPO_ROOT/scripts/aws"
-expect_ok "creates both secrets when absent, as hex SecureString passed by file" scenario_creates_both_when_absent "$R"
-expect_ok "creates nothing when both exist" scenario_keeps_existing "$R"
+expect_ok "creates all three secrets when absent, as hex SecureString passed by file" scenario_creates_all_when_absent "$R"
+expect_ok "creates nothing when all exist" scenario_keeps_existing "$R"
 expect_ok "creates only the missing secret" scenario_only_missing_created "$R"
 expect_ok "an error other than not-found stops with no put and no file" scenario_other_error_stops "$R"
 expect_ok "the env file is mode 0600 with every variable, and no output shows a secret" scenario_file_is_private_and_complete "$R"
 expect_ok "generated values never reach stdout, stderr, or the call log" scenario_generated_values_not_printed "$R"
+expect_ok "the database name and relay address follow the settings and are validated" scenario_settings_choose_database_and_relay "$R"
 expect_ok "a missing value fails naming the parameter and writes no file" scenario_missing_value_writes_nothing "$R"
 expect_ok "an unsafe value fails without printing it and writes no file" scenario_unsafe_value_writes_nothing "$R"
 
@@ -140,6 +160,8 @@ expect_caught "file mode left at the umask default" scenario_file_is_private_and
   's/^umask 077$/umask 022/; s/^chmod 0600 "\$tmp"$/chmod 0644 "$tmp"/'
 expect_caught "value passed on the command line" scenario_generated_values_not_printed hive-env.sh \
   's#--value "file://\$WORK/value"#--value "$(cat "$WORK/value")"#'
+expect_caught "database name hardcoded" scenario_settings_choose_database_and_relay hive-env.sh \
+  's#/\$db_name"#/buzz"#'
 expect_caught "unsafe value accepted" scenario_unsafe_value_writes_nothing hive-env.sh \
   's/\^\[A-Za-z0-9\]\+\$/^.+$/'
 

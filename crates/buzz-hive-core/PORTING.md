@@ -278,7 +278,9 @@ spec's title and are confirmed when that phase starts.
   when there is none. `SetCardWorkflow` refuses a card that has a run.
 - Tool `move_card` works for an agent only when the workflow sets
   `side_effects.agent_moves_cards` (default false). `skip_stage`, `pause_card`,
-  `resume_card` and `set_card_workflow` are tools too.
+  `resume_card` and `set_card_workflow` are tools too. (Later, `skip_stage`, `pause_card`
+  and `resume_card` stopped being tools and refuse an agent. `stage_done` and `move_card`
+  take the stage and visit the task named.)
 - A failed or `ask` result, a `needs_input` result and a missing result set the card waiting.
 - `calls`: `then` is honored after a `passed` call. `give` waits for Phase 9.
 - A hand-off to a next workflow may leave the card done with an `activity.added` note.

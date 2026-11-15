@@ -52,7 +52,10 @@ service EngineService {
   // rpc. Only the Buzz agent the stage's task mentioned may call it, whatever
   // level others hold. The result must be one the stage offers, else
   // InvalidArgument lists them. A passed result from the last stage ends the
-  // run and moves the card to done.
+  // run and moves the card to done. The report names the stage and visit the
+  // task gave: either one missing is InvalidArgument, and either one that is
+  // not where the run is now is FailedPrecondition, so an answer to an earlier
+  // visit cannot move the card on from a later one.
   rpc StageDone(StageDoneRequest) returns (Run);
   // StopRun stops a run: its turn is cancelled and its agent session
   // closed, it ends with outcome stopped, its open items are resolved, and
@@ -376,7 +379,8 @@ service EngineService {
   // place of the route its result would give. Beehive: new rpc. Only the
   // Buzz agent the stage task mentioned may call it, and only when the
   // workflow sets side_effects.agent_moves_cards. An unknown stage is
-  // InvalidArgument.
+  // InvalidArgument. Like StageDone, the call names the stage and visit the
+  // task gave, and they must be where the run is now.
   rpc MoveCard(MoveCardRequest) returns (Run);
   // ArchiveCards sets cards aside, all or nothing. A card with an unfinished
   // run is FailedPrecondition until the run is stopped, and a test card is
@@ -479,10 +483,15 @@ message GetStatusResponse {
   int64 head_seq = 3;
   // The cards in state running.
   int64 running = 4;
-  // The open Needs you items.
+  // The open Needs you items. Beehive has none yet, so this stays 0.
   int64 needs_you = 5;
   // Beehive: the Buzz community this service serves.
   string community_id = 6;
+  // Beehive: posts to the relay not sent yet, failed ones included.
+  int64 outbox_pending = 7;
+  // Beehive: the pending posts whose last attempt failed. Stays above 0 while the relay
+  // refuses them, so an operator can see a drain that is stuck.
+  int64 outbox_failed = 8;
 }
 
 // A person in the company. user_id is "" in token mode before --owner is set.
@@ -886,6 +895,11 @@ message StageDoneRequest {
   string result = 2;
   // What the agent says about the result, up to 10,000 characters. Optional.
   string summary = 3;
+  // The stage the task named. Required: it must be the stage the run is at.
+  string stage = 4;
+  // The visit the task named, from 1. Required: it must be the run's current
+  // visit to that stage.
+  int32 visit = 5;
 }
 
 message StopRunRequest {
@@ -1000,6 +1014,12 @@ message MoveCardRequest {
   string card_id = 1;
   // The stage to move the card to.
   string stage_id = 2;
+  // The stage the task named, which the card is moved from. Required: it must
+  // be the stage the run is at.
+  string stage = 3;
+  // The visit the task named, from 1. Required: it must be the run's current
+  // visit to that stage.
+  int32 visit = 4;
 }
 
 message ArchiveCardsRequest {

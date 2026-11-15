@@ -136,6 +136,29 @@ impl Catalog {
         self.by_name.get(name).and_then(|packages| packages.first())
     }
 
+    /// The refusal for a workflow `name` that is not in the catalog. When a package could not
+    /// load, the reason is named, because the catalog is read from disk on every call and a
+    /// folder that is unreadable or half-written for a moment looks the same as one that was
+    /// never there.
+    pub fn absent(&self, name: &str) -> String {
+        let reasons: Vec<String> = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.code == "source_unreadable" || finding.path.rsplit('/').next() == Some(name)
+            })
+            .map(|finding| format!("{}: {}", finding.path, finding.message))
+            .collect();
+        if reasons.is_empty() {
+            format!("workflow {name} does not exist")
+        } else {
+            format!(
+                "workflow {name} could not be loaded ({})",
+                reasons.join("; ")
+            )
+        }
+    }
+
     /// Every package loaded with `name`, in load order.
     pub fn all(&self, name: &str) -> &[Package] {
         self.by_name.get(name).map_or(&[], Vec::as_slice)

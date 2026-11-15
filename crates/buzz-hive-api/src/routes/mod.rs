@@ -110,195 +110,60 @@ fn needs(method: &str) -> Level {
         .unwrap_or_else(|| panic!("{method} is not in ROUTES"))
 }
 
+/// Adds the route for `method`, at the level its tool or [`ROUTES`] row names.
+fn route<Req, Res, F, Fut>(r: Router<App>, method: &str, handler: F) -> Router<App>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Res: serde::Serialize + Send + 'static,
+    F: Fn(App, crate::unary::Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Res, crate::error::HiveError>> + Send + 'static,
+{
+    r.route(&path(method), unary(needs(method), handler))
+}
+
 /// A route for every entry in [`ROUTES`].
-pub fn router(app: &App) -> Router<App> {
-    Router::new()
-        .route(
-            &path("GetStatus"),
-            unary(app.clone(), needs("GetStatus"), status::get_status),
-        )
-        .route(
-            &path("WhoAmI"),
-            unary(app.clone(), needs("WhoAmI"), status::who_am_i),
-        )
-        .route(
-            &path("ListCards"),
-            unary(app.clone(), needs("ListCards"), cards::list_cards),
-        )
-        .route(
-            &path("GetCard"),
-            unary(app.clone(), needs("GetCard"), cards::get_card),
-        )
-        .route(
-            &path("CreateCard"),
-            unary(app.clone(), needs("CreateCard"), cards::create_card),
-        )
-        .route(
-            &path("CreateTask"),
-            unary(app.clone(), needs("CreateTask"), cards::create_task),
-        )
-        .route(
-            &path("AddNote"),
-            unary(app.clone(), needs("AddNote"), cards::add_note),
-        )
-        .route(
-            &path("RemoveCard"),
-            unary(app.clone(), needs("RemoveCard"), cards::remove_card),
-        )
-        .route(
-            &path("ArchiveCards"),
-            unary(app.clone(), needs("ArchiveCards"), cards::archive_cards),
-        )
-        .route(
-            &path("RestoreCard"),
-            unary(app.clone(), needs("RestoreCard"), cards::restore_card),
-        )
-        .route(
-            &path("PollEvents"),
-            unary(app.clone(), needs("PollEvents"), poll::poll_events),
-        )
-        .route(
-            &path("ListWorkflows"),
-            unary(
-                app.clone(),
-                needs("ListWorkflows"),
-                workflows::list_workflows,
-            ),
-        )
-        .route(
-            &path("CheckWorkflow"),
-            unary(
-                app.clone(),
-                needs("CheckWorkflow"),
-                workflows::check_workflow,
-            ),
-        )
-        .route(
-            &path("ListTemplateVariables"),
-            unary(
-                app.clone(),
-                needs("ListTemplateVariables"),
-                workflows::list_template_variables,
-            ),
-        )
-        .route(
-            &path("ListStageTemplates"),
-            unary(
-                app.clone(),
-                needs("ListStageTemplates"),
-                workflows::list_stage_templates,
-            ),
-        )
-        .route(
-            &path("StartStage"),
-            unary(app.clone(), needs("StartStage"), runs::start_stage),
-        )
-        .route(
-            &path("StageDone"),
-            unary(app.clone(), needs("StageDone"), stages::stage_done),
-        )
-        .route(
-            &path("GetRun"),
-            unary(app.clone(), needs("GetRun"), runs::get_run),
-        )
-        .route(
-            &path("ListRuns"),
-            unary(app.clone(), needs("ListRuns"), runs::list_runs),
-        )
-        .route(
-            &path("GetSettings"),
-            unary(app.clone(), needs("GetSettings"), settings::get_settings),
-        )
-        .route(
-            &path("SetSetting"),
-            unary(app.clone(), needs("SetSetting"), settings::set_setting),
-        )
-        .route(
-            &path("ListAgents"),
-            unary(app.clone(), needs("ListAgents"), agents::list_agents),
-        )
-        .route(
-            &path("SkipStage"),
-            unary(app.clone(), needs("SkipStage"), stages::skip_stage),
-        )
-        .route(
-            &path("PauseCard"),
-            unary(app.clone(), needs("PauseCard"), stages::pause_card),
-        )
-        .route(
-            &path("ResumeCard"),
-            unary(app.clone(), needs("ResumeCard"), stages::resume_card),
-        )
-        .route(
-            &path("SetCardWorkflow"),
-            unary(
-                app.clone(),
-                needs("SetCardWorkflow"),
-                cards::set_card_workflow,
-            ),
-        )
-        .route(
-            &path("MoveCard"),
-            unary(app.clone(), needs("MoveCard"), stages::move_card),
-        )
-        .route(
-            &path("GetBrief"),
-            unary(app.clone(), needs("GetBrief"), artifacts::get_brief),
-        )
-        .route(
-            &path("ListArtifacts"),
-            unary(
-                app.clone(),
-                needs("ListArtifacts"),
-                artifacts::list_artifacts,
-            ),
-        )
-        .route(
-            &path("ListArtifactVersions"),
-            unary(
-                app.clone(),
-                needs("ListArtifactVersions"),
-                artifacts::list_artifact_versions,
-            ),
-        )
-        .route(
-            &path("ReadArtifact"),
-            unary(app.clone(), needs("ReadArtifact"), artifacts::read_artifact),
-        )
-        .route(
-            &path("ListCardFiles"),
-            unary(
-                app.clone(),
-                needs("ListCardFiles"),
-                artifacts::list_card_files,
-            ),
-        )
-        .route(
-            &path("SetHandoff"),
-            unary(app.clone(), needs("SetHandoff"), artifacts::set_handoff),
-        )
-        .route(
-            &path("SaveArtifact"),
-            unary(app.clone(), needs("SaveArtifact"), artifacts::save_artifact),
-        )
-        .route(
-            &path("UpdatePlan"),
-            unary(app.clone(), needs("UpdatePlan"), artifacts::update_plan),
-        )
-        .route(
-            &path("LogWork"),
-            unary(app.clone(), needs("LogWork"), artifacts::log_work),
-        )
-        .route(
-            &path("RecordDecision"),
-            unary(
-                app.clone(),
-                needs("RecordDecision"),
-                artifacts::record_decision,
-            ),
-        )
-        .route(
-            &path("ReadHistory"),
-            unary(app.clone(), needs("ReadHistory"), artifacts::read_history),
-        )
+pub fn router() -> Router<App> {
+    let r = Router::new();
+    let r = route(r, "GetStatus", status::get_status);
+    let r = route(r, "WhoAmI", status::who_am_i);
+    let r = route(r, "ListCards", cards::list_cards);
+    let r = route(r, "GetCard", cards::get_card);
+    let r = route(r, "CreateCard", cards::create_card);
+    let r = route(r, "CreateTask", cards::create_task);
+    let r = route(r, "AddNote", cards::add_note);
+    let r = route(r, "RemoveCard", cards::remove_card);
+    let r = route(r, "ArchiveCards", cards::archive_cards);
+    let r = route(r, "RestoreCard", cards::restore_card);
+    let r = route(r, "PollEvents", poll::poll_events);
+    let r = route(r, "ListWorkflows", workflows::list_workflows);
+    let r = route(r, "CheckWorkflow", workflows::check_workflow);
+    let r = route(
+        r,
+        "ListTemplateVariables",
+        workflows::list_template_variables,
+    );
+    let r = route(r, "ListStageTemplates", workflows::list_stage_templates);
+    let r = route(r, "StartStage", runs::start_stage);
+    let r = route(r, "StageDone", stages::stage_done);
+    let r = route(r, "GetRun", runs::get_run);
+    let r = route(r, "ListRuns", runs::list_runs);
+    let r = route(r, "GetSettings", settings::get_settings);
+    let r = route(r, "SetSetting", settings::set_setting);
+    let r = route(r, "ListAgents", agents::list_agents);
+    let r = route(r, "SkipStage", stages::skip_stage);
+    let r = route(r, "PauseCard", stages::pause_card);
+    let r = route(r, "ResumeCard", stages::resume_card);
+    let r = route(r, "SetCardWorkflow", cards::set_card_workflow);
+    let r = route(r, "MoveCard", stages::move_card);
+    let r = route(r, "GetBrief", artifacts::get_brief);
+    let r = route(r, "ListArtifacts", artifacts::list_artifacts);
+    let r = route(r, "ListArtifactVersions", artifacts::list_artifact_versions);
+    let r = route(r, "ReadArtifact", artifacts::read_artifact);
+    let r = route(r, "ListCardFiles", artifacts::list_card_files);
+    let r = route(r, "SetHandoff", artifacts::set_handoff);
+    let r = route(r, "SaveArtifact", artifacts::save_artifact);
+    let r = route(r, "UpdatePlan", artifacts::update_plan);
+    let r = route(r, "LogWork", artifacts::log_work);
+    let r = route(r, "RecordDecision", artifacts::record_decision);
+    route(r, "ReadHistory", artifacts::read_history)
 }

@@ -19,8 +19,8 @@ use serde_json::Value;
 pub use client::{CallError, Clock, Config, HiveClient, SystemClock, RENEW_BEFORE_SECS};
 
 const INSTRUCTIONS: &str = "Tools for Beehive, the workflow board. A stage task in chat names the \
-card and the results it accepts. When you finish the stage, call stage_done with that card_id \
-and one of those results.";
+card, the stage, the visit and the results it accepts. When you finish the stage, call stage_done \
+with that card_id, stage and visit and one of those results.";
 
 /// The MCP tool for each row of the table.
 pub fn tool_list() -> Vec<Tool> {

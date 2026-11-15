@@ -184,9 +184,7 @@ pub async fn set_card_workflow(
             )));
         }
         if !workflow.is_empty() && env.catalog.get(workflow).is_none() {
-            return Err(OpError::NotFound(format!(
-                "workflow {workflow} does not exist"
-            )));
+            return Err(OpError::NotFound(env.catalog.absent(workflow)));
         }
         let from = std::mem::replace(&mut card.workflow, workflow.to_owned());
         if card.workflow != from {
@@ -232,7 +230,8 @@ pub async fn archive_cards(
 /// Brings an archived card back to Backlog.
 ///
 /// The Go engine returns a card that has run to its workflow. No run exists yet, so
-/// every card goes to Backlog; Phase 6 keeps the workflow of a card that has run.
+/// every card goes to Backlog, idle and with no workflow, whatever state it was archived in;
+/// Phase 6 keeps the workflow of a card that has run.
 pub async fn restore_card(
     store: &dyn Store,
     ctx: &Ctx,
@@ -247,6 +246,7 @@ pub async fn restore_card(
     }
     card.archived = false;
     card.workflow.clear();
+    card.state = CardState::Idle;
     tx.cards().set_archived(id, false).await?;
     tx.cards().update(&card).await?;
     append(&mut *tx, ctx, "card.restored", id, summary(&card)).await?;

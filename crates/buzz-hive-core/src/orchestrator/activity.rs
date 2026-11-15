@@ -19,6 +19,10 @@ pub const MAX_SUMMARY_CHARS: usize = 120;
 pub const MAX_DETAIL_CHARS: usize = 2000;
 /// The longest reason a decision gives, in characters.
 pub const MAX_WHY_CHARS: usize = 300;
+/// The longest option a decision names as turned down, in characters.
+pub const MAX_OPTION_CHARS: usize = 120;
+/// The longest reason for turning an option down, in characters.
+pub const MAX_REJECTED_REASON_CHARS: usize = 300;
 /// The most options a decision may name as turned down.
 pub const MAX_REJECTED: usize = 10;
 
@@ -125,6 +129,14 @@ pub async fn record_decision(
         return Err(OpError::InvalidArgument(format!(
             "rejected may name at most {MAX_REJECTED} options"
         )));
+    }
+    for r in rejected {
+        check_text("a rejected option", &r.option, MAX_OPTION_CHARS)?;
+        check_text(
+            "the reason for a rejected option",
+            &r.reason,
+            MAX_REJECTED_REASON_CHARS,
+        )?;
     }
     if supersedes < 0 {
         return Err(OpError::InvalidArgument(

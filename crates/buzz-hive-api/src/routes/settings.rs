@@ -3,7 +3,6 @@
 use buzz_hive_core::access::{allow, Level};
 use buzz_hive_core::config::{Entry, Invalid, Source as CoreSource, KEY_UPDATE_CHANNEL};
 use buzz_hive_core::orchestrator::settings::{self, Scope};
-use buzz_hive_core::orchestrator::Env;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -20,10 +19,9 @@ pub async fn get_settings(
     req: GetSettingsRequest,
 ) -> Result<GetSettingsResponse, HiveError> {
     let scope = scope(&req.scope, &req.scope_id, &req.workflow)?;
-    let catalog = app.catalog.load();
-    let env = env(&app, &catalog);
+    let op = app.op(false)?;
     let stage = (!req.stage_id.is_empty()).then_some(req.stage_id.as_str());
-    let resolution = settings::get_settings(&env, &ctx.op(), &scope, stage).await?;
+    let resolution = settings::get_settings(&op.env(), &ctx.op(), &scope, stage).await?;
     Ok(GetSettingsResponse {
         settings: resolution.entries.into_iter().map(setting).collect(),
         invalid: resolution.invalid.into_iter().map(invalid).collect(),
@@ -45,27 +43,15 @@ pub async fn set_setting(app: App, ctx: Ctx, req: SetSettingRequest) -> Result<S
     }
     let value = parse_value(&req.value_json)?;
     // Saving the update channel checks that the Beehive account is in it.
-    if value.is_some() && req.key == KEY_UPDATE_CHANNEL {
-        app.require_hive()?;
-    }
-    let catalog = app.catalog.load();
-    let env = env(&app, &catalog);
-    let (entry, events) = settings::set_setting(&env, &ctx.op(), &scope, &req.key, value).await?;
-    app.bus.publish(&events);
+    let op = app.op(value.is_some() && req.key == KEY_UPDATE_CHANNEL)?;
+    let (entry, events) =
+        settings::set_setting(&op.env(), &ctx.op(), &scope, &req.key, value).await?;
+    op.settle(&events);
     Ok(entry.map(setting).unwrap_or_else(|| Setting {
         key: req.key,
         value_json: "null".to_owned(),
         source: None,
     }))
-}
-
-fn env<'a>(app: &'a App, catalog: &'a buzz_hive_core::workflow::load::Catalog) -> Env<'a> {
-    Env {
-        store: app.store.as_ref(),
-        directory: app.directory.as_ref(),
-        catalog,
-        hive: &app.hive_pubkey,
-    }
 }
 
 fn scope(scope: &str, scope_id: &str, workflow: &str) -> Result<Scope, HiveError> {

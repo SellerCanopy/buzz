@@ -89,6 +89,30 @@ fn load_skips_dot_folders_and_marks_built_in_sources() {
 }
 
 #[test]
+fn a_missing_workflow_names_why_it_could_not_load() {
+    let catalog = load(&[Source::new("test", false, demo_source())]);
+    // A folder that failed to load is named, with its reason.
+    let reason = catalog.absent("nameless");
+    assert!(
+        reason.starts_with("workflow nameless could not be loaded (test/nameless: "),
+        "{reason}"
+    );
+    // A name nothing was ever called is plainly absent.
+    assert_eq!(catalog.absent("nothing"), "workflow nothing does not exist");
+
+    // A source that cannot be read at all may hold any workflow, so it is named for every one.
+    let gone = load(&[Source::new(
+        "/gone",
+        false,
+        BrokenSource("permission denied".into()),
+    )]);
+    assert_eq!(
+        gone.absent("demo"),
+        "workflow demo could not be loaded (/gone: permission denied)"
+    );
+}
+
+#[test]
 fn a_source_that_cannot_be_listed_is_a_catalog_finding() {
     let catalog = load(&[Source::new(
         "/gone",

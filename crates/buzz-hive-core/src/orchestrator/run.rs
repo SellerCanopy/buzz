@@ -10,6 +10,7 @@ use super::artifacts::missing_outputs;
 use super::routes::{apply, begin_run, facts, resolve_settings, Mode};
 use super::settings;
 use super::{Ctx, Env, OpError};
+use crate::access::ActorKind;
 use crate::config::LayerKind;
 use crate::domain::card::Card;
 use crate::domain::events::Event;
@@ -17,6 +18,7 @@ use crate::domain::run::{Run, RunState};
 use crate::domain::workflow::RESULT_PASSED;
 use crate::ports::store::{Posting, Tx};
 use crate::rules::run::{entry_stage, step, task_key, Input};
+use crate::tool_names::STAGE_DONE;
 use crate::workflow::load::Package;
 use crate::workflow::routes::reportable_results;
 
@@ -64,9 +66,10 @@ pub async fn start_run_at(
             "the card has no workflow; choose one before starting it".into(),
         ));
     }
-    let package = env.catalog.get(&card.workflow).ok_or_else(|| {
-        OpError::FailedPrecondition(format!("workflow {} does not exist", card.workflow))
-    })?;
+    let package = env
+        .catalog
+        .get(&card.workflow)
+        .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&card.workflow)))?;
     if let Some(id) = stage {
         if package.stage(id).is_none() {
             return Err(OpError::InvalidArgument(format!(
@@ -134,13 +137,20 @@ async fn check_parameters(
 /// result routes the card: to another stage, to done, to stop, or to a wait for a person.
 /// A stale call, for a card whose run is not running, is refused with a sentence rather
 /// than applied twice.
+///
+/// `for_stage` and `visit` name the stage and visit the report is for, as the task said them. A
+/// report for any other stage or visit is a `FailedPrecondition`, so a late answer to an
+/// earlier visit cannot move the card on from a later one.
 pub async fn stage_done(
     env: &Env<'_>,
     ctx: &Ctx,
     card_id: Uuid,
+    for_stage: &str,
+    visit: u32,
     result: &str,
     summary: &str,
 ) -> Result<(Run, Vec<Event>), OpError> {
+    require_position(for_stage, visit)?;
     if summary.chars().count() > MAX_SUMMARY_CHARS {
         return Err(OpError::InvalidArgument(format!(
             "the summary is over {MAX_SUMMARY_CHARS} characters"
@@ -153,6 +163,7 @@ pub async fn stage_done(
         OpError::FailedPrecondition(format!("workflow {} has no stage {stage_id}", run.workflow))
     })?;
     check_agent(&mut *tx, ctx, &run, &stage_id).await?;
+    check_position(&run, &stage_id, for_stage, visit)?;
     let allowed = reportable_results(stage);
     if !allowed.iter().any(|r| r == result) {
         return Err(OpError::InvalidArgument(format!(
@@ -194,12 +205,53 @@ pub async fn stage_done(
     Ok((run, events))
 }
 
-/// A person moves a card that waits, or is held, on as if its stage had passed.
+/// Refuses a report that does not say which stage and visit it is for.
+fn require_position(stage: &str, visit: u32) -> Result<(), OpError> {
+    if stage.is_empty() {
+        return Err(OpError::InvalidArgument(
+            "stage is required: the stage the task named".into(),
+        ));
+    }
+    if visit == 0 {
+        return Err(OpError::InvalidArgument(
+            "visit is required: the visit the task named, from 1".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a report for a stage or visit the run is no longer at.
+fn check_position(run: &Run, running: &str, stage: &str, visit: u32) -> Result<(), OpError> {
+    if stage != running || visit != run.visit {
+        return Err(OpError::FailedPrecondition(format!(
+            "this report is for stage {stage} visit {visit}, but the run is at stage {running} visit {}; \
+             the task you answered is out of date",
+            run.visit
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an agent a call that is a person's to make. An agent acts through the stage task
+/// it was given, so it may report a result or move its own card, and may not hold, release or
+/// skip a card, which would let one agent override the others on a board.
+fn people_only(ctx: &Ctx, what: &str) -> Result<(), OpError> {
+    if ctx.actor.kind == ActorKind::Agent {
+        return Err(OpError::PermissionDenied(format!(
+            "only a person may {what}; an agent reports with {STAGE_DONE}"
+        )));
+    }
+    Ok(())
+}
+
+/// A person moves a card that waits, or is held, on as if its stage had passed. An agent may
+/// not.
 pub async fn skip_stage(
     env: &Env<'_>,
     ctx: &Ctx,
     card_id: Uuid,
 ) -> Result<(Run, Vec<Event>), OpError> {
+    people_only(ctx, "skip a stage")?;
     let mut tx = env.store.begin(ctx.community).await?;
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await?;
     if !matches!(run.state, RunState::Waiting | RunState::Paused) {
@@ -224,12 +276,14 @@ pub async fn skip_stage(
     Ok((run, events))
 }
 
-/// A person holds a running card. Its agent may not report until the card is resumed.
+/// A person holds a running card. Its agent may not report until the card is resumed. An
+/// agent may not hold a card.
 pub async fn pause_card(
     env: &Env<'_>,
     ctx: &Ctx,
     card_id: Uuid,
 ) -> Result<(Run, Vec<Event>), OpError> {
+    people_only(ctx, "pause a card")?;
     let mut tx = env.store.begin(ctx.community).await?;
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await?;
     if run.state != RunState::Running {
@@ -254,12 +308,14 @@ pub async fn pause_card(
     Ok((run, events))
 }
 
-/// A person lets a held stage start, or tells a paused stage's agent to carry on.
+/// A person lets a held stage start, or tells a paused stage's agent to carry on. An agent
+/// may not.
 pub async fn resume_card(
     env: &Env<'_>,
     ctx: &Ctx,
     card_id: Uuid,
 ) -> Result<(Run, Vec<Event>), OpError> {
+    people_only(ctx, "resume a card")?;
     let mut tx = env.store.begin(ctx.community).await?;
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await?;
     if run.state != RunState::Paused {
@@ -286,16 +342,23 @@ pub async fn resume_card(
 
 /// The stage's agent moves the card to `target`, in place of the route its result would give.
 /// A workflow allows it with `side_effects.agent_moves_cards`.
+///
+/// `for_stage` and `visit` name the stage and visit the move is made from, as the task said them,
+/// and are checked as [`stage_done`] checks them. `target` is the stage to move to.
 pub async fn move_card(
     env: &Env<'_>,
     ctx: &Ctx,
     card_id: Uuid,
+    for_stage: &str,
+    visit: u32,
     target: &str,
 ) -> Result<(Run, Vec<Event>), OpError> {
+    require_position(for_stage, visit)?;
     let mut tx = env.store.begin(ctx.community).await?;
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await?;
     let stage_id = running_stage(&run)?;
     check_agent(&mut *tx, ctx, &run, &stage_id).await?;
+    check_position(&run, &stage_id, for_stage, visit)?;
     let allowed = resolve_settings(env, &mut *tx, &card, &run.parameters, Some(&stage_id))
         .await?
         .value(KEY_AGENT_MOVES_CARDS)
@@ -366,9 +429,10 @@ pub(super) async fn locked<'a>(
         .get_for_update(active.id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("run {} does not exist", active.id)))?;
-    let package = env.catalog.get(&run.workflow).ok_or_else(|| {
-        OpError::FailedPrecondition(format!("workflow {} does not exist", run.workflow))
-    })?;
+    let package = env
+        .catalog
+        .get(&run.workflow)
+        .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     Ok((card, run, package))
 }
 

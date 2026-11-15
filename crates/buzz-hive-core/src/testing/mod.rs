@@ -2,6 +2,7 @@
 
 mod fake_relay;
 mod mem_store;
+pub mod outbox_scenarios;
 
 pub use fake_relay::{FakeRelay, Posted};
 pub use mem_store::{FakeDirectory, MemStore};

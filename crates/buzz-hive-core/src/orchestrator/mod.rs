@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod cards;
+mod lookup;
 pub mod outbox;
 mod routes;
 pub mod run;

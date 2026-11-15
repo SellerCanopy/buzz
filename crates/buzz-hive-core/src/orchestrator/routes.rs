@@ -11,6 +11,7 @@ use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::lookup::Memo;
 use super::task_message::{render_task, with_card_link, CardText, Handoff};
 use super::{activity, artifacts};
 use super::{Ctx, Env, OpError};
@@ -22,6 +23,7 @@ use crate::ports::store::{Posting, Tx};
 use crate::rules::run::{
     entry_stage, step, task_key, Effect, Ended, Facts, Input, Note, Round, Step,
 };
+use crate::tool_names::STAGE_DONE;
 use crate::workflow::load::Package;
 use crate::workflow::options::resolve_options;
 
@@ -139,6 +141,10 @@ pub(super) async fn begin_run(
 
 /// Writes `stepped`: the run, the events and posts it asks for, and the card's new state. A
 /// run that ended with the workflow done hands its card to the workflow's next one.
+///
+/// The first event appended takes the community's log lock, which is held to the commit. So
+/// every answer the relay's directory has to give, which agent a stage names, whether it is in
+/// the channel, and whether the next workflow can start, is asked for before that append.
 pub(super) async fn apply(
     env: &Env<'_>,
     ctx: &Ctx,
@@ -154,6 +160,31 @@ pub(super) async fn apply(
         ended,
         reason,
     } = stepped;
+    let directory = Memo::new(env.directory);
+    let env = &Env {
+        directory: &directory,
+        ..*env
+    };
+    let channel = super::settings::update_channel(tx).await?;
+    for effect in &effects {
+        if let Effect::PostStageTask {
+            stage,
+            agent: agent_name,
+            ..
+        } = effect
+        {
+            let channel = need_channel(channel)?;
+            let agent = find_agent(env, ctx, agent_name, &package.meta.name, stage).await?;
+            env.directory
+                .member_of_channel(ctx.community, channel, &agent)
+                .await?;
+        }
+    }
+    let next = if ended == Some(Ended::Done) && mode == Mode::Update {
+        Some(next_workflow(env, ctx, tx, package).await?)
+    } else {
+        None
+    };
     if ended.is_some() {
         run.ended_at = Some(Utc::now().trunc_subsecs(6));
     }
@@ -182,7 +213,6 @@ pub(super) async fn apply(
             append(tx, ctx, "card.state", &run, payload).await?;
         }
     }
-    let channel = super::settings::update_channel(tx).await?;
     for effect in effects {
         match effect {
             Effect::Emit { kind, payload } => append(tx, ctx, kind, &run, payload).await?,
@@ -272,7 +302,7 @@ pub(super) async fn apply(
                         .await?
                     }
                     Note::Resumed => format!(
-                        "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `stage_done` with card_id `{id}`."
+                        "The card was resumed. Stage {stage} is running again: report its result with the Beehive tool `{STAGE_DONE}` with card_id `{id}`, stage `{stage}` and visit {visit}."
                     ),
                 };
                 let posting = Posting::StageReply {
@@ -292,8 +322,8 @@ pub(super) async fn apply(
     }
     // A run that ends in the step that starts it, because its conditions skip every stage,
     // does not hand off, so two workflows that hand off to each other cannot loop.
-    if ended == Some(Ended::Done) && mode == Mode::Update {
-        hand_off(env, ctx, tx, card, package).await?;
+    if let Some(next) = next {
+        hand_off(env, ctx, tx, card, next).await?;
     }
     Ok(run)
 }
@@ -353,6 +383,7 @@ async fn task_text(
             String::new()
         },
         channel: Some(channel),
+        visit,
     };
     let mut text = render_task(
         package,
@@ -368,16 +399,16 @@ async fn task_text(
     .map_err(OpError::FailedPrecondition)?;
     if let Some(round) = round {
         text.push_str("\n\n");
-        text.push_str(&round_line(round));
+        text.push_str(&round_line(round, stage, visit));
     }
     Ok(text)
 }
 
 /// What the agent is told about the round it is starting.
-fn round_line(round: &Round) -> String {
+fn round_line(round: &Round, stage: &str, visit: u32) -> String {
     if round.plan.is_empty() {
         format!(
-            "This is round {}. Carry on, and call `stage_done` with passed when the work is done.",
+            "This is round {}. Carry on, and call `{STAGE_DONE}` with stage `{stage}`, visit {visit} and result passed when the work is done.",
             round.number
         )
     } else {
@@ -388,32 +419,34 @@ fn round_line(round: &Round) -> String {
     }
 }
 
-/// With the workflow done, the card takes the workflow's next one and starts at its first stage,
-/// unless that stage is held. A next workflow that is not loaded, or whose first stage cannot
-/// start, leaves the card done and says why in its activity.
-async fn hand_off(
-    env: &Env<'_>,
+/// What becomes of a card whose workflow is done.
+enum Next<'a> {
+    /// The workflow hands nothing on.
+    Nothing,
+    /// The card goes to the workflow of this name, whose first stage can start.
+    Start(String, &'a Package),
+    /// The card stays done, and this is what its activity says.
+    Stay(String),
+}
+
+/// Decides, before anything is written, where a card whose workflow is done goes next: the
+/// workflow's next one, unless that is not loaded or its first stage cannot start.
+async fn next_workflow<'a>(
+    env: &Env<'a>,
     ctx: &Ctx,
     tx: &mut dyn Tx,
-    card: &mut Card,
     package: &Package,
-) -> Result<(), OpError> {
+) -> Result<Next<'a>, OpError> {
     let options = tx.workflows().options().await?;
     let next = resolve_options(package, options.get(&package.meta.name)).next;
     if next.is_empty() {
-        return Ok(());
+        return Ok(Next::Nothing);
     }
     let Some(target) = env.catalog.get(&next) else {
-        return note(
-            tx,
-            ctx,
-            card,
-            format!(
-                "{} hands finished cards to {next}, which is not loaded, so the card stayed done",
-                package.meta.name
-            ),
-        )
-        .await;
+        return Ok(Next::Stay(format!(
+            "{} hands finished cards to {next}, which is not loaded, so the card stayed done",
+            package.meta.name
+        )));
     };
     let refusal = match entry_stage(target, None) {
         Err(refusal) => Some(refusal),
@@ -423,18 +456,30 @@ async fn hand_off(
                 .err()
         }
     };
-    if let Some(refusal) = refusal {
-        return note(
-            tx,
-            ctx,
-            card,
-            format!(
-                "{} hands finished cards to {next}, which cannot start: {refusal}. The card stayed done",
-                package.meta.name
-            ),
-        )
-        .await;
-    }
+    Ok(match refusal {
+        Some(refusal) => Next::Stay(format!(
+            "{} hands finished cards to {next}, which cannot start: {refusal}. The card stayed done",
+            package.meta.name
+        )),
+        None => Next::Start(next, target),
+    })
+}
+
+/// With the workflow done, the card takes the workflow's next one and starts at its first stage,
+/// unless that stage is held. A next workflow that is not loaded, or whose first stage cannot
+/// start, leaves the card done and says why in its activity.
+async fn hand_off(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    tx: &mut dyn Tx,
+    card: &mut Card,
+    next: Next<'_>,
+) -> Result<(), OpError> {
+    let (next, target) = match next {
+        Next::Nothing => return Ok(()),
+        Next::Stay(summary) => return note(tx, ctx, card, summary).await,
+        Next::Start(next, target) => (next, target),
+    };
     let from = std::mem::replace(&mut card.workflow, next.clone());
     tx.cards().update(card).await?;
     let at = Event::new(

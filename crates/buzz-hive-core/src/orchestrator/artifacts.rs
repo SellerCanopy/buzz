@@ -20,6 +20,7 @@ use crate::domain::events::Event;
 use crate::domain::workflow::Stage;
 use crate::ports::store::{ArtifactSave, StoreError, Tx};
 use crate::rules::checkboxes::{count_checkboxes, set_checkbox};
+use crate::tool_names::SAVE_ARTIFACT;
 
 /// The longest item `update_plan` takes.
 pub const MAX_PLAN_ITEM_BYTES: usize = 1 << 10;
@@ -210,7 +211,7 @@ pub async fn update_plan(
     }) = latest
     else {
         return Err(OpError::FailedPrecondition(format!(
-            "the plan {plan} has no saved version yet; save it with save_artifact first"
+            "the plan {plan} has no saved version yet; save it with {SAVE_ARTIFACT} first"
         )));
     };
     let next = set_checkbox(&text, item, done).map_err(OpError::InvalidArgument)?;

@@ -46,9 +46,16 @@ The Beehive account's pubkey is logged at startup as `account`.
 
 The stage task names the card and the results the stage accepts. The agent ends the stage
 with the `stage_done` tool of `buzz-hive-mcp`, a stdio MCP server in `crates/buzz-hive-mcp`.
-Only the agent the task mentioned may report. A `passed` from the workflow's last stage ends
-the run and moves the card to Done. Any other result is recorded on the card's activity and
-the run stays where it is until workflow routing exists.
+Only the agent the task mentioned may report. The workflow routes the result: to another
+stage, which posts its own task, to Done, to stopped, or to a wait for a person. A `passed`
+from the workflow's last stage ends the run and moves the card to Done. A call for a card
+whose run is not waiting on a result is refused, not applied twice.
+
+The call carries the card id, the stage and the visit, all three as the task gave them. A
+call for any other stage or visit is refused with `failed_precondition`, so a late answer to
+an earlier visit of a stage cannot move the card on from a later one. The same holds for
+`move_card`. Holding, resuming and skipping a card are a person's: an agent calling them gets
+`permission_denied`, and they are not tools.
 
 Add the server to the agent's MCP servers, with the command `buzz-hive-mcp`. It reads
 `BUZZ_PRIVATE_KEY` and `BUZZ_RELAY_URL`, which the agent runtime already sets, signs in as

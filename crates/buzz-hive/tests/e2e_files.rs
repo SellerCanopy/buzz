@@ -130,13 +130,14 @@ async fn run(world: &World, outsider: &Keys) {
             TokenMinter::new(b"0123456789abcdef0123456789abcdef", Arc::new(SystemClock)).unwrap(),
         ),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        auth_limit: buzz_hive_api::rate::auth_limiter(),
         bus: Bus::new(0),
         catalog: Arc::new(Sources(vec![Source::new("e2e", false, files)])),
         community: world.community,
         hive_pubkey: adapter.pubkey(),
         outbox: Arc::new(tokio::sync::Notify::new()),
     };
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(&app), app.clone());
+    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
     let (agent, owner) = (
@@ -296,7 +297,7 @@ async fn scenario(
             ),
             Step::Call(
                 "stage_done",
-                json!({"cardId": "$card", "result": "passed", "summary": "made"}),
+                json!({"cardId": "$card", "stage": "make", "visit": 1, "result": "passed", "summary": "made"}),
             ),
             Step::AwaitMention,
         ])
@@ -367,7 +368,7 @@ async fn scenario(
     let (replies, _) = script
         .play(vec![Step::Call(
             "stage_done",
-            json!({"cardId": "$card", "result": "passed"}),
+            json!({"cardId": "$card", "stage": "use", "visit": 1, "result": "passed"}),
         )])
         .await;
     assert_eq!(replies[0].json()["state"], "ended", "{replies:?}");

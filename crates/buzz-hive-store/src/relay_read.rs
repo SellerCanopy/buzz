@@ -4,7 +4,9 @@
 //! `bytea` in `users`, so this module converts both ways.
 
 use buzz_hive_core::access::RelayRole;
-use buzz_hive_core::ports::store::{AgentInfo, CommunityId, Directory, Pubkey, StoreError};
+use buzz_hive_core::ports::store::{AgentInfo, AgentLink, CommunityId, Directory, StoreError};
+
+use crate::db_error::store_error;
 
 pub struct RelayRead {
     pool: sqlx::PgPool,
@@ -21,12 +23,8 @@ impl RelayRead {
             .bind(host)
             .fetch_optional(&self.pool)
             .await
-            .map_err(unavailable)
+            .map_err(store_error)
     }
-}
-
-fn unavailable(error: sqlx::Error) -> StoreError {
-    StoreError::Unavailable(error.to_string())
 }
 
 #[async_trait::async_trait]
@@ -43,7 +41,7 @@ impl Directory for RelayRead {
         .bind(pubkey)
         .fetch_optional(&self.pool)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(role.and_then(|r| match r.as_str() {
             "owner" => Some(RelayRole::Owner),
             "admin" => Some(RelayRole::Admin),
@@ -52,22 +50,25 @@ impl Directory for RelayRead {
         }))
     }
 
-    async fn agent_owner(
+    async fn agent_link(
         &self,
         community: CommunityId,
         pubkey: &str,
-    ) -> Result<Option<Pubkey>, StoreError> {
+    ) -> Result<Option<AgentLink>, StoreError> {
         let bytes = hex::decode(pubkey).map_err(|e| StoreError::NotFound(e.to_string()))?;
-        let owner: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT agent_owner_pubkey FROM public.users \
+        let row: Option<(Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT agent_owner_pubkey, deactivated_at IS NOT NULL FROM public.users \
              WHERE community_id = $1 AND pubkey = $2 AND agent_owner_pubkey IS NOT NULL",
         )
         .bind(community)
         .bind(bytes)
         .fetch_optional(&self.pool)
         .await
-        .map_err(unavailable)?;
-        Ok(owner.map(hex::encode))
+        .map_err(store_error)?;
+        Ok(row.map(|(owner, deactivated)| AgentLink {
+            owner: hex::encode(owner),
+            deactivated,
+        }))
     }
 
     async fn agents_named(
@@ -86,7 +87,7 @@ impl Directory for RelayRead {
         .bind(name)
         .fetch_all(&self.pool)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows.into_iter().map(agent).collect())
     }
 
@@ -100,7 +101,7 @@ impl Directory for RelayRead {
         .bind(community)
         .fetch_all(&self.pool)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         Ok(rows.into_iter().map(agent).collect())
     }
 
@@ -118,7 +119,7 @@ impl Directory for RelayRead {
         .bind(channel)
         .fetch_one(&self.pool)
         .await
-        .map_err(unavailable)
+        .map_err(store_error)
     }
 
     async fn member_of_channel(
@@ -139,7 +140,7 @@ impl Directory for RelayRead {
         .bind(bytes)
         .fetch_one(&self.pool)
         .await
-        .map_err(unavailable)
+        .map_err(store_error)
     }
 }
 
@@ -185,7 +186,7 @@ pub async fn verify_relay_columns(pool: &sqlx::PgPool) -> Result<(), StoreError>
         .bind(column)
         .fetch_optional(pool)
         .await
-        .map_err(unavailable)?;
+        .map_err(store_error)?;
         match found {
             Some(t) if t == *ty || (*ty == "text" && t == "character varying") => {}
             other => {

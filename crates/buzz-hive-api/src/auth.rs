@@ -1,13 +1,15 @@
 //! `POST /auth/token`: trade a signed NIP-98 event for a Beehive token.
 
+use std::time::Instant;
+
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine as _;
-use buzz_hive_core::access::Level;
 
 use crate::app::App;
 use crate::error::HiveError;
+use crate::replay::Seen;
 
 #[derive(serde::Serialize)]
 pub struct TokenReply {
@@ -32,37 +34,62 @@ pub async fn token(
     )
     .map_err(|_| HiveError::Unauthenticated("authorization is not text".into()))?;
 
-    let expected = format!("{}/auth/token", app.config.public_url.trim_end_matches('/'));
+    let expected = format!(
+        "{}{}",
+        app.config.public_url.trim_end_matches('/'),
+        crate::AUTH_TOKEN_PATH
+    );
     let pubkey =
         buzz_auth::verify_nip98_event(&event_json, &expected, "POST", None).map_err(|e| {
-            tracing::debug!(error = %e, "NIP-98 verification failed");
+            tracing::warn!(error = %e, "sign-in refused: NIP-98 verification failed");
             HiveError::Unauthenticated("authorization was not accepted".into())
         })?;
+    let hex = pubkey.to_hex();
     let event_id = serde_json::from_str::<serde_json::Value>(&event_json)
         .ok()
         .and_then(|v| v["id"].as_str().map(str::to_owned))
         .ok_or_else(|| HiveError::Unauthenticated("event has no id".into()))?;
-    // Verified first: burning an id on a forgery would let anyone block a real event.
-    if !app.replay.first_use(&event_id, std::time::Instant::now()) {
-        return Err(HiveError::Unauthenticated(
-            "authorization already used".into(),
+
+    // Only a verified event costs a lookup, and only this many a second. Anyone can sign an
+    // event, so without a ceiling the relay and the store answer for every one of them.
+    if !app.auth_limit.try_acquire(Instant::now()) {
+        tracing::warn!(pubkey = %hex, "sign-in refused: rate limit");
+        return Err(HiveError::ResourceExhausted(
+            "too many sign-ins, try again shortly".into(),
         ));
     }
 
-    let hex = pubkey.to_hex();
+    // Membership first, replay second: an event signed by a stranger must not take a slot in
+    // the seen-set, or strangers could fill it and lock real members out.
     let actor = app.resolve(&hex).await?;
-    if actor.level == Level::None
-        && app
-            .directory
-            .relay_role(app.community, &hex)
-            .await?
-            .is_none()
-        && actor.owner.is_none()
-    {
+    if !actor.member {
+        tracing::warn!(pubkey = %hex, "sign-in refused: not a member");
         return Err(HiveError::PermissionDenied(
             "not a member of this community".into(),
         ));
     }
+    match app.replay.first_use(&event_id, Instant::now()) {
+        Seen::New => {}
+        Seen::Replayed => {
+            tracing::warn!(pubkey = %hex, event = %short(&event_id), "sign-in refused: replayed event");
+            return Err(HiveError::Unauthenticated(
+                "authorization already used".into(),
+            ));
+        }
+        Seen::Full => {
+            tracing::warn!(pubkey = %hex, event = %short(&event_id), "sign-in refused: replay guard is full");
+            return Err(HiveError::Unavailable(
+                "too many sign-ins in flight, try again shortly".into(),
+            ));
+        }
+    }
+
     let (token, expires_at) = app.minter.mint(&hex, app.community, actor.owner)?;
+    tracing::info!(pubkey = %hex, level = ?actor.level, "sign-in accepted");
     Ok(Json(TokenReply { token, expires_at }))
+}
+
+/// The first characters of an event id, enough to find it in a log.
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
 }

@@ -6,6 +6,19 @@
 //! route has neither a row here nor an entry in [`NOT_TOOLS`] with its reason.
 
 use buzz_hive_core::access::Level;
+use buzz_hive_core::domain::artifact::MAX_ARTIFACT_BYTES;
+use buzz_hive_core::orchestrator::activity::{
+    DEFAULT_HISTORY_LIMIT, MAX_DETAIL_CHARS, MAX_HISTORY_LIMIT, MAX_OPTION_CHARS, MAX_REJECTED,
+    MAX_REJECTED_REASON_CHARS, MAX_SUMMARY_CHARS, MAX_WHY_CHARS,
+};
+use buzz_hive_core::orchestrator::artifacts::MAX_PLAN_ITEM_BYTES;
+use buzz_hive_core::orchestrator::cards::{
+    MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
+};
+use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
+use buzz_hive_core::tool_names::{
+    MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
+};
 use serde_json::{json, Value};
 
 pub struct Tool {
@@ -36,39 +49,18 @@ pub const TOOLS: &[Tool] = &[
         schema: start_run,
     },
     Tool {
-        name: "stage_done",
+        name: STAGE_DONE,
         route: "StageDone",
         needs: Level::Run,
-        description: "Report the result of the stage you were asked to do. Only the agent the stage task mentioned may call it. Pass the card_id from the task and one of the results it lists.",
+        description: "Report the result of the stage you were asked to do. Only the agent the stage task mentioned may call it. Pass the card_id, stage and visit from the task and one of the results it lists. A report for a stage or visit the card has moved past is refused.",
         schema: stage_done,
     },
     Tool {
-        name: "move_card",
+        name: MOVE_CARD,
         route: "MoveCard",
         needs: Level::Run,
-        description: "Move the card you are working on to another stage, in place of the route your result would give. Only the agent the stage task mentioned may call it, and only when the workflow allows agents to move cards.",
+        description: "Move the card you are working on to another stage, in place of the route your result would give. Pass the card_id, stage and visit from the task, and stage_id for the stage to move to. Only the agent the stage task mentioned may call it, and only when the workflow allows agents to move cards.",
         schema: move_card,
-    },
-    Tool {
-        name: "skip_stage",
-        route: "SkipStage",
-        needs: Level::Run,
-        description: "Move a card that is waiting or held on, as if its stage had passed. The stage is marked skipped.",
-        schema: card_id_only,
-    },
-    Tool {
-        name: "pause_card",
-        route: "PauseCard",
-        needs: Level::Run,
-        description: "Hold a running card. Its agent's report is refused until the card is resumed.",
-        schema: card_id_only,
-    },
-    Tool {
-        name: "resume_card",
-        route: "ResumeCard",
-        needs: Level::Run,
-        description: "Let a held card carry on: a stage held before it started posts its task, and a paused stage runs again.",
-        schema: card_id_only,
     },
     Tool {
         name: "set_card_workflow",
@@ -169,21 +161,21 @@ pub const TOOLS: &[Tool] = &[
         schema: set_setting,
     },
     Tool {
-        name: "save_artifact",
+        name: SAVE_ARTIFACT,
         route: "SaveArtifact",
         needs: Level::Run,
         description: "Save the next version of one of the outputs your stage task lists. Give a document as content, or a file with kind file and the sha256, size, type and url that `buzz upload file` printed. Only the agent the stage task mentioned may call it.",
         schema: save_artifact,
     },
     Tool {
-        name: "read_artifact",
+        name: READ_ARTIFACT,
         route: "ReadArtifact",
         needs: Level::Read,
         description: "Read one version of a document a stage saved, the latest when version is 0. A file has no text: the result says where to download it with `buzz media get`.",
         schema: read_artifact,
     },
     Tool {
-        name: "update_plan",
+        name: UPDATE_PLAN,
         route: "UpdatePlan",
         needs: Level::Run,
         description: "Check or uncheck one item of your stage's plan. It saves a new version of the plan and returns how many items are checked. The plan must be saved with save_artifact first.",
@@ -193,7 +185,7 @@ pub const TOOLS: &[Tool] = &[
         name: "log_work",
         route: "LogWork",
         needs: Level::Run,
-        description: "Record one piece of work you finished, so a later session on this stage can see it. One line, up to 120 characters.",
+        description: "Record one piece of work you finished, so a later session on this stage can see it. The summary is one short line.",
         schema: log_work,
     },
     Tool {
@@ -214,7 +206,7 @@ pub const TOOLS: &[Tool] = &[
         name: "get_hive_health",
         route: "GetStatus",
         needs: Level::Read,
-        description: "Read Beehive's version, the newest event number and the running card count.",
+        description: "Read Beehive's version, the newest event number, the running card count and how many posts to the relay are waiting or have failed.",
         schema: no_arguments,
     },
 ];
@@ -258,6 +250,18 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "the Files tab lists a card's files; a stage task says how to download its inputs",
     ),
     (
+        "SkipStage",
+        "a person's call from the board. An agent that could hold, release or skip a card could override the others, so the engine refuses an agent and the shim offers no tool",
+    ),
+    (
+        "PauseCard",
+        "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
+        "ResumeCard",
+        "a person's call from the board; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
     ),
@@ -291,10 +295,17 @@ fn card_id_only() -> Value {
 fn create_card() -> Value {
     object(
         vec![
-            ("title", string("The card's title, 1 to 200 characters.")),
+            (
+                "title",
+                string(&format!(
+                    "The card's title, 1 to {MAX_TITLE_CHARS} characters."
+                )),
+            ),
             (
                 "description",
-                string("What the card is about, up to 65536 characters."),
+                string(&format!(
+                    "What the card is about, up to {MAX_DESCRIPTION_CHARS} characters."
+                )),
             ),
             (
                 "workflow",
@@ -331,8 +342,13 @@ fn move_card() -> Value {
         vec![
             ("cardId", string("The card_id the stage task gave you.")),
             ("stageId", string("The stage to move the card to.")),
+            (
+                "stage",
+                string("The stage the task named, which the card is at."),
+            ),
+            ("visit", visit_field()),
         ],
-        &["cardId", "stageId"],
+        &["cardId", "stageId", "stage", "visit"],
     )
 }
 
@@ -363,17 +379,26 @@ fn stage_done() -> Value {
     object(
         vec![
             ("cardId", string("The card_id the stage task gave you.")),
+            ("stage", string("The stage the task named.")),
+            ("visit", visit_field()),
             (
                 "result",
                 string("One of the results the stage task lists, such as passed or failed."),
             ),
             (
                 "summary",
-                string("What you did or found, up to 10000 characters. Optional."),
+                string(&format!(
+                    "What you did or found, up to {MAX_RESULT_SUMMARY_CHARS} characters. Optional."
+                )),
             ),
         ],
-        &["cardId", "result"],
+        &["cardId", "stage", "visit", "result"],
     )
+}
+
+/// The visit a stage task names, which a report passes back.
+fn visit_field() -> Value {
+    json!({ "type": "integer", "minimum": 1, "description": "The visit the task named, from 1." })
 }
 
 fn list_cards() -> Value {
@@ -401,10 +426,17 @@ fn add_note() -> Value {
     object(
         vec![
             ("cardId", string("The card's id.")),
-            ("summary", string("One line, 1 to 200 characters.")),
+            (
+                "summary",
+                string(&format!(
+                    "One line, 1 to {MAX_NOTE_SUMMARY_CHARS} characters."
+                )),
+            ),
             (
                 "detail",
-                string("More text, up to 10000 characters. Optional."),
+                string(&format!(
+                    "More text, up to {MAX_NOTE_DETAIL_CHARS} characters. Optional."
+                )),
             ),
         ],
         &["cardId", "summary"],
@@ -439,7 +471,7 @@ fn save_artifact() -> Value {
             ),
             (
                 "content",
-                string("The document's full text, up to 1 MiB. Leave empty for a file."),
+                string(&format!("The document's full text, up to {MAX_ARTIFACT_BYTES} bytes. Leave empty for a file.")),
             ),
             (
                 "sha256",
@@ -482,7 +514,7 @@ fn update_plan() -> Value {
             ("cardId", string("The card_id the stage task gave you.")),
             (
                 "item",
-                string("The item's text as written after its checkbox, up to 1 KiB."),
+                string(&format!("The item's text as written after its checkbox, up to {MAX_PLAN_ITEM_BYTES} bytes.")),
             ),
             (
                 "done",
@@ -497,10 +529,15 @@ fn log_work() -> Value {
     object(
         vec![
             ("cardId", string("The card_id the stage task gave you.")),
-            ("summary", string("One line, 1 to 120 characters.")),
+            (
+                "summary",
+                string(&format!("One line, 1 to {MAX_SUMMARY_CHARS} characters.")),
+            ),
             (
                 "detail",
-                string("More text, up to 2000 characters. Optional."),
+                string(&format!(
+                    "More text, up to {MAX_DETAIL_CHARS} characters. Optional."
+                )),
             ),
             (
                 "planItem",
@@ -517,18 +554,23 @@ fn record_decision() -> Value {
             ("cardId", string("The card_id the stage task gave you.")),
             (
                 "summary",
-                string("The choice, one line of 1 to 120 characters."),
+                string(&format!(
+                    "The choice, one line of 1 to {MAX_SUMMARY_CHARS} characters."
+                )),
             ),
-            ("why", string("Why, up to 300 characters.")),
+            (
+                "why",
+                string(&format!("Why, up to {MAX_WHY_CHARS} characters.")),
+            ),
             (
                 "rejected",
                 json!({
                     "type": "array",
-                    "maxItems": 10,
+                    "maxItems": MAX_REJECTED,
                     "items": object(
                         vec![
-                            ("option", string("An option you turned down.")),
-                            ("reason", string("Why.")),
+                            ("option", string(&format!("An option you turned down, up to {MAX_OPTION_CHARS} characters."))),
+                            ("reason", string(&format!("Why, up to {MAX_REJECTED_REASON_CHARS} characters."))),
                         ],
                         &["option"],
                     ),
@@ -537,7 +579,9 @@ fn record_decision() -> Value {
             ),
             (
                 "detail",
-                string("More text, up to 2000 characters. Optional."),
+                string(&format!(
+                    "More text, up to {MAX_DETAIL_CHARS} characters. Optional."
+                )),
             ),
             (
                 "supersedes",
@@ -558,7 +602,7 @@ fn read_history() -> Value {
             ),
             (
                 "limit",
-                json!({ "type": "integer", "description": "At most this many, up to 500. 0 means 100." }),
+                json!({ "type": "integer", "description": format!("At most this many, up to {MAX_HISTORY_LIMIT}. 0 means {DEFAULT_HISTORY_LIMIT}.") }),
             ),
         ],
         &["cardId"],
@@ -628,6 +672,70 @@ mod tests {
         routes.sort_unstable();
         routes.dedup();
         assert_eq!(routes.len(), TOOLS.len(), "two tools call one route");
+    }
+
+    #[test]
+    fn the_limits_a_schema_states_are_the_ones_core_enforces() {
+        let text = |tool: &str| {
+            let tool = TOOLS.iter().find(|t| t.name == tool).unwrap();
+            (tool.schema)().to_string()
+        };
+        let has = |tool: &str, limit: &dyn std::fmt::Display| {
+            let text = text(tool);
+            assert!(
+                text.contains(&limit.to_string()),
+                "{tool} does not state {limit}: {text}"
+            );
+        };
+        has("create_card", &MAX_TITLE_CHARS);
+        has("create_card", &MAX_DESCRIPTION_CHARS);
+        has("stage_done", &MAX_RESULT_SUMMARY_CHARS);
+        has("add_note", &MAX_NOTE_SUMMARY_CHARS);
+        has("add_note", &MAX_NOTE_DETAIL_CHARS);
+        has("save_artifact", &MAX_ARTIFACT_BYTES);
+        has("update_plan", &MAX_PLAN_ITEM_BYTES);
+        has("log_work", &MAX_SUMMARY_CHARS);
+        has("log_work", &MAX_DETAIL_CHARS);
+        has("record_decision", &MAX_WHY_CHARS);
+        has("record_decision", &MAX_OPTION_CHARS);
+        has("record_decision", &MAX_REJECTED_REASON_CHARS);
+        has("record_decision", &MAX_REJECTED);
+        has("read_history", &MAX_HISTORY_LIMIT);
+        has("read_history", &DEFAULT_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn every_tool_the_text_core_writes_points_at_is_a_tool() {
+        for name in [
+            STAGE_DONE,
+            READ_ARTIFACT,
+            SAVE_ARTIFACT,
+            UPDATE_PLAN,
+            MOVE_CARD,
+        ] {
+            assert!(
+                TOOLS.iter().any(|t| t.name == name),
+                "core tells agents to call {name}, which is not in TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_and_a_move_require_the_stage_and_visit() {
+        for name in [STAGE_DONE, MOVE_CARD] {
+            let tool = TOOLS.iter().find(|t| t.name == name).unwrap();
+            let schema = (tool.schema)();
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(
+                required.contains(&"stage") && required.contains(&"visit"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

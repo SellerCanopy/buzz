@@ -29,7 +29,7 @@ pub async fn call(app: &App, method: &str, pubkey: &str, body: Value) -> (Status
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body.to_string()))
         .unwrap();
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(app), app.clone());
+    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

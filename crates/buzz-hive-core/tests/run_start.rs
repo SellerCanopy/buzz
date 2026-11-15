@@ -5,7 +5,6 @@ mod common;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::run::RunState;
 use buzz_hive_core::orchestrator::cards::{create_card, NewCard};
-use buzz_hive_core::orchestrator::outbox::drain_outbox;
 use buzz_hive_core::orchestrator::run::start_run;
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::OpError;
@@ -200,7 +199,7 @@ async fn start_run_queues_the_status_and_the_task_and_moves_the_card_to_running(
 async fn draining_posts_the_status_then_the_task_and_records_the_thread() {
     let (f, card_id) = ready().await;
     start_run(&f.env(), &person(), card_id).await.unwrap();
-    let drained = drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    let drained = f.drain().await.unwrap();
     assert_eq!((drained.posted, drained.failed), (2, 0));
     let posts = f.relay.posts();
     assert_eq!(posts.len(), 2);
@@ -229,7 +228,7 @@ async fn draining_posts_the_status_then_the_task_and_records_the_thread() {
         .all(|r| r.done_at.is_some()));
 
     // Nothing left to send.
-    let again = drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    let again = f.drain().await.unwrap();
     assert_eq!(again.posted, 0);
     assert_eq!(f.relay.posts().len(), 2);
 }
@@ -240,7 +239,7 @@ async fn a_failed_post_is_retried_with_the_same_key_and_the_relay_records_one_po
     f.relay = FakeRelay::new().failing_first(1);
     start_run(&f.env(), &person(), card_id).await.unwrap();
 
-    let first = drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    let first = f.drain().await.unwrap();
     assert_eq!((first.posted, first.failed), (0, 1));
     assert!(first.first_error.unwrap().contains("the relay is down"));
     // The status failed, so the task of the same card did not overtake it.
@@ -257,7 +256,7 @@ async fn a_failed_post_is_retried_with_the_same_key_and_the_relay_records_one_po
         assert!(rows.iter().all(|r| r.done_at.is_none()));
     }
 
-    let second = drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    let second = f.drain().await.unwrap();
     assert_eq!((second.posted, second.failed), (2, 0));
     let posts = f.relay.posts();
     assert_eq!(posts.len(), 2, "one post per key");
@@ -273,7 +272,7 @@ async fn a_post_repeated_after_a_crash_is_the_same_relay_event() {
     // The post reached the relay, then the process died before the row was marked done.
     let (f, card_id) = ready().await;
     start_run(&f.env(), &person(), card_id).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     let before = f.relay.posts();
 
     let mut tx = f.store.begin(COMMUNITY).await.unwrap();
@@ -327,7 +326,7 @@ async fn a_run_after_an_ended_one_gets_the_next_visit_and_posts_again() {
     }
     let (second, _) = start_run(&f.env(), &person(), card_id).await.unwrap();
     assert_eq!(second.visit, 2);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     let keys: Vec<String> = f.relay.posts().into_iter().map(|p| p.key).collect();
     assert_eq!(keys.len(), 4, "{keys:?}");
     assert!(keys.contains(&format!("kiln:{card_id}:research:2")));

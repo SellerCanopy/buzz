@@ -1,6 +1,7 @@
 //! Connection and migrator for the `hive` schema.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -8,13 +9,54 @@ use sqlx::PgPool;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 const SCHEMA_LOCK: i64 = 0x0062_6565_6869_7665; // "beehive"
 
+/// How a pool is sized and bounded.
+///
+/// The default matches a plain `connect`: ten connections, sqlx's 30 second acquire
+/// timeout and no server-side timeouts. The service sets all of them.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Most connections the pool opens.
+    pub max_connections: u32,
+    /// How long a caller waits for a free connection before the call fails.
+    pub acquire_timeout: Duration,
+    /// Server-side `statement_timeout` for every connection, when set.
+    pub statement_timeout: Option<Duration>,
+    /// Server-side `lock_timeout` for every connection, when set. A lock wait that long
+    /// fails the statement instead of queueing behind a stuck writer.
+    pub lock_timeout: Option<Duration>,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            acquire_timeout: Duration::from_secs(30),
+            statement_timeout: None,
+            lock_timeout: None,
+        }
+    }
+}
+
 /// Connect with a search path of `hive`. That puts sqlx's default
 /// `_sqlx_migrations` table in `hive`, so no table-name override is needed and
 /// the relay's `public._sqlx_migrations` is untouched.
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
-    let options = PgConnectOptions::from_str(url)?.options([("search_path", "hive")]);
+    connect_with(url, &PoolConfig::default()).await
+}
+
+/// [`connect`] with an explicit size and timeouts.
+pub async fn connect_with(url: &str, config: &PoolConfig) -> Result<PgPool, sqlx::Error> {
+    let mut settings = vec![("search_path", "hive".to_owned())];
+    if let Some(timeout) = config.statement_timeout {
+        settings.push(("statement_timeout", timeout.as_millis().to_string()));
+    }
+    if let Some(timeout) = config.lock_timeout {
+        settings.push(("lock_timeout", timeout.as_millis().to_string()));
+    }
+    let options = PgConnectOptions::from_str(url)?.options(settings);
     PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.max_connections)
+        .acquire_timeout(config.acquire_timeout)
         .connect_with(options)
         .await
 }

@@ -89,9 +89,7 @@ async fn layers_for<'a>(
     let mut name = String::new();
     if let Some(workflow) = workflow {
         if matches!(scope, Scope::Workflow(_)) && env.catalog.get(&workflow).is_none() {
-            return Err(OpError::NotFound(format!(
-                "workflow {workflow} does not exist"
-            )));
+            return Err(OpError::NotFound(env.catalog.absent(&workflow)));
         }
         layers.workflow = Layer::new(
             format!("workflow {workflow}"),

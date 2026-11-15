@@ -3,6 +3,7 @@
 use std::future::Future;
 
 use axum::body::Bytes;
+use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{post, MethodRouter};
 use axum::Json;
@@ -36,19 +37,19 @@ impl Ctx {
 /// A POST route that needs `needs`. The body is Connect JSON; an empty body means `{}`.
 ///
 /// Add it to a router that goes through [`crate::finish`], which caps the body at 16 MiB.
-pub fn unary<S, Req, Res, F, Fut>(app: App, needs: Level, f: F) -> MethodRouter<S>
+pub fn unary<Req, Res, F, Fut>(needs: Level, f: F) -> MethodRouter<App>
 where
-    S: Clone + Send + Sync + 'static,
     Req: serde::de::DeserializeOwned + Send + 'static,
     Res: serde::Serialize + Send + 'static,
     F: Fn(App, Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<Res, HiveError>> + Send + 'static,
 {
-    post(move |headers: HeaderMap, body: Bytes| {
-        let app = app.clone();
-        let f = f.clone();
-        async move { handle(app, needs, f, headers, body).await }
-    })
+    post(
+        move |State(app): State<App>, headers: HeaderMap, body: Bytes| {
+            let f = f.clone();
+            async move { handle(app, needs, f, headers, body).await }
+        },
+    )
 }
 
 async fn handle<Req, Res, F, Fut>(

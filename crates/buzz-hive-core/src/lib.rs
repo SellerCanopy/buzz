@@ -12,6 +12,7 @@ pub mod orchestrator;
 pub mod ports;
 pub mod resolve;
 pub mod rules;
+pub mod tool_names;
 pub mod workflow;
 
 #[cfg(any(test, feature = "testing"))]

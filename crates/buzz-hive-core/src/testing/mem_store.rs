@@ -7,9 +7,9 @@ use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
 use crate::domain::run::{Run, RunState};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId,
-    Directory, EventsRepo, OutboxRepo, OutboxRow, Posting, Pubkey, RunsRepo, SettingsRepo,
-    StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
+    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
+    CommunityId, Directory, EventsRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, Pubkey,
+    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, Tx, WorkflowsRepo,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -590,6 +590,7 @@ impl OutboxRepo for MemTx {
             posting: posting.clone(),
             created_at: chrono::Utc::now(),
             done_at: None,
+            claimed_at: None,
             attempts: 0,
             last_error: None,
         };
@@ -597,20 +598,48 @@ impl OutboxRepo for MemTx {
         Ok(true)
     }
 
-    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError> {
-        Ok(self
+    async fn claim_next(
+        &mut self,
+        skip_cards: &[uuid::Uuid],
+        lease: std::time::Duration,
+    ) -> Result<Option<OutboxRow>, StoreError> {
+        let now = chrono::Utc::now();
+        let community = self.community;
+        let pending: Vec<(i64, uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> = self
             .work
             .outbox
             .iter()
-            .find(|(c, row)| {
-                *c == self.community && row.done_at.is_none() && !skip_cards.contains(&row.card_id)
-            })
-            .map(|(_, row)| row.clone()))
+            .filter(|(c, row)| *c == community && row.done_at.is_none())
+            .map(|(_, row)| (row.id, row.card_id, row.claimed_at))
+            .collect();
+        let live = |at: Option<chrono::DateTime<chrono::Utc>>| {
+            at.is_some_and(|at| now - at < chrono::Duration::from_std(lease).unwrap_or_default())
+        };
+        // Rows are in id order, so the first pending row of a card is its oldest.
+        let mut seen: Vec<uuid::Uuid> = Vec::new();
+        let mut pick = None;
+        for (id, card, claimed) in pending {
+            if seen.contains(&card) {
+                continue;
+            }
+            seen.push(card);
+            if !skip_cards.contains(&card) && !live(claimed) {
+                pick = Some(id);
+                break;
+            }
+        }
+        let Some(id) = pick else {
+            return Ok(None);
+        };
+        let row = self.outbox_row(id)?;
+        row.claimed_at = Some(now);
+        Ok(Some(row.clone()))
     }
 
     async fn mark_done(&mut self, id: i64) -> Result<(), StoreError> {
         let row = self.outbox_row(id)?;
         row.done_at = Some(chrono::Utc::now());
+        row.claimed_at = None;
         Ok(())
     }
 
@@ -618,6 +647,7 @@ impl OutboxRepo for MemTx {
         let row = self.outbox_row(id)?;
         row.attempts += 1;
         row.last_error = Some(error.to_owned());
+        row.claimed_at = None;
         Ok(())
     }
 
@@ -629,6 +659,22 @@ impl OutboxRepo for MemTx {
             .filter(|(c, _)| *c == self.community)
             .map(|(_, row)| row.clone())
             .collect())
+    }
+
+    async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError> {
+        let waiting = self
+            .work
+            .outbox
+            .iter()
+            .filter(|(c, row)| *c == self.community && row.done_at.is_none());
+        let (mut pending, mut failed) = (0, 0);
+        for (_, row) in waiting {
+            pending += 1;
+            if row.attempts > 0 {
+                failed += 1;
+            }
+        }
+        Ok(OutboxBacklog { pending, failed })
     }
 
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
@@ -813,6 +859,7 @@ impl MemTx {
 pub struct FakeDirectory {
     roles: HashMap<Pubkey, RelayRole>,
     owners: HashMap<Pubkey, Pubkey>,
+    deactivated: Vec<Pubkey>,
     agents: Vec<AgentInfo>,
     channels: HashMap<uuid::Uuid, Vec<Pubkey>>,
 }
@@ -829,6 +876,12 @@ impl FakeDirectory {
 
     pub fn with_agent(mut self, agent: &str, owner: &str) -> Self {
         self.owners.insert(agent.to_owned(), owner.to_owned());
+        self
+    }
+
+    /// Switches `pubkey` off in Buzz. It keeps its owner.
+    pub fn with_deactivated(mut self, pubkey: &str) -> Self {
+        self.deactivated.push(pubkey.to_owned());
         self
     }
 
@@ -861,12 +914,15 @@ impl Directory for FakeDirectory {
         Ok(self.roles.get(pubkey).copied())
     }
 
-    async fn agent_owner(
+    async fn agent_link(
         &self,
         _community: CommunityId,
         pubkey: &str,
-    ) -> Result<Option<Pubkey>, StoreError> {
-        Ok(self.owners.get(pubkey).cloned())
+    ) -> Result<Option<AgentLink>, StoreError> {
+        Ok(self.owners.get(pubkey).map(|owner| AgentLink {
+            owner: owner.clone(),
+            deactivated: self.deactivated.iter().any(|d| d == pubkey),
+        }))
     }
 
     async fn agents_named(

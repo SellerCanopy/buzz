@@ -12,9 +12,8 @@ use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::orchestrator::cards::{create_card, set_card_workflow, CardMove, NewCard};
-use buzz_hive_core::orchestrator::outbox::drain_outbox;
 use buzz_hive_core::orchestrator::run::{
-    move_card, pause_card, resume_card, skip_stage, stage_done, start_run, start_run_at,
+    move_card, pause_card, resume_card, skip_stage, start_run, start_run_at,
 };
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::OpError;
@@ -56,16 +55,14 @@ async fn started(workflow: &str) -> (Fixture, Uuid) {
     .await
     .unwrap();
     start_run(&f.env(), &person(), card.id).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     (f, card.id)
 }
 
 /// The agent reports `result`, and the posts it caused reach the relay.
 async fn report(f: &Fixture, card: Uuid, result: &str) -> (Run, Vec<Event>) {
-    let done = stage_done(&f.env(), &builder(), card, result, "")
-        .await
-        .unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    let done = f.report(&builder(), card, result, "").await.unwrap();
+    f.drain().await.unwrap();
     done
 }
 
@@ -221,18 +218,41 @@ async fn a_held_stage_waits_for_resume_card() {
             .count(),
         1
     );
-    let error = stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap_err();
+    let error = f.report(&builder(), card, "passed", "").await.unwrap_err();
     assert!(refused(error).contains("run is paused"));
 
     let (run, events) = resume_card(&f.env(), &person(), card).await.unwrap();
     assert_eq!(run.state, RunState::Running);
     assert_eq!(kinds(&events), ["run.resumed", "card.state"]);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     assert!(root_of(&f, card, "b", 1).await.is_some());
     let (run, _) = report(&f, card, "passed").await;
     assert_eq!(run.state, RunState::Ended);
+}
+
+#[tokio::test]
+async fn an_agent_may_not_skip_pause_or_resume_a_card() {
+    let (f, card) = started("three").await;
+    // The stage's own agent, and any other agent, are refused the same way.
+    for who in [builder(), ctx_for("cc", ActorKind::Agent)] {
+        for (call, result) in [
+            ("skip", skip_stage(&f.env(), &who, card).await),
+            ("pause", pause_card(&f.env(), &who, card).await),
+            ("resume", resume_card(&f.env(), &who, card).await),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, OpError::PermissionDenied(ref m) if m.contains("only a person")),
+                "{call}: {error:?}"
+            );
+        }
+    }
+    // Nothing changed: a person can still pause the card, which was running.
+    let (run, _) = pause_card(&f.env(), &person(), card).await.unwrap();
+    assert_eq!(run.state, RunState::Paused);
+    // And a refused agent did not get to resume or skip it.
+    assert!(resume_card(&f.env(), &builder(), card).await.is_err());
+    assert_eq!(card_state(&f, card).await, CardState::Waiting);
 }
 
 #[tokio::test]
@@ -243,14 +263,12 @@ async fn pausing_a_running_card_refuses_the_agent_and_resume_tells_it_to_carry_o
     assert_eq!(kinds(&events), ["run.paused", "card.state"]);
     let error = pause_card(&f.env(), &person(), card).await.unwrap_err();
     assert!(refused(error).contains("only a running card"));
-    let error = stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap_err();
+    let error = f.report(&builder(), card, "passed", "").await.unwrap_err();
     assert!(refused(error).contains("run is paused"));
 
     let (run, _) = resume_card(&f.env(), &person(), card).await.unwrap();
     assert_eq!(run.state, RunState::Running);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     let root = root_of(&f, card, "a", 1).await.unwrap();
     let reply = f.relay.posts().into_iter().last().unwrap();
     assert_eq!(reply.root.as_deref(), Some(root.as_str()));
@@ -349,7 +367,7 @@ async fn a_finished_card_is_handed_to_the_next_workflow() {
     // The row has no pause list, so the package's own pause on b stands.
     report(&f, card, "passed").await;
     resume_card(&f.env(), &person(), card).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     let (run, events) = report(&f, card, "passed").await;
     assert_eq!(run.state, RunState::Ended);
     assert!(
@@ -366,7 +384,7 @@ async fn a_finished_card_is_handed_to_the_next_workflow() {
     assert_eq!(active.workflow, "second");
     assert_eq!(active.current_stage.as_deref(), Some("s1"));
     drop(tx);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     assert!(root_of(&f, card, "s1", 1).await.is_some());
 }
 
@@ -400,9 +418,7 @@ async fn a_next_workflow_that_does_not_exist_leaves_the_card_done_with_a_note() 
 #[tokio::test]
 async fn an_agent_moves_the_card_only_when_the_workflow_allows_it() {
     let (f, card) = started("three").await;
-    let error = move_card(&f.env(), &builder(), card, "c")
-        .await
-        .unwrap_err();
+    let error = f.move_to(&builder(), card, "c").await.unwrap_err();
     assert!(refused(error).contains("side_effects.agent_moves_cards"));
 
     set_setting(
@@ -415,19 +431,56 @@ async fn an_agent_moves_the_card_only_when_the_workflow_allows_it() {
     .await
     .unwrap();
     // A person is not the stage's agent.
-    let error = move_card(&f.env(), &person(), card, "c").await.unwrap_err();
+    let error = f.move_to(&person(), card, "c").await.unwrap_err();
     assert!(matches!(error, OpError::PermissionDenied(_)), "{error:?}");
-    let error = move_card(&f.env(), &builder(), card, "nope")
-        .await
-        .unwrap_err();
+    let error = f.move_to(&builder(), card, "nope").await.unwrap_err();
     assert!(matches!(error, OpError::InvalidArgument(_)), "{error:?}");
 
-    let (run, events) = move_card(&f.env(), &builder(), card, "c").await.unwrap();
+    let (run, events) = f.move_to(&builder(), card, "c").await.unwrap();
     assert_eq!(run.current_stage.as_deref(), Some("c"));
     assert_eq!(kinds(&events), ["stage.routed"]);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     assert!(root_of(&f, card, "c", 1).await.is_some());
     assert!(root_of(&f, card, "b", 1).await.is_none());
+}
+
+#[tokio::test]
+async fn a_move_names_the_stage_and_visit_it_is_made_from() {
+    let (f, card) = started("three").await;
+    set_setting(
+        &f.env(),
+        &person(),
+        &Scope::Workflow("three".into()),
+        "side_effects.agent_moves_cards",
+        Some(json!(true)),
+    )
+    .await
+    .unwrap();
+    for (stage, visit) in [("", 1), ("a", 0)] {
+        let error = move_card(&f.env(), &builder(), card, stage, visit, "c")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OpError::InvalidArgument(_)),
+            "{stage:?} {visit}: {error:?}"
+        );
+    }
+    // The card is at `a`, visit 1. A move from `b`, or from a visit it has not reached, is
+    // stale.
+    for (stage, visit) in [("b", 1), ("a", 2)] {
+        let error = move_card(&f.env(), &builder(), card, stage, visit, "c")
+            .await
+            .unwrap_err();
+        assert!(
+            refused(error).contains(&format!("stage {stage} visit {visit}")),
+            "{stage} {visit}"
+        );
+    }
+    assert_eq!(f.at(card).await, ("a".to_owned(), 1));
+    let (run, _) = move_card(&f.env(), &builder(), card, "a", 1, "c")
+        .await
+        .unwrap();
+    assert_eq!(run.current_stage.as_deref(), Some("c"));
 }
 
 #[tokio::test]
@@ -519,7 +572,7 @@ async fn a_run_started_at_a_later_stage_begins_there() {
         .unwrap();
     assert_eq!(run.current_stage.as_deref(), Some("b"));
     assert_eq!(run.steps.len(), 1);
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     assert!(root_of(&f, card.id, "b", 1).await.is_some());
     assert!(root_of(&f, card.id, "a", 1).await.is_none());
 }
@@ -532,9 +585,7 @@ async fn a_report_that_cannot_reach_the_next_agent_is_refused_and_changes_nothin
         .with_named_agent("builder", BUILDER, "aa")
         .with_channel(CHANNEL, &[common::HIVE]);
     let f = Fixture { directory, ..f };
-    let error = stage_done(&f.env(), &builder(), card, "passed", "")
-        .await
-        .unwrap_err();
+    let error = f.report(&builder(), card, "passed", "").await.unwrap_err();
     assert!(refused(error).contains("add builder to the update channel"));
     let mut tx = f.store.begin(COMMUNITY).await.unwrap();
     let run = tx.runs().active_for_card(card).await.unwrap().unwrap();

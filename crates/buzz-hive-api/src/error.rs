@@ -19,6 +19,9 @@ pub enum HiveError {
     AlreadyExists(String),
     #[error("{0}")]
     Unavailable(String),
+    /// The caller is over a rate limit. Trying again later works.
+    #[error("{0}")]
+    ResourceExhausted(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -33,6 +36,7 @@ impl HiveError {
             Self::FailedPrecondition(_) => "failed_precondition",
             Self::AlreadyExists(_) => "already_exists",
             Self::Unavailable(_) => "unavailable",
+            Self::ResourceExhausted(_) => "resource_exhausted",
             Self::Internal(_) => "internal",
         }
     }
@@ -46,6 +50,7 @@ impl HiveError {
             Self::InvalidArgument(_) => S::BAD_REQUEST,
             Self::FailedPrecondition(_) | Self::AlreadyExists(_) => S::CONFLICT,
             Self::Unavailable(_) => S::SERVICE_UNAVAILABLE,
+            Self::ResourceExhausted(_) => S::TOO_MANY_REQUESTS,
             Self::Internal(_) => S::INTERNAL_SERVER_ERROR,
         }
     }
@@ -66,6 +71,7 @@ impl From<StoreError> for HiveError {
             }
             StoreError::Conflict(message) => Self::FailedPrecondition(message),
             StoreError::NotFound(message) => Self::NotFound(message),
+            StoreError::Internal(cause) => Self::internal(cause),
         }
     }
 }
@@ -84,6 +90,11 @@ impl From<OpError> for HiveError {
 
 impl axum::response::IntoResponse for HiveError {
     fn into_response(self) -> axum::response::Response {
+        // A refusal the caller caused is not an error here, but it should be findable: the
+        // request span names the route and the request id.
+        if !self.status().is_server_error() {
+            tracing::info!(code = self.code(), message = %self, "request refused");
+        }
         let body = serde_json::json!({ "code": self.code(), "message": self.to_string() });
         (self.status(), axum::Json(body)).into_response()
     }

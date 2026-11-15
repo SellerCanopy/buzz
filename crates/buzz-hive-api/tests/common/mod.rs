@@ -30,18 +30,17 @@ pub fn community() -> CommunityId {
     CommunityId::from_u128(1)
 }
 
-/// `OWNER` is Admin, `MEMBER` is Read, `AGENT` belongs to `OWNER` and has been given Run.
-pub async fn app(store: MemStore) -> App {
-    let directory = FakeDirectory::new()
+/// `OWNER` is a relay owner, `MEMBER` a relay member, and `AGENT` belongs to `OWNER`.
+pub fn people() -> FakeDirectory {
+    FakeDirectory::new()
         .with_role(OWNER, RelayRole::Owner)
         .with_role(MEMBER, RelayRole::Member)
-        .with_agent(AGENT, OWNER);
-    let mut tx = store.begin(community()).await.unwrap();
-    tx.access()
-        .set_level(AGENT, Level::Run, ActorKind::Agent, OWNER)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+        .with_agent(AGENT, OWNER)
+}
+
+/// An app over `store` and `directory`, with the built-in workflows and the Beehive account
+/// `HIVE`. Nothing is stored in it yet.
+pub fn app_with(directory: FakeDirectory, store: MemStore) -> App {
     App {
         config: Arc::new(ApiConfig {
             public_url: "http://hive.test".into(),
@@ -53,6 +52,7 @@ pub async fn app(store: MemStore) -> App {
             TokenMinter::new(b"0123456789abcdef0123456789abcdef", Arc::new(SystemClock)).unwrap(),
         ),
         replay: Arc::new(ReplayGuard::new(REPLAY_TTL)),
+        auth_limit: buzz_hive_api::rate::auth_limiter(),
         bus: Bus::new(0),
         catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
@@ -61,8 +61,19 @@ pub async fn app(store: MemStore) -> App {
     }
 }
 
+/// [`people`], where `OWNER` is Admin, `MEMBER` is Read, and `AGENT` has been given Run.
+pub async fn app(store: MemStore) -> App {
+    let mut tx = store.begin(community()).await.unwrap();
+    tx.access()
+        .set_level(AGENT, Level::Run, ActorKind::Agent, OWNER)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    app_with(people(), store)
+}
+
 pub fn router(app: &App) -> Router {
-    buzz_hive_api::finish(buzz_hive_api::routes(app), app.clone())
+    buzz_hive_api::finish(buzz_hive_api::routes(), app.clone())
 }
 
 pub async fn call(

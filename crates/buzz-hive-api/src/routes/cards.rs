@@ -3,7 +3,6 @@
 use buzz_hive_core::domain::card::Card as DomainCard;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::orchestrator::cards::{self, CardMove, NewCard};
-use buzz_hive_core::orchestrator::Env;
 use uuid::Uuid;
 
 use crate::app::App;
@@ -163,15 +162,10 @@ pub async fn set_card_workflow(
             })
         })
         .collect::<Result<Vec<_>, HiveError>>()?;
-    let catalog = app.catalog.load();
-    let env = Env {
-        store: app.store.as_ref(),
-        directory: app.directory.as_ref(),
-        catalog: &catalog,
-        hive: &app.hive_pubkey,
-    };
-    let (cards, events) = cards::set_card_workflow(&env, &ctx.op(), &moves).await?;
-    app.bus.publish(&events);
+    // Sorting cards queues no post, so it needs no relay account.
+    let op = app.op(false)?;
+    let (cards, events) = cards::set_card_workflow(&op.env(), &ctx.op(), &moves).await?;
+    op.settle(&events);
     Ok(SetCardWorkflowResponse {
         cards: cards.into_iter().map(|c| to_proto(c, false)).collect(),
     })

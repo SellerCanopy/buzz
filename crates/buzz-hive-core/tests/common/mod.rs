@@ -25,7 +25,12 @@ pub fn agent() -> Ctx {
     ctx_for("bb", ActorKind::Agent)
 }
 
-use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::domain::events::Event;
+use buzz_hive_core::domain::run::Run;
+use buzz_hive_core::orchestrator::outbox::{drain_outbox, Drained};
+use buzz_hive_core::orchestrator::run::{move_card, stage_done};
+use buzz_hive_core::orchestrator::{Env, OpError};
+use buzz_hive_core::ports::store::{Store, StoreError};
 use buzz_hive_core::testing::{FakeDirectory, FakeRelay, MemStore};
 use buzz_hive_core::workflow::load::{load, Catalog};
 use buzz_hive_core::workflow::source::{MemSource, Source};
@@ -172,6 +177,46 @@ impl Fixture {
     pub fn with_directory(mut self, directory: FakeDirectory) -> Self {
         self.directory = directory;
         self
+    }
+
+    /// One pass over the outbox, with nothing skipped and no stop signal.
+    pub async fn drain(&self) -> Result<Drained, StoreError> {
+        let (_stop, running) = tokio::sync::watch::channel(false);
+        drain_outbox(&self.env(), COMMUNITY, &self.relay, &[], &running).await
+    }
+
+    /// The stage and visit the card's run is at now, as a stage task names them. A card with
+    /// no run in progress has none, so this gives a placeholder the operation then refuses
+    /// for the run's state.
+    pub async fn at(&self, card: uuid::Uuid) -> (String, u32) {
+        let mut tx = self.store.begin(COMMUNITY).await.unwrap();
+        match tx.runs().active_for_card(card).await.unwrap() {
+            Some(run) => (run.current_stage.unwrap_or_default(), run.visit),
+            None => ("none".into(), 1),
+        }
+    }
+
+    /// `stage_done` for the stage and visit the card is at.
+    pub async fn report(
+        &self,
+        who: &Ctx,
+        card: uuid::Uuid,
+        result: &str,
+        summary: &str,
+    ) -> Result<(Run, Vec<Event>), OpError> {
+        let (stage, visit) = self.at(card).await;
+        stage_done(&self.env(), who, card, &stage, visit, result, summary).await
+    }
+
+    /// `move_card` from the stage and visit the card is at.
+    pub async fn move_to(
+        &self,
+        who: &Ctx,
+        card: uuid::Uuid,
+        target: &str,
+    ) -> Result<(Run, Vec<Event>), OpError> {
+        let (stage, visit) = self.at(card).await;
+        move_card(&self.env(), who, card, &stage, visit, target).await
     }
 
     pub fn env(&self) -> Env<'_> {

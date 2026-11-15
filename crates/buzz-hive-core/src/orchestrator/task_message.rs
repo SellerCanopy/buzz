@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::workflow::Stage;
+use crate::tool_names::{READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN};
 use crate::workflow::load::Package;
 use crate::workflow::routes::reportable_results;
 use crate::workflow::template::{find_vars, known_variable, param_variable, variables};
@@ -24,6 +25,20 @@ pub struct CardText<'a> {
 /// A text input under this many bytes is written into the task. A larger one is named, and
 /// the agent reads it with `read_artifact`.
 pub const INLINE_LIMIT: usize = 8 * 1024;
+
+/// The most bytes the relay takes in one message.
+pub const MAX_POST_BYTES: usize = 64 * 1024;
+
+/// Bytes [`render_task`] leaves free for what is added after it: the card link every first
+/// post of a thread ends with, and a round's line.
+const TAIL_RESERVE: usize = 2 * 1024;
+
+/// The most bytes [`render_task`] writes.
+pub const TASK_BUDGET: usize = MAX_POST_BYTES - TAIL_RESERVE;
+
+/// Ends a description cut short to fit the message.
+pub const DESCRIPTION_CUT: &str =
+    "\n\n(description cut here to fit the message; the whole text is on the card)";
 
 /// What the stage's agent is told about one artifact it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +75,9 @@ pub struct Handoff {
     pub brief: String,
     /// The channel the task is posted in, which a file is posted in too.
     pub channel: Option<uuid::Uuid>,
+    /// The visit the task opens. The agent passes it back with the stage's id, so a report
+    /// for an earlier visit cannot move the card on from this one.
+    pub visit: u32,
 }
 
 /// The id buzz-app registers Beehive under (`PLUGIN_ID` in `src/features/beehive/routes.ts`).
@@ -85,10 +103,60 @@ pub fn with_card_link(text: &str, card: uuid::Uuid) -> String {
 /// variables filled in, and the instruction to report a result. A stage that runs a plugin
 /// command starts with the command line instead, because the agent reads a leading slash as
 /// the command, and the card follows it. `params` are the resolved `params.<name>` values.
+///
+/// The message stays within [`TASK_BUDGET`] bytes, so the instruction to report a result, which
+/// ends it, always reaches the agent. A description too long for that is cut, wherever it is
+/// written, and ends with [`DESCRIPTION_CUT`]. Everything else is written whole.
 pub fn render_task(
     package: &Package,
     stage: &Stage,
     card: &CardText<'_>,
+    params: &BTreeMap<String, String>,
+    handoff: &Handoff,
+) -> Result<String, String> {
+    let render =
+        |description: &str| render_with(package, stage, card, description, params, handoff);
+    let full = render(card.description)?;
+    if full.len() <= TASK_BUDGET || card.description.is_empty() {
+        return Ok(full);
+    }
+    // What is left once the description is gone is what the cut one must fit in. The
+    // description may be written more than once, and a quote in a command's arguments grows
+    // when it is escaped, so the first guess is corrected until the message fits.
+    let base = render("")?;
+    let copies = (full.len() - base.len())
+        .div_ceil(card.description.len())
+        .max(1);
+    let mut allow = TASK_BUDGET.saturating_sub(base.len()) / copies;
+    loop {
+        let text = render(&cut_description(card.description, allow))?;
+        if text.len() <= TASK_BUDGET || allow == 0 {
+            return Ok(text);
+        }
+        allow -= (text.len() - TASK_BUDGET).div_ceil(copies).clamp(1, allow);
+    }
+}
+
+/// `description` as it is, or cut at a character boundary so that it and [`DESCRIPTION_CUT`]
+/// take at most `allow` bytes. Nothing is left when there is not room for the marker.
+fn cut_description(description: &str, allow: usize) -> String {
+    if description.len() <= allow {
+        return description.to_owned();
+    }
+    let Some(mut end) = allow.checked_sub(DESCRIPTION_CUT.len()).filter(|n| *n > 0) else {
+        return String::new();
+    };
+    while !description.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{DESCRIPTION_CUT}", &description[..end])
+}
+
+fn render_with(
+    package: &Package,
+    stage: &Stage,
+    card: &CardText<'_>,
+    description: &str,
     params: &BTreeMap<String, String>,
     handoff: &Handoff,
 ) -> Result<String, String> {
@@ -100,15 +168,15 @@ pub fn render_task(
         .map(|v| (v.name, String::new()))
         .collect();
     values.insert("issue.title".into(), card.title.to_owned());
-    values.insert("issue.body".into(), card.description.to_owned());
+    values.insert("issue.body".into(), description.to_owned());
     values.insert("stage.results".into(), results.join(", "));
     for (name, value) in params {
         values.insert(format!("params.{name}"), value.clone());
     }
-    let card_block = match (card.title.is_empty(), card.description.is_empty()) {
+    let card_block = match (card.title.is_empty(), description.is_empty()) {
         (_, true) => card.title.to_owned(),
-        (true, false) => card.description.to_owned(),
-        (false, false) => format!("{}\n\n{}", card.title, card.description),
+        (true, false) => description.to_owned(),
+        (false, false) => format!("{}\n\n{description}", card.title),
     };
     let body = if stage.command.is_empty() {
         render_template(&text, &values)
@@ -135,16 +203,20 @@ pub fn render_task(
     parts.push(handoff.brief.clone());
     parts.push(inputs_section(&handoff.inputs));
     parts.push(outputs_section(stage, card.id, handoff.channel));
-    parts.push(format!(
-        "When you are done, call the Beehive tool `stage_done` with card_id `{}` and result one of: {}.",
-        card.id,
-        results.join(", ")
-    ));
+    parts.push(done_line(card.id, &stage.id, handoff.visit, &results));
     Ok(parts
         .into_iter()
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+/// The instruction to report a result: which tool, and the card, stage and visit it takes.
+pub fn done_line(card: uuid::Uuid, stage: &str, visit: u32, results: &[String]) -> String {
+    format!(
+        "When you are done, call the Beehive tool `{STAGE_DONE}` with card_id `{card}`, stage `{stage}`, visit {visit} and result one of: {}.",
+        results.join(", ")
+    )
 }
 
 /// The longest run of backticks in `text`, so a fence can be longer.
@@ -188,7 +260,7 @@ fn inputs_section(inputs: &[InputView]) -> String {
                 )
             }
             InputState::Text { version, bytes, .. } => format!(
-                "- `{name}` (text, version {version}, {}): too long to write here. Read it with the Beehive tool `read_artifact`.",
+                "- `{name}` (text, version {version}, {}): too long to write here. Read it with the Beehive tool `{READ_ARTIFACT}`.",
                 human_bytes(*bytes)
             ),
             InputState::File {
@@ -217,15 +289,15 @@ fn outputs_section(stage: &Stage, card: uuid::Uuid, channel: Option<uuid::Uuid>)
     }
     if !plan.is_empty() {
         lines.push(format!(
-            "- `{plan}`: the plan. Save it as a Markdown checklist, then check items off with the Beehive tool `update_plan`."
+            "- `{plan}`: the plan. Save it as a Markdown checklist, then check items off with the Beehive tool `{UPDATE_PLAN}`."
         ));
     }
     lines.push(format!(
-        "Save a document with the Beehive tool `save_artifact`, with card_id `{card}`, the artifact's name and its full text as content. Each call saves a new version."
+        "Save a document with the Beehive tool `{SAVE_ARTIFACT}`, with card_id `{card}`, the artifact's name and its full text as content. Each call saves a new version."
     ));
     let channel = channel.map_or_else(|| "<channel>".to_owned(), |c| c.to_string());
     lines.push(format!(
-        "To save a file, such as an image or a PDF, upload it with `buzz upload file --file <path>`, post the file in your own thread with `buzz messages send --channel {channel} --reply-to <the id of the message that mentioned you> --file <path> --content <name>`, then call `save_artifact` with card_id `{card}`, the artifact's name, kind `file`, and the sha256, size and type the upload printed."
+        "To save a file, such as an image or a PDF, upload it with `buzz upload file --file <path>`, post the file in your own thread with `buzz messages send --channel {channel} --reply-to <the id of the message that mentioned you> --file <path> --content <name>`, then call `{SAVE_ARTIFACT}` with card_id `{card}`, the artifact's name, kind `file`, and the sha256, size and type the upload printed."
     ));
     lines.join("\n")
 }
@@ -342,14 +414,101 @@ mod tests {
             &s,
             &card(),
             &params(&[]),
-            &Handoff::default(),
+            &Handoff {
+                visit: 3,
+                ..Handoff::default()
+            },
         )
         .unwrap();
         // `needs_work` has no route here, so the agent is not offered it.
         let want = "the bug\n\nIt breaks.\n\n\
             Fix the bug.\nIt breaks.\nPick passed, failed, needs_input, blocked.\n\n\
-            When you are done, call the Beehive tool `stage_done` with card_id `00000000-0000-0000-0000-00000000002a` and result one of: passed, failed, needs_input, blocked.";
+            When you are done, call the Beehive tool `stage_done` with card_id `00000000-0000-0000-0000-00000000002a`, stage `fix`, visit 3 and result one of: passed, failed, needs_input, blocked.";
         assert_eq!(got, want);
+    }
+
+    /// A card whose description is `unit` repeated to the most characters a card takes.
+    fn long_card(unit: &str) -> (String, CardText<'static>) {
+        let description: &'static str = Box::leak(unit.repeat(65_536).into_boxed_str());
+        (
+            description.to_owned(),
+            CardText {
+                id: CARD,
+                title: "the bug",
+                description,
+            },
+        )
+    }
+
+    #[test]
+    fn a_long_description_is_cut_so_the_report_instruction_still_ends_the_task() {
+        // One byte, two bytes and four bytes a character, each at the most the card takes.
+        for unit in ["x", "\u{e9}", "\u{1f41d}"] {
+            let (description, card) = long_card(unit);
+            let handoff = Handoff {
+                visit: 2,
+                ..Handoff::default()
+            };
+            let s = stage("Fix {{issue.title}}.");
+            let got = render_task(&package(&[]), &s, &card, &params(&[]), &handoff).unwrap();
+            assert!(got.len() <= TASK_BUDGET, "{unit}: {} bytes", got.len());
+            let done = done_line(CARD, "fix", 2, &reportable_results(&s));
+            assert!(got.ends_with(&done), "{unit}: the instruction was cut");
+            assert!(got.contains(DESCRIPTION_CUT), "{unit}: no marker");
+            // The cut is made at a character, and keeps the start of the description.
+            let kept = got
+                .split(DESCRIPTION_CUT)
+                .next()
+                .unwrap()
+                .strip_prefix("the bug\n\n")
+                .unwrap();
+            assert!(description.starts_with(kept) && !kept.is_empty(), "{unit}");
+            // With the link and a round's line added after it, the post still fits whole.
+            let post = format!(
+                "{}\n\n{}",
+                with_card_link(&got, CARD),
+                "x".repeat(TAIL_RESERVE - 200)
+            );
+            assert!(post.len() <= MAX_POST_BYTES, "{unit}: {} bytes", post.len());
+        }
+    }
+
+    #[test]
+    fn a_description_written_twice_or_in_a_command_still_leaves_room_for_the_instruction() {
+        let (_, card) = long_card("'");
+        // In the prompt too, and the quotes grow when a command's arguments escape them.
+        let prompt = stage("A {{issue.body}} B {{issue.body}}");
+        let mut command = stage("");
+        command.command = "review".into();
+        command.args = "'{{issue.body}}'".into();
+        for s in [prompt, command] {
+            let got =
+                render_task(&package(&[]), &s, &card, &params(&[]), &Handoff::default()).unwrap();
+            assert!(got.len() <= TASK_BUDGET, "{} bytes", got.len());
+            assert!(
+                got.ends_with(&done_line(CARD, "fix", 0, &reportable_results(&s))),
+                "the instruction was cut"
+            );
+        }
+    }
+
+    #[test]
+    fn a_description_that_fits_is_written_whole() {
+        let description = "d".repeat(TASK_BUDGET - 1_000);
+        let card = CardText {
+            id: CARD,
+            title: "the bug",
+            description: &description,
+        };
+        let got = render_task(
+            &package(&[]),
+            &stage("Fix."),
+            &card,
+            &params(&[]),
+            &Handoff::default(),
+        )
+        .unwrap();
+        assert!(got.contains(&description) && !got.contains(DESCRIPTION_CUT));
     }
 
     #[test]
@@ -397,7 +556,7 @@ mod tests {
             "rendered task:\n{got}"
         );
         assert!(got.ends_with(
-            "`stage_done` with card_id `00000000-0000-0000-0000-00000000002a` and result one of: passed, failed, needs_input."
+            "`stage_done` with card_id `00000000-0000-0000-0000-00000000002a`, stage `fix`, visit 0 and result one of: passed, failed, needs_input."
         ));
     }
 

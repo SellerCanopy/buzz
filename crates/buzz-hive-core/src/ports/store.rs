@@ -19,6 +19,9 @@ pub enum StoreError {
     Conflict(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A fault that retrying will not fix, such as a bad column or a failed decode.
+    #[error("store error: {0}")]
+    Internal(String),
 }
 
 #[async_trait::async_trait]
@@ -302,8 +305,19 @@ pub struct OutboxRow {
     pub posting: Posting,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub done_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a drainer last claimed the post. A claim older than its lease does not count.
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub attempts: i32,
     pub last_error: Option<String>,
+}
+
+/// The posts the relay has not taken yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxBacklog {
+    /// Posts not done, including the ones that have failed.
+    pub pending: i64,
+    /// The pending posts that failed their last attempt.
+    pub failed: i64,
 }
 
 /// Posts waiting for the relay. Written in the transaction that changes a run, so a crash
@@ -317,14 +331,24 @@ pub trait OutboxRepo: Send {
         card: uuid::Uuid,
         posting: &Posting,
     ) -> Result<bool, StoreError>;
-    /// The oldest post not done, other than those of `skip_cards`, held until the
-    /// transaction ends so two drainers never take the same one.
-    async fn next(&mut self, skip_cards: &[uuid::Uuid]) -> Result<Option<OutboxRow>, StoreError>;
+    /// Claims the next post to send: the oldest one not done of a card, other than the
+    /// cards in `skip_cards`. A card's later post is never offered while an earlier one is
+    /// not done, so posts of one card go in order even with two drainers. The claim is a
+    /// lease of `lease`, recorded in the row, so the caller can end the transaction and send
+    /// the post outside it. A post whose lease has run out is offered again.
+    async fn claim_next(
+        &mut self,
+        skip_cards: &[uuid::Uuid],
+        lease: std::time::Duration,
+    ) -> Result<Option<OutboxRow>, StoreError>;
+    /// Marks a post done and ends its claim.
     async fn mark_done(&mut self, id: i64) -> Result<(), StoreError>;
-    /// Counts a failed attempt and keeps the cause.
+    /// Counts a failed attempt, keeps the cause and ends the claim.
     async fn mark_failed(&mut self, id: i64, error: &str) -> Result<(), StoreError>;
     /// Every post, done or not, oldest first.
     async fn all(&mut self) -> Result<Vec<OutboxRow>, StoreError>;
+    /// How many posts are waiting, and how many of those have failed at least once.
+    async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError>;
     /// The post queued under `key`, done or not.
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError>;
 }
@@ -345,12 +369,12 @@ pub trait Directory: Send + Sync {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<Option<RelayRole>, StoreError>;
-    /// `Some(owner pubkey)` when the pubkey is an agent, `None` when it is a person or unknown.
-    async fn agent_owner(
+    /// `Some` when the pubkey is an agent, `None` when it is a person or unknown.
+    async fn agent_link(
         &self,
         community: CommunityId,
         pubkey: &str,
-    ) -> Result<Option<Pubkey>, StoreError>;
+    ) -> Result<Option<AgentLink>, StoreError>;
     /// Every agent whose display name is `name`, compared case-insensitively.
     async fn agents_named(
         &self,
@@ -372,6 +396,14 @@ pub trait Directory: Send + Sync {
         channel: uuid::Uuid,
         pubkey: &str,
     ) -> Result<bool, StoreError>;
+}
+
+/// How the relay ties an agent to the person who owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLink {
+    pub owner: Pubkey,
+    /// The agent was switched off in Buzz. It keeps its owner but must not act.
+    pub deactivated: bool,
 }
 
 /// A Buzz agent as the relay lists it.

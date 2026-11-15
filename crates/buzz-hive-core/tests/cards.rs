@@ -197,6 +197,30 @@ async fn restore_returns_an_archived_card_to_backlog() {
 }
 
 #[tokio::test]
+async fn restore_makes_a_card_idle_whatever_state_it_was_archived_in() {
+    for state in [CardState::Done, CardState::Stopped, CardState::Failed] {
+        let store = MemStore::new();
+        let id = Uuid::from_u128(7);
+        store.seed_card(
+            COMMUNITY,
+            buzz_hive_core::domain::card::Card {
+                id,
+                title: "finished".into(),
+                description: String::new(),
+                state,
+                workflow: "rpi".into(),
+                archived: true,
+                created_by: "aa".into(),
+            },
+        );
+        let (restored, events) = restore_card(&store, &person(), id).await.unwrap();
+        assert_eq!(restored.state, CardState::Idle, "from {state:?}");
+        assert_eq!(restored.workflow, "", "from {state:?}");
+        assert_eq!(events[0].payload["state"], "idle", "from {state:?}");
+    }
+}
+
+#[tokio::test]
 async fn an_archived_card_cannot_be_changed() {
     let store = MemStore::new();
     let (card, _) = create_card(&store, &person(), new_card("a")).await.unwrap();

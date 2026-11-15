@@ -15,11 +15,10 @@ use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
 };
-use buzz_hive_core::orchestrator::outbox::drain_outbox;
-use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, stage_done, start_run};
+use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::testing::MemStore;
-use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
+use common::{ctx_for, person, Fixture, BUILDER, CHANNEL};
 
 const CURRENT_PHASE: u8 = 9;
 
@@ -87,7 +86,7 @@ async fn run_scenarios(f: &Fixture) {
     .await
     .unwrap();
     start_run(&f.env(), &ctx, card.id).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
 }
 
 /// Phase 7: the agent reports a result, and a passed last stage ends the run.
@@ -115,9 +114,7 @@ async fn report_scenarios(f: &Fixture) {
     .unwrap();
     start_run(&f.env(), &ctx, card.id).await.unwrap();
     let agent = ctx_for(BUILDER, ActorKind::Agent);
-    stage_done(&f.env(), &agent, card.id, "passed", "done")
-        .await
-        .unwrap();
+    f.report(&agent, card.id, "passed", "done").await.unwrap();
 }
 
 /// A card on `workflow` whose run has started and whose posts have reached the relay.
@@ -135,7 +132,7 @@ async fn begun(f: &Fixture, workflow: &str) -> uuid::Uuid {
     .await
     .unwrap();
     start_run(&f.env(), &ctx, card.id).await.unwrap();
-    drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+    f.drain().await.unwrap();
     card.id
 }
 
@@ -146,10 +143,8 @@ async fn routing_scenarios(f: &Fixture) {
     let report = |card: uuid::Uuid, result: &'static str| {
         let agent = agent.clone();
         async move {
-            stage_done(&f.env(), &agent, card, result, "")
-                .await
-                .unwrap();
-            drain_outbox(&f.env(), COMMUNITY, &f.relay).await.unwrap();
+            f.report(&agent, card, result, "").await.unwrap();
+            f.drain().await.unwrap();
         }
     };
 

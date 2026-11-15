@@ -12,4 +12,14 @@ ALTER ROLE buzz_hive PASSWORD :'hive_password';
 CREATE SCHEMA IF NOT EXISTS hive AUTHORIZATION buzz_hive;
 ALTER ROLE buzz_hive SET search_path = hive;
 GRANT USAGE ON SCHEMA public TO buzz_hive;
-GRANT SELECT ON public.communities, public.channels, public.channel_members, public.relay_members, public.users TO buzz_hive;
+-- Read access is by column, and only the columns RELAY_COLUMNS in
+-- crates/buzz-hive-store/src/relay_read.rs lists. A table-wide grant would also expose
+-- every other column the relay keeps, so the table grant is revoked first (a stack set
+-- up earlier had it). Add a column here when RELAY_COLUMNS gains one: the service checks
+-- the list at startup and the roles test compares it with these grants.
+REVOKE SELECT ON public.communities, public.channels, public.channel_members, public.relay_members, public.users FROM buzz_hive;
+GRANT SELECT (id, host) ON public.communities TO buzz_hive;
+GRANT SELECT (community_id, id, archived_at, deleted_at) ON public.channels TO buzz_hive;
+GRANT SELECT (community_id, channel_id, pubkey, removed_at) ON public.channel_members TO buzz_hive;
+GRANT SELECT (community_id, pubkey, role) ON public.relay_members TO buzz_hive;
+GRANT SELECT (community_id, pubkey, agent_owner_pubkey, display_name, deactivated_at) ON public.users TO buzz_hive;
