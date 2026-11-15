@@ -1,0 +1,10 @@
+{
+  "number": 42,
+  "title": "Crash when saving a draft",
+  "body": "Steps:\n1. Open a draft\n2. Press save\n\nThe app closes.",
+  "state": "closed",
+  "labels": [{"name": "bug"}, {"name": "kiln"}],
+  "assignees": [],
+  "user": {"login": "octo"},
+  "html_url": "https://github.example.org/example-org/api/issues/42"
+}

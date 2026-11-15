@@ -29,3 +29,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 # Lets this crate's own integration tests use the `testing` module.
 buzz-hive-core = { path = ".", features = ["testing"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

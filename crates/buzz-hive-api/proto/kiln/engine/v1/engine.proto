@@ -330,7 +330,7 @@ service EngineService {
   rpc SignOut(SignOutRequest) returns (SignOutResponse);
   // SaveIntakeRule stores an intake rule, a search that sends each new
   // issue to a workflow, or to Backlog, and restarts its refresh loop. A rule
-  // with id 0 is new.
+  // with an empty id is new.
   // It fails with InvalidArgument for an interval under one minute, an
   // unknown assignee filter, a query the host would not run (such as one
   // that names no repo:, org: or user:), and with NotFound for an unknown
@@ -373,6 +373,11 @@ service EngineService {
   // cursor it did not hand out; with FailedPrecondition when the host is
   // signed out; and with ResourceExhausted at once on a rate limit.
   rpc SearchIssues(SearchIssuesRequest) returns (SearchIssuesResponse);
+  // ListIssueComments returns the comments on a card's issue, oldest first, the newest
+  // 100 of them, read from the host now. Beehive: new rpc, for the card's Issue tab. It
+  // fails with NotFound for a card with no issue, with FailedPrecondition when
+  // the host is not set up, and with ResourceExhausted at once on a rate limit.
+  rpc ListIssueComments(ListIssueCommentsRequest) returns (ListIssueCommentsResponse);
   // MergeCard merges every open pull request of the card in merge order, then
   // starts the workflow's cleanup stage, or marks the card done when it has
   // none. It reads the
@@ -685,9 +690,9 @@ message Card {
   // every other reason in blocked_reason, such as a merge setting or a stage
   // that needs an issue host, which a repo cannot fix.
   bool needs_repo = 16;
-  // The intake rule that brought the card, 0 for a card a person added or
-  // whose rule was deleted.
-  int64 intake_rule_id = 17;
+  // The intake rule that brought the card, empty for a card a person added or
+  // whose rule was deleted. Beehive: a UUID; the Go engine used an int64.
+  string intake_rule_id = 17;
   // The source's own name for the issue, such as "PROJ-123". Empty for
   // GitHub and local issues, which the UI names owner/repo#number.
   string issue_key = 18;
@@ -712,6 +717,9 @@ message Card {
   // Beehive: the thread each stage visit opened, in the order they were posted. Only
   // GetCard sets it. stage_id is then the stage the card's latest run is in.
   repeated StageThread stages = 25;
+  // Beehive: the labels the card's issue had when it was last read. Only GetCard
+  // sets it.
+  repeated string issue_labels = 26;
 }
 
 // Beehive: the relay thread one visit to a stage opened. Its root is the top-level
@@ -907,12 +915,14 @@ message InboxItem {
 message CreateCardRequest {
   // The card's workflow; empty puts the card in Backlog. The issue's
   // existing card on the same workflow is returned instead of a new one.
+  // Beehive: `issue` names an issue on github.com by owner, repo and number; the
+  // card takes its title and body from it, and description is ignored.
   string workflow = 1;
   IssueRef issue = 2;
   reserved 3;
   reserved "view_id";
-  // Beehive: the card's title, 1 to 200 characters. A Beehive card has no
-  // issue until intake exists, so `issue` is refused when set.
+  // Beehive: the card's title, 1 to 200 characters. Ignored when `issue` is set:
+  // the card takes the issue's title.
   string title = 4;
   // Beehive: the card's description, up to 65536 characters.
   string description = 5;
@@ -2591,7 +2601,8 @@ message Intake {
 
 // IntakeRule is a search that brings issues onto the board.
 message IntakeRule {
-  int64 id = 1;
+  // Beehive: a UUID, empty for a rule that is new. The Go engine used an int64.
+  string id = 1;
   // Shown on the Sources screen; empty is the search.
   string name = 2;
   Intake intake = 3;
@@ -2600,6 +2611,8 @@ message IntakeRule {
   // Where the rule's issues go: empty fills Backlog, a name lands them on
   // that workflow's first stage.
   string workflow = 6;
+  // Beehive: false stops the rule's refresh loop and keeps the rule.
+  bool enabled = 7;
 }
 
 message SaveIntakeRuleRequest {
@@ -2607,7 +2620,8 @@ message SaveIntakeRuleRequest {
 }
 
 message DeleteIntakeRuleRequest {
-  int64 id = 1;
+  // Beehive: a UUID.
+  string id = 1;
 }
 
 message DeleteIntakeRuleResponse {}
@@ -2707,20 +2721,43 @@ message SearchIssuesResponse {
   bool truncated = 3;
 }
 
+message ListIssueCommentsRequest {
+  string card_id = 1;
+}
+
+// IssueComment is one comment on a card's issue. Its text was written by someone
+// who may be outside the team, so a client shows it as plain text.
+message IssueComment {
+  // The host's id for the comment, as text.
+  string id = 1;
+  string author = 2;
+  string body = 3;
+  google.protobuf.Timestamp at = 4;
+  // True when the comment was written by Beehive itself.
+  bool from_hive = 5;
+}
+
+message ListIssueCommentsResponse {
+  repeated IssueComment comments = 1;
+  // The issue has more comments than were returned.
+  bool truncated = 2;
+}
+
 message RefreshIntakeRequest {
   reserved 1;
   reserved "view_id";
-  // When set, only this rule is refreshed; 0 refreshes every rule.
-  int64 rule_id = 2;
+  // When set, only this rule is refreshed; empty refreshes every rule.
+  // Beehive: a UUID.
+  string rule_id = 2;
 }
 
 message RefreshIntakeResponse {
   // Open issues the search matched that the filters took.
   int32 matched = 1;
   // The cards this refresh added.
-  repeated int64 added_card_ids = 2;
-  // Cards that never ran, taken off the board because their issue left
-  // the search.
+  repeated string added_card_ids = 2;
+  // Beehive: always 0. A card whose issue left the search stays on the board
+  // and is counted in marked.
   int32 removed = 3;
   // Cards that ran, marked with why their issue left the search.
   int32 marked = 4;

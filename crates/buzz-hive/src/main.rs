@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
-use buzz_hive::{config, dir_source, drain, relay_adapter, timers};
+use buzz_hive::{config, dir_source, drain, github_adapter, intake, relay_adapter, timers};
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::orchestrator::workflows::record_builtins;
+use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::workflow::builtin::builtin_source;
 use buzz_hive_core::workflow::source::{CatalogSource, Source, Sources};
 use buzz_hive_store::migrate::PoolConfig;
@@ -121,6 +122,19 @@ async fn run() -> Result<(), String> {
         .map(|adapter| adapter.pubkey())
         .unwrap_or_default();
 
+    // One team token reads GitHub. Without it the service runs, and the intake screens and
+    // the issue pickers say so.
+    let code_host: Option<Arc<dyn CodeHost>> = match &config.github_token {
+        Some(token) => Some(Arc::new(github_adapter::GitHub::new(
+            &config.github_api_url,
+            token,
+        )?)),
+        None => {
+            tracing::warn!("GH_TOKEN is not set: issue intake is off");
+            None
+        }
+    };
+
     let app = App {
         config: Arc::new(ApiConfig {
             public_url: config.public_url.clone(),
@@ -140,6 +154,8 @@ async fn run() -> Result<(), String> {
         hive_pubkey: hive_pubkey.clone(),
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
+        code_host: code_host.clone(),
+        intake: Arc::new(tokio::sync::Notify::new()),
     };
     let bus = app.bus.clone();
     let (stop, stopped) = tokio::sync::watch::channel(false);
@@ -155,6 +171,24 @@ async fn run() -> Result<(), String> {
             outbox: app.outbox.clone(),
         };
         tokio::spawn(timers.run(stopped.clone()))
+    });
+    let mut intake_task = code_host.map(|host| {
+        let supervisor = intake::IntakeSupervisor {
+            shared: Arc::new(intake::Shared {
+                store: app.store.clone(),
+                directory: app.directory.clone(),
+                catalog: app.catalog.clone(),
+                host,
+                bus: app.bus.clone(),
+                community,
+                hive: hive_pubkey.clone(),
+                outbox: app.outbox.clone(),
+                gate: Default::default(),
+                random: intake::system_random(),
+            }),
+            wake: app.intake.clone(),
+        };
+        tokio::spawn(supervisor.run(stopped.clone()))
     });
     let mut drain = relay_adapter.map(|relay| {
         let drain = drain::Drain {
@@ -192,6 +226,16 @@ async fn run() -> Result<(), String> {
             .is_err()
         {
             tracing::warn!("the outbox drain did not stop in time; it was cut off");
+            task.abort();
+        }
+    }
+    if let Some(task) = intake_task.as_mut() {
+        // The supervisor waits for its own loops, so give it their grace and a little more.
+        if tokio::time::timeout(DRAIN_SHUTDOWN_GRACE * 2, &mut *task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the intake loops did not stop in time; they were cut off");
             task.abort();
         }
     }

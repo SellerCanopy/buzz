@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::resolve::{resolve_actor, Actor};
 use buzz_hive_core::workflow::load::Catalog;
@@ -46,6 +47,10 @@ pub struct App {
     pub outbox: Arc<tokio::sync::Notify>,
     /// Wakes the timer loop after a commit that may have set a timer.
     pub timers: Arc<tokio::sync::Notify>,
+    /// The team's code host, `None` when no token is set. Intake and the issue pickers need it.
+    pub code_host: Option<Arc<dyn CodeHost>>,
+    /// Wakes the intake supervisor after a rule was saved or deleted.
+    pub intake: Arc<tokio::sync::Notify>,
 }
 
 impl App {
@@ -58,6 +63,15 @@ impl App {
             ));
         }
         Ok(&self.hive_pubkey)
+    }
+
+    /// The code host, or the sentence to show when the service has no token for one.
+    pub fn require_host(&self) -> Result<&dyn CodeHost, HiveError> {
+        self.code_host.as_deref().ok_or_else(|| {
+            HiveError::FailedPrecondition(
+                "Beehive has no GitHub token yet: set GH_TOKEN, then restart it".into(),
+            )
+        })
     }
 
     /// The actor behind `pubkey`, with the level it holds right now.

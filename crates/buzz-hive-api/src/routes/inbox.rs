@@ -14,7 +14,7 @@ use crate::proto::{
     AnswerInboxRequest, ApproveRequest, AskGateRequest, Card, InboxItem, ListInboxRequest,
     ListInboxResponse, Run, SendBackRequest, SendMessageRequest, SendMessageResponse,
 };
-use crate::routes::cards::to_proto as card_to_proto;
+use crate::routes::cards::reply as card_reply;
 use crate::routes::poll::timestamp;
 use crate::routes::runs::{parse_id, to_proto as run_to_proto};
 use crate::unary::Ctx;
@@ -94,7 +94,7 @@ pub async fn approve(app: App, ctx: Ctx, req: ApproveRequest) -> Result<Card, Hi
     let op = app.op(true)?;
     let (card, events) = ops::approve(&op.env(), &ctx.op(), id, &versions).await?;
     op.settle(&events);
-    Ok(card_to_proto(card, false))
+    card_reply(&app, &ctx, card).await
 }
 
 /// A person sends the card's open approval stage back with comments.
@@ -103,7 +103,7 @@ pub async fn send_back(app: App, ctx: Ctx, req: SendBackRequest) -> Result<Card,
     let op = app.op(true)?;
     let (card, events) = ops::send_back(&op.env(), &ctx.op(), id, &req.comments).await?;
     op.settle(&events);
-    Ok(card_to_proto(card, false))
+    card_reply(&app, &ctx, card).await
 }
 
 /// A person writes to the agent of the card's stage, in the stage's thread.

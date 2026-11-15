@@ -17,8 +17,8 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::store::{
     AccessRepo, AgentInfo, AgentLink, ArtifactsRepo, CardsRepo, CommunityId, Directory, EventsRepo,
-    InboxRepo, OutboxRepo, PersonInfo, RelayEvent, RunsRepo, SettingsRepo, Store, StoreError,
-    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    InboxRepo, IntakeRepo, IssuesRepo, OutboxRepo, PersonInfo, RelayEvent, RunsRepo, SettingsRepo,
+    Store, StoreError, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
@@ -105,6 +105,12 @@ impl Tx for SpyTx {
     }
     fn usage(&mut self) -> &mut dyn UsageRepo {
         self.inner.usage()
+    }
+    fn intake(&mut self) -> &mut dyn IntakeRepo {
+        self.inner.intake()
+    }
+    fn issues(&mut self) -> &mut dyn IssuesRepo {
+        self.inner.issues()
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
         self.inner.savepoint().await

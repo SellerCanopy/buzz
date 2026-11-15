@@ -58,9 +58,15 @@ pub(super) async fn facts(
         let resolution = config::resolve(&card.workflow, Some(stage), &layers, false);
         execution.insert(stage.id.clone(), execution_from(&resolution));
     }
+    // A card made from an issue has the issue's labels as last read; any other has none.
+    let labels = tx
+        .issues()
+        .by_card(card.id)
+        .await?
+        .map(|row| row.issue.labels)
+        .unwrap_or_default();
     Ok(Facts {
-        // Issue labels arrive with intake (Phase 16).
-        labels: Vec::new(),
+        labels,
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
         plan,

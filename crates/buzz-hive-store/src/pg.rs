@@ -7,13 +7,17 @@ use buzz_hive_core::domain::artifact::{
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::events::{check_new, Actor, Event};
 use buzz_hive_core::domain::inbox::{InboxItem, InboxKind};
+use buzz_hive_core::domain::intake::{
+    IntakeRule, Issue, IssueState, RepoRef, RuleFilter, StoredIssue,
+};
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo, SettingsRepo, StageThread,
-    Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting, RunsRepo,
+    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
+    WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -91,6 +95,12 @@ impl Tx for PgTx {
         self
     }
     fn usage(&mut self) -> &mut dyn UsageRepo {
+        self
+    }
+    fn intake(&mut self) -> &mut dyn IntakeRepo {
+        self
+    }
+    fn issues(&mut self) -> &mut dyn IssuesRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -1692,5 +1702,360 @@ impl OutboxRepo for PgTx {
                 .await
                 .map_err(store_error)?;
         row.map(decode_outbox).transpose()
+    }
+}
+
+type RuleRow = (
+    uuid::Uuid,
+    String,
+    String,
+    serde_json::Value,
+    String,
+    bool,
+    i32,
+);
+
+fn decode_rule(row: RuleRow) -> Result<IntakeRule, StoreError> {
+    let (id, name, repo, filter, workflow, enabled, interval_s) = row;
+    Ok(IntakeRule {
+        id,
+        name,
+        repo: RepoRef::parse(&repo)
+            .map_err(|e| StoreError::Conflict(format!("stored repo of rule {id}: {e}")))?,
+        filter: serde_json::from_value::<RuleFilter>(filter)
+            .map_err(|e| StoreError::Conflict(format!("stored filter of rule {id}: {e}")))?,
+        workflow,
+        enabled,
+        interval_s: u32::try_from(interval_s)
+            .map_err(|_| StoreError::Conflict(format!("stored interval of rule {id}")))?,
+    })
+}
+
+#[async_trait::async_trait]
+impl IntakeRepo for PgTx {
+    async fn list(&mut self) -> Result<Vec<IntakeRule>, StoreError> {
+        let rows: Vec<RuleRow> = sqlx::query_as(
+            "SELECT id, name, repo, filter, workflow, enabled, interval_s \
+             FROM hive.intake_rules WHERE community_id = $1 ORDER BY created_at, id",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_rule).collect()
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<IntakeRule>, StoreError> {
+        let row: Option<RuleRow> = sqlx::query_as(
+            "SELECT id, name, repo, filter, workflow, enabled, interval_s \
+             FROM hive.intake_rules WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_rule).transpose()
+    }
+
+    async fn save(&mut self, rule: &IntakeRule) -> Result<(), StoreError> {
+        let filter = serde_json::to_value(&rule.filter)
+            .map_err(|e| StoreError::Internal(format!("rule filter: {e}")))?;
+        sqlx::query(
+            "INSERT INTO hive.intake_rules \
+             (community_id, id, name, repo, filter, workflow, enabled, interval_s) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (community_id, id) DO UPDATE SET name = EXCLUDED.name, \
+             repo = EXCLUDED.repo, filter = EXCLUDED.filter, workflow = EXCLUDED.workflow, \
+             enabled = EXCLUDED.enabled, interval_s = EXCLUDED.interval_s",
+        )
+        .bind(self.community)
+        .bind(rule.id)
+        .bind(&rule.name)
+        .bind(rule.repo.to_string())
+        .bind(filter)
+        .bind(&rule.workflow)
+        .bind(rule.enabled)
+        .bind(i32::try_from(rule.interval_s).unwrap_or(i32::MAX))
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<bool, StoreError> {
+        let done = sqlx::query("DELETE FROM hive.intake_rules WHERE community_id = $1 AND id = $2")
+            .bind(self.community)
+            .bind(id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        if done.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE hive.issues SET rule_id = NULL WHERE community_id = $1 AND rule_id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(true)
+    }
+}
+
+type IssueRow = (
+    String,
+    i64,
+    String,
+    String,
+    Vec<String>,
+    Vec<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    String,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// The columns of an [`IssueRow`], as a literal so queries can be built with `concat!`.
+macro_rules! issue_columns {
+    () => {
+        "repo, number, title, body, labels, assignees, author, state, url, etag, card_id, \
+         rule_id, left_reason, last_comment_at"
+    };
+}
+
+fn decode_issue(row: IssueRow) -> Result<StoredIssue, StoreError> {
+    let (
+        repo,
+        number,
+        title,
+        body,
+        labels,
+        assignees,
+        author,
+        state,
+        url,
+        etag,
+        card_id,
+        rule_id,
+        left,
+        last_comment_at,
+    ) = row;
+    let repo_ref = RepoRef::parse(&repo)
+        .map_err(|e| StoreError::Conflict(format!("stored issue repo: {e}")))?;
+    Ok(StoredIssue {
+        issue: Issue {
+            number: u64::try_from(number)
+                .map_err(|_| StoreError::Conflict(format!("stored number {number} in {repo}")))?,
+            repo: repo_ref,
+            title,
+            body,
+            labels,
+            assignees,
+            author,
+            state: IssueState::parse(&state)
+                .ok_or_else(|| StoreError::Conflict(format!("stored state {state} in {repo}")))?,
+            url,
+            etag,
+        },
+        card_id,
+        rule_id,
+        left,
+        last_comment_at,
+    })
+}
+
+fn issue_number(number: u64) -> Result<i64, StoreError> {
+    i64::try_from(number).map_err(|_| StoreError::Conflict(format!("issue number {number}")))
+}
+
+#[async_trait::async_trait]
+impl IssuesRepo for PgTx {
+    async fn upsert(
+        &mut self,
+        issue: &Issue,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<StoredIssue, StoreError> {
+        let row: IssueRow = sqlx::query_as(concat!(
+            "INSERT INTO hive.issues (community_id, repo, number, title, body, labels, \
+             assignees, author, state, url, etag, last_seen, last_comment_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) \
+             ON CONFLICT (community_id, repo, number) DO UPDATE SET title = EXCLUDED.title, \
+             body = EXCLUDED.body, labels = EXCLUDED.labels, assignees = EXCLUDED.assignees, \
+             author = EXCLUDED.author, state = EXCLUDED.state, url = EXCLUDED.url, \
+             etag = COALESCE(EXCLUDED.etag, hive.issues.etag), last_seen = EXCLUDED.last_seen \
+             RETURNING ",
+            issue_columns!()
+        ))
+        .bind(self.community)
+        .bind(issue.repo.to_string())
+        .bind(issue_number(issue.number)?)
+        .bind(&issue.title)
+        .bind(&issue.body)
+        .bind(&issue.labels)
+        .bind(&issue.assignees)
+        .bind(&issue.author)
+        .bind(issue.state.as_str())
+        .bind(&issue.url)
+        .bind(&issue.etag)
+        .bind(seen_at)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        decode_issue(row)
+    }
+
+    async fn get(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError> {
+        let row: Option<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND repo = $2 AND number = $3"
+        ))
+        .bind(self.community)
+        .bind(repo.to_string())
+        .bind(issue_number(number)?)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_issue).transpose()
+    }
+
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<StoredIssue>, StoreError> {
+        let row: Option<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND card_id = $2 LIMIT 1"
+        ))
+        .bind(self.community)
+        .bind(card)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_issue).transpose()
+    }
+
+    async fn of_rule(&mut self, rule: uuid::Uuid) -> Result<Vec<StoredIssue>, StoreError> {
+        let rows: Vec<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND rule_id = $2 \
+             AND card_id IS NOT NULL ORDER BY repo, number"
+        ))
+        .bind(self.community)
+        .bind(rule)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_issue).collect()
+    }
+
+    async fn attached(&mut self) -> Result<Vec<StoredIssue>, StoreError> {
+        let rows: Vec<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND card_id IS NOT NULL \
+             ORDER BY repo, number"
+        ))
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_issue).collect()
+    }
+
+    async fn watched(&mut self) -> Result<Vec<StoredIssue>, StoreError> {
+        let rows: Vec<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND card_id IS NOT NULL \
+             AND left_reason = '' AND state = 'open' ORDER BY repo, number"
+        ))
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_issue).collect()
+    }
+
+    async fn attach(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        card: uuid::Uuid,
+        rule: Option<uuid::Uuid>,
+    ) -> Result<(), StoreError> {
+        let done = sqlx::query(
+            "UPDATE hive.issues SET card_id = $4, rule_id = $5 \
+             WHERE community_id = $1 AND repo = $2 AND number = $3",
+        )
+        .bind(self.community)
+        .bind(repo.to_string())
+        .bind(issue_number(number)?)
+        .bind(card)
+        .bind(rule)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        missing_unless_one(done.rows_affected(), repo, number)
+    }
+
+    async fn set_left(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        left: &str,
+    ) -> Result<(), StoreError> {
+        let done = sqlx::query(
+            "UPDATE hive.issues SET left_reason = $4 \
+             WHERE community_id = $1 AND repo = $2 AND number = $3",
+        )
+        .bind(self.community)
+        .bind(repo.to_string())
+        .bind(issue_number(number)?)
+        .bind(left)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        missing_unless_one(done.rows_affected(), repo, number)
+    }
+
+    async fn set_last_comment(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        let done = sqlx::query(
+            "UPDATE hive.issues SET last_comment_at = $4 \
+             WHERE community_id = $1 AND repo = $2 AND number = $3",
+        )
+        .bind(self.community)
+        .bind(repo.to_string())
+        .bind(issue_number(number)?)
+        .bind(at)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        missing_unless_one(done.rows_affected(), repo, number)
+    }
+}
+
+fn missing_unless_one(rows: u64, repo: &RepoRef, number: u64) -> Result<(), StoreError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "issue {repo}#{number} has not been read"
+        )))
     }
 }

@@ -5,6 +5,7 @@ use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
 use crate::domain::inbox::InboxItem;
+use crate::domain::intake::{IntakeRule, Issue, RepoRef, StoredIssue};
 use crate::domain::run::Run;
 use crate::domain::timer::{Timer, TimerKind};
 use crate::workflow::options::WorkflowOptions;
@@ -59,6 +60,8 @@ pub trait Tx: Send {
     fn timers(&mut self) -> &mut dyn TimersRepo;
     fn inbox(&mut self) -> &mut dyn InboxRepo;
     fn usage(&mut self) -> &mut dyn UsageRepo;
+    fn intake(&mut self) -> &mut dyn IntakeRepo;
+    fn issues(&mut self) -> &mut dyn IssuesRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -445,6 +448,61 @@ pub trait OutboxRepo: Send {
     async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError>;
     /// The post queued under `key`, done or not.
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError>;
+}
+
+/// The rules that bring issues onto the board.
+#[async_trait::async_trait]
+pub trait IntakeRepo: Send {
+    /// Every rule, oldest first.
+    async fn list(&mut self) -> Result<Vec<IntakeRule>, StoreError>;
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<IntakeRule>, StoreError>;
+    /// Adds the rule, or replaces the one with its id.
+    async fn save(&mut self, rule: &IntakeRule) -> Result<(), StoreError>;
+    /// Deletes a rule. The cards it brought stay, and no longer name it. `false` when there
+    /// was no such rule.
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<bool, StoreError>;
+}
+
+/// The issues Beehive has read, and the card each became.
+#[async_trait::async_trait]
+pub trait IssuesRepo: Send {
+    /// Writes what the host reports of an issue and keeps what Beehive made of it, then
+    /// returns the row. The row stays locked until the transaction ends, so two passes
+    /// that meet one issue do not both make a card for it. A new issue starts reading
+    /// comments from `seen_at`.
+    async fn upsert(
+        &mut self,
+        issue: &Issue,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<StoredIssue, StoreError>;
+    async fn get(&mut self, repo: &RepoRef, number: u64)
+        -> Result<Option<StoredIssue>, StoreError>;
+    /// The issue a card was made from.
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<StoredIssue>, StoreError>;
+    /// Every issue that has a card, for the board to show which issue each card came from.
+    async fn attached(&mut self) -> Result<Vec<StoredIssue>, StoreError>;
+    /// The issues that have a card and are still in the rule's search or have left it.
+    async fn of_rule(&mut self, rule: uuid::Uuid) -> Result<Vec<StoredIssue>, StoreError>;
+    /// The open issues that have a card and are in their rule's search, which is where
+    /// comments are read.
+    async fn watched(&mut self) -> Result<Vec<StoredIssue>, StoreError>;
+    /// Records the card made from an issue, and the rule that brought it.
+    async fn attach(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        card: uuid::Uuid,
+        rule: Option<uuid::Uuid>,
+    ) -> Result<(), StoreError>;
+    /// Records why an issue left its rule's search, or clears it with an empty `left`.
+    async fn set_left(&mut self, repo: &RepoRef, number: u64, left: &str)
+        -> Result<(), StoreError>;
+    async fn set_last_comment(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError>;
 }
 
 /// A package the store holds versions of.

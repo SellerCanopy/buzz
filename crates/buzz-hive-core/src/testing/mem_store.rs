@@ -6,15 +6,17 @@ use crate::domain::artifact::{ArtifactInfo, ArtifactVersion};
 use crate::domain::card::Card;
 use crate::domain::events::{check_new, Event};
 use crate::domain::inbox::InboxItem;
+use crate::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, StoredIssue};
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::{Timer, TimerKind};
 use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, OutboxBacklog, OutboxRepo, OutboxRow,
-    PersonInfo, Posting, Pubkey, RelayEvent, RunsRepo, SettingsRepo, StageThread, Store,
-    StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
+    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog,
+    OutboxRepo, OutboxRow, PersonInfo, Posting, Pubkey, RelayEvent, RunsRepo, SettingsRepo,
+    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -39,6 +41,9 @@ struct State {
     timers: Vec<(CommunityId, MemTimer)>,
     /// In the order opened.
     inbox: Vec<(CommunityId, InboxItem)>,
+    /// In creation order.
+    intake: Vec<(CommunityId, IntakeRule)>,
+    issues: Vec<(CommunityId, StoredIssue)>,
 }
 
 #[derive(Clone)]
@@ -167,6 +172,12 @@ impl Tx for MemTx {
         self
     }
     fn usage(&mut self) -> &mut dyn UsageRepo {
+        self
+    }
+    fn intake(&mut self) -> &mut dyn IntakeRepo {
+        self
+    }
+    fn issues(&mut self) -> &mut dyn IssuesRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -1347,5 +1358,194 @@ impl Directory for FakeDirectory {
                 && e.in_thread(root)
                 && (e.created_at, &e.id) > (event.created_at, &event.id)
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl IntakeRepo for MemTx {
+    async fn list(&mut self) -> Result<Vec<IntakeRule>, StoreError> {
+        Ok(self
+            .work
+            .intake
+            .iter()
+            .filter(|(c, _)| *c == self.community)
+            .map(|(_, rule)| rule.clone())
+            .collect())
+    }
+
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<IntakeRule>, StoreError> {
+        Ok(self
+            .work
+            .intake
+            .iter()
+            .find(|(c, rule)| *c == self.community && rule.id == id)
+            .map(|(_, rule)| rule.clone()))
+    }
+
+    async fn save(&mut self, rule: &IntakeRule) -> Result<(), StoreError> {
+        let community = self.community;
+        match self
+            .work
+            .intake
+            .iter_mut()
+            .find(|(c, have)| *c == community && have.id == rule.id)
+        {
+            Some((_, have)) => *have = rule.clone(),
+            None => self.work.intake.push((community, rule.clone())),
+        }
+        Ok(())
+    }
+
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<bool, StoreError> {
+        let community = self.community;
+        let before = self.work.intake.len();
+        self.work
+            .intake
+            .retain(|(c, rule)| !(*c == community && rule.id == id));
+        for (c, row) in &mut self.work.issues {
+            if *c == community && row.rule_id == Some(id) {
+                row.rule_id = None;
+            }
+        }
+        Ok(self.work.intake.len() != before)
+    }
+}
+
+impl MemTx {
+    fn issue_row(&mut self, repo: &RepoRef, number: u64) -> Option<&mut StoredIssue> {
+        let community = self.community;
+        self.work
+            .issues
+            .iter_mut()
+            .find(|(c, row)| {
+                *c == community && row.issue.repo == *repo && row.issue.number == number
+            })
+            .map(|(_, row)| row)
+    }
+
+    fn missing_issue(repo: &RepoRef, number: u64) -> StoreError {
+        StoreError::NotFound(format!("issue {repo}#{number} has not been read"))
+    }
+}
+
+#[async_trait::async_trait]
+impl IssuesRepo for MemTx {
+    async fn upsert(
+        &mut self,
+        issue: &Issue,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<StoredIssue, StoreError> {
+        if let Some(row) = self.issue_row(&issue.repo, issue.number) {
+            row.issue = issue.clone();
+            return Ok(row.clone());
+        }
+        let row = StoredIssue {
+            issue: issue.clone(),
+            card_id: None,
+            rule_id: None,
+            left: String::new(),
+            last_comment_at: Some(seen_at),
+        };
+        self.work.issues.push((self.community, row.clone()));
+        Ok(row)
+    }
+
+    async fn get(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError> {
+        Ok(self.issue_row(repo, number).map(|row| row.clone()))
+    }
+
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<StoredIssue>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .issues
+            .iter()
+            .find(|(c, row)| *c == community && row.card_id == Some(card))
+            .map(|(_, row)| row.clone()))
+    }
+
+    async fn attached(&mut self) -> Result<Vec<StoredIssue>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .issues
+            .iter()
+            .filter(|(c, row)| *c == community && row.card_id.is_some())
+            .map(|(_, row)| row.clone())
+            .collect())
+    }
+
+    async fn of_rule(&mut self, rule: uuid::Uuid) -> Result<Vec<StoredIssue>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .issues
+            .iter()
+            .filter(|(c, row)| {
+                *c == community && row.rule_id == Some(rule) && row.card_id.is_some()
+            })
+            .map(|(_, row)| row.clone())
+            .collect())
+    }
+
+    async fn watched(&mut self) -> Result<Vec<StoredIssue>, StoreError> {
+        let community = self.community;
+        Ok(self
+            .work
+            .issues
+            .iter()
+            .filter(|(c, row)| {
+                *c == community
+                    && row.card_id.is_some()
+                    && row.left.is_empty()
+                    && row.issue.state == IssueState::Open
+            })
+            .map(|(_, row)| row.clone())
+            .collect())
+    }
+
+    async fn attach(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        card: uuid::Uuid,
+        rule: Option<uuid::Uuid>,
+    ) -> Result<(), StoreError> {
+        let row = self
+            .issue_row(repo, number)
+            .ok_or_else(|| Self::missing_issue(repo, number))?;
+        row.card_id = Some(card);
+        row.rule_id = rule;
+        Ok(())
+    }
+
+    async fn set_left(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        left: &str,
+    ) -> Result<(), StoreError> {
+        let row = self
+            .issue_row(repo, number)
+            .ok_or_else(|| Self::missing_issue(repo, number))?;
+        row.left = left.to_owned();
+        Ok(())
+    }
+
+    async fn set_last_comment(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        let row = self
+            .issue_row(repo, number)
+            .ok_or_else(|| Self::missing_issue(repo, number))?;
+        row.last_comment_at = Some(at);
+        Ok(())
     }
 }

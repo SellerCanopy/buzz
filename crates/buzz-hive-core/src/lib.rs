@@ -5,6 +5,7 @@
 //! the in-memory fakes in `testing` with no infrastructure.
 
 pub mod access;
+pub mod background;
 pub mod bus;
 pub mod config;
 pub mod domain;

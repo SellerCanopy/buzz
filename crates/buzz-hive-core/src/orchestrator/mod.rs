@@ -9,6 +9,7 @@ pub mod artifacts;
 pub mod auto;
 pub mod cards;
 pub mod inbox;
+pub mod intake;
 mod lookup;
 pub mod outbox;
 mod routes;

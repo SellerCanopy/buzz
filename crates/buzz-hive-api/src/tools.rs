@@ -356,6 +356,42 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "the access page lists the community's members with their levels; an agent has no use for them",
     ),
     (
+        "SaveIntakeRule",
+        "a person's setting from the Intake page; a rule decides which outside text becomes cards and reaches agents, so an agent may not change it",
+    ),
+    (
+        "DeleteIntakeRule",
+        "a person's setting from the Intake page; an agent may not change which issues become cards",
+    ),
+    (
+        "RefreshIntake",
+        "a person's button on the Intake page; the loops read the host on their own schedule",
+    ),
+    (
+        "ListIntakeRules",
+        "the Intake page lists the rules; an agent has no use for them",
+    ),
+    (
+        "PreviewIntake",
+        "the Intake page's preview of a rule; an agent has no use for it",
+    ),
+    (
+        "ListRepos",
+        "the repo picker's list; an agent does not browse the team token's repos",
+    ),
+    (
+        "ListOwners",
+        "the repo picker's list; an agent does not browse the team token's accounts",
+    ),
+    (
+        "SearchIssues",
+        "the browse drawer's search; an agent does not search the team token's repos",
+    ),
+    (
+        "ListIssueComments",
+        "the Issue tab reads the comments live; an agent gets the ones a rule trusts in its stage thread",
+    ),
+    (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
     ),

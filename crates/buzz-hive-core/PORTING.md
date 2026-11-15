@@ -32,7 +32,7 @@ never edited. Phase numbers refer to the Beehive plan.
 | Permission prompts | dropped | 1 |
 | The `interrupted` inbox item | dropped | 1 |
 | `core/openspec` | kept, not dropped: the built-in `openspec` package calls `check_openspec`. Phase 5 ports the action's argument checks (`workflow/actions.rs`) and ships the package with its `NOTICE` and `LICENSE-OpenSpec`. The document validator runs inside the action, so it ports with the action runner in Phase 18 | 18 |
-| `core/issuefiles` | pending | 16 |
+| `core/issuefiles` | dropped (the Go package copies an issue's attached images into the card's folder; a card has no folder here and the Issue tab shows the issue's own text. Phase 16 does not fetch or store issue attachments) | 16 |
 | `core/config` | ported | 6 |
 
 ## Go test directories
@@ -46,7 +46,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `adapters/actions` | 1 | pending | 18 |
 | `adapters/artifacts/local` | 2 | changed (documents live in the `hive.artifacts` tables of the relay's Postgres and a file is a pointer to a media-store blob, so there is no folder adapter; `postgres_artifacts.rs` and `tests/artifacts.rs` carry the contract) | 9 |
 | `adapters/downloadmark` | 3 | pending | unassigned |
-| `adapters/github` | 20 | pending | 16 |
+| `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. The Go pull-request calls stay Phase 17. `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
 | `adapters/gitwork` | 5 | dropped | 1 |
 | `adapters/keyring` | 1 | dropped | 23 |
 | `adapters/localrepo` | 2 | dropped (scratch folders) | 1 |
@@ -72,7 +72,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `core/domain` | 12 | pending | unassigned |
 | `core/events` | 1 | changed (Phase 4: `domain/events.rs`, `bus.rs` and the `hive.events` log; one Postgres transaction per change and a long poll replace the Go subscription) | 4 |
 | `core/events/schema` | 1 | changed (Phase 4: `EVENT_KINDS` and `check_new` refuse an unlisted kind or a payload over 64 KiB; each later phase registers the kinds it emits) | 4 |
-| `core/issuefiles` | 7 | pending | 16 |
+| `core/issuefiles` | 7 | dropped (see Features) | 16 |
 | `core/kinds` | 8 | pending | unassigned |
 | `core/openspec` | 1 | kept, not dropped (see Features): the validator ports with the action runner | 18 |
 | `core/orchestrator` | 56 | pending | unassigned |
@@ -109,14 +109,14 @@ spec's title and are confirmed when that phase starts.
 | `auto-mode` | changed (Phase 13 ports the contract: a card in auto mode has its approval gates approved when every listed artifact has a saved version, a failed run started again twice and a stage with no result asked to carry on twice, each with its reason in Activity, and a loop that is never unbounded. The Go spec's cost-cap cases, its Ask recommendations and forms and its paused-turn reply are dropped, see the Phase 13 deliverables. The Switch and the Activity entry are covered in buzz-app `ActivityTab.test.tsx` and `BeehivePage.test.tsx`) | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
 | `boot` | pending | 3 |
-| `browse` | pending (the Go spec browses GitHub issues, which needs intake) | 16 |
+| `browse` | changed (Phase 16: `SearchIssues` and `ListRepos` back the New card dialog's From an issue mode, in `buzz-hive-api/tests/intake.rs` and buzz-app `NewCardDialog.test.tsx`. The spec's typed GitHub query is not ported: a search is by repo, label and text) | 16 |
 | `builder-run` | pending | 19 |
 | `builder` | pending | 19 |
 | `calls` | changed (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents; Phase 12 opens a Needs you item for a route that asks, with skip and stop) | 12 |
 | `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
-| `files` | changed (the Files tab lists a card's saved files and documents with a download link, in buzz-app `beehive.journey.mjs` and `BeehivePage.test.tsx`; `buzz-hive/tests/e2e_files.rs` proves the file round trip through the relay's media store. Intake files stay Phase 16) | 9 |
+| `files` | changed (the Files tab lists a card's saved files and documents with a download link, in buzz-app `beehive.journey.mjs` and `BeehivePage.test.tsx`; `buzz-hive/tests/e2e_files.rs` proves the file round trip through the relay's media store. Issue attachments are dropped, see `core/issuefiles`) | 9 |
 | `filters` | pending (filters narrow by run state and search; a card now reaches Done, but the Stopped and Failed states the spec filters on arrive with StopRun and routing, Phase 11) | 11 |
 | `guide` | pending (the Go spec drives the workflow builder) | 19 |
 | `home` | pending | 3 |
@@ -126,8 +126,8 @@ spec's title and are confirmed when that phase starts.
 | `login` | dropped (team login and cookie session) | 1 |
 | `merge` | pending | 18 |
 | `needs-you` | changed (Phase 12: the Needs you view lists open items with the card, the stage and a button per answer, and its tab counts them live; buzz-app `NeedsYou.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. A gate an agent opens is answered end to end in `buzz-hive/tests/e2e_approval.rs`, which needs a relay. Resolved items are not listed) | 12 |
-| `newtask` | pending | 16 |
-| `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is Phase 16) | 16 |
+| `newtask` | changed (Phase 16: a card is made from an issue with `CreateCard` and `issue {repo, number}`, in `buzz-hive-api/tests/intake.rs`; making the same issue twice returns the first card) | 16 |
+| `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is not ported: a card made from an issue starts with no parameters) | 16 |
 | `paused-turn` | changed (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; Phase 12 opens the Needs you item that a reply finishes, in `tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`) | 12 |
 | `permissions` | changed (Phase 14 ports the contract against Beehive levels: an admin sets a person's or an agent's level, the engine then allows and refuses to match, and Settings lists the same levels. Kiln's permission asks are dropped, Buzz owns permissions. Covered by buzz-app `e2e/permissions.spec.mjs`) | 14 |
 | `pick-repo` | pending | 21 |
@@ -287,8 +287,8 @@ spec's title and are confirmed when that phase starts.
   A run that ends in its start step does not hand off.
 - Loop count is per run. The Go `card.loop_limit` setting does not apply. Auto mode only fills in a
   bound for a stage whose workflow sets none (Phase 13).
-- The card has no labels field yet, so `Facts.labels` is empty until Phase 16 and every
-  stage that needs a label follows `else`. The plan score is (0, 0) until Phase 9.
+- `Facts.labels` is the labels of the card's issue as last read (Phase 16), so a card with no
+  issue has none and every stage that needs a label follows `else`. The plan score is (0, 0) until Phase 9.
 - Dropped: `DecidePermission` and `LevelAsks`. Buzz owns who may do what.
 - Tests: `tests/rules_decide.rs`, `tests/routes.rs` (flat, not `tests/scenarios/routes.rs`),
   `buzz-hive-api/tests/routing.rs` and `buzz-hive/tests/e2e_fresh_session.rs`.
@@ -478,3 +478,35 @@ spec's title and are confirmed when that phase starts.
 - Tests: api `tests/claims.rs`, `tests/access.rs`, `tests/inbox.rs`; shim `tests/shim.rs`;
   `buzz-acp` `requester.rs` and a pool test; store `tests/postgres_roles.rs`;
   `buzz-hive/tests/claim_echo.rs` and `e2e_requester.rs` (needs a local relay).
+
+## Phase 16 deliverables
+
+- `CodeHost` (`ports/code_host.rs`) is the only way the engine reads or writes a code host.
+  `FakeCodeHost` answers it in tests; `buzz-hive/src/github_adapter.rs` answers it from GitHub
+  with the team token `GH_TOKEN`. `BUZZ_HIVE_GITHUB_API_URL` moves the API address (tests point it
+  at a replay server). Without a token the intake routes that read GitHub answer
+  `FailedPrecondition` and no loop starts.
+- A rule is one repo: `host: github.com`, `repos` with exactly one `owner/name`, an optional
+  label, optional text, `assignees` of `anyone` or `unassigned`, and an interval of at least 60
+  seconds. A typed `query` and `assigned_to_me` are refused. Only a person may save or delete a
+  rule: its authors decide which outside comments reach an agent.
+- A pass lists the open issues (one request per page of 100, up to 10 pages), makes a card for
+  each issue without one, and reads once each attached issue that left the list (up to 50 per
+  pass) to learn if it closed or lost its label. A card stays on the board either way; the
+  engine records `card.left_intake` with the reason, and `RefreshIntake` always reports
+  `removed: 0`. A card a person removed is not made again. One row per issue, taken with an
+  upsert, keeps two passes from making two cards.
+- GitHub calls: one list per rule per interval, one read per issue that left, one comment read
+  per running or waiting card every 120 seconds. A `304` costs no quota. A rate limit holds every
+  loop (`Gate`) for what GitHub asked; other failures wait twice the interval, then twice that,
+  up to 30 minutes. Loops start after a jitter of up to a fifth of their interval. Nothing reads
+  the relay.
+- A comment from the host is outside text. It goes to a card's agent only when its author is in
+  the rule's `authors` list, quoted and labelled as not an instruction from a person, and is
+  recorded once per comment id. "Delivered" means queued in the stage thread's outbox.
+- New on the wire beyond the plan: the `ListIssueComments` procedure and `Card.issue_labels`, for
+  the Issue tab. Ids of rules are uuid strings. The plan's migration `0009` is `0013_intake.sql`.
+- Tests: core `tests/intake.rs`, `tests/routes.rs`, `tests/event_coverage.rs`; store
+  `tests/postgres_intake.rs`; api `tests/intake.rs`; binary `tests/github_adapter.rs`,
+  `tests/intake_loop.rs` (paused time) and `tests/intake_replay.rs` (real adapter, loops and routes
+  against the replay server, with a restart). Real GitHub is not exercised.

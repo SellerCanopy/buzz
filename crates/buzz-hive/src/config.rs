@@ -32,6 +32,11 @@ pub struct Config {
     /// `BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS`, default 10. How long a call waits for a free
     /// database connection.
     pub db_acquire_timeout: std::time::Duration,
+    /// `GH_TOKEN`, the team's GitHub token. Unset means intake and the issue pickers are off.
+    pub github_token: Option<String>,
+    /// `BUZZ_HIVE_GITHUB_API_URL`, default `https://api.github.com`. A GitHub Enterprise
+    /// server's API address, or a test server's.
+    pub github_api_url: String,
 }
 
 /// Longest any one statement may run, and the longest a statement waits for a lock.
@@ -105,6 +110,16 @@ impl Config {
                 10,
                 300,
             )?),
+            github_token: optional("GH_TOKEN"),
+            github_api_url: match optional("BUZZ_HIVE_GITHUB_API_URL") {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,
+                Some(_) => {
+                    return Err(
+                        "BUZZ_HIVE_GITHUB_API_URL must start with http:// or https://".into(),
+                    )
+                }
+                None => crate::github_adapter::DEFAULT_API_URL.to_owned(),
+            },
         })
     }
 }
@@ -268,6 +283,28 @@ mod tests {
         let config = Config::from_lookup(env(&pairs)).unwrap();
         assert_eq!(config.relay_url.as_deref(), Some("ws://relay:3000"));
         assert!(config.nostr_key.is_some());
+    }
+
+    #[test]
+    fn the_github_token_is_optional_and_the_address_defaults_to_github() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert_eq!(config.github_token, None);
+        assert_eq!(config.github_api_url, "https://api.github.com");
+
+        let mut pairs = FULL.to_vec();
+        pairs.push(("GH_TOKEN", " example-token "));
+        pairs.push(("BUZZ_HIVE_GITHUB_API_URL", "http://127.0.0.1:9/api/v3"));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.github_token.as_deref(), Some("example-token"));
+        assert_eq!(config.github_api_url, "http://127.0.0.1:9/api/v3");
+    }
+
+    #[test]
+    fn a_github_address_that_is_not_a_url_names_the_variable() {
+        let mut pairs = FULL.to_vec();
+        pairs.push(("BUZZ_HIVE_GITHUB_API_URL", "api.example.org"));
+        let error = Config::from_lookup(env(&pairs)).err().unwrap();
+        assert!(error.contains("BUZZ_HIVE_GITHUB_API_URL"), "{error}");
     }
 
     #[test]

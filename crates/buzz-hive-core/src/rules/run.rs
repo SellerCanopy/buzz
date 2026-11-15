@@ -98,7 +98,7 @@ pub struct Approved {
 /// What the reducer needs to know that is not in the run or the workflow.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
-    /// The card's labels. They come from the card's issue, so there are none until intake exists.
+    /// The card's labels. They come from the card's issue as last read, so a card with no issue has none.
     pub labels: Vec<String>,
     /// The stages the card waits before until a person starts it.
     pub paused: Vec<String>,

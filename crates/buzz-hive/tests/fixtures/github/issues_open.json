@@ -1,0 +1,33 @@
+[
+  {
+    "number": 42,
+    "title": "Crash when saving a draft",
+    "body": "Steps:\n1. Open a draft\n2. Press save\n\nThe app closes.",
+    "state": "open",
+    "labels": [{"name": "bug"}, {"name": "kiln"}],
+    "assignees": [],
+    "user": {"login": "octo"},
+    "html_url": "https://github.example.org/example-org/api/issues/42"
+  },
+  {
+    "number": 43,
+    "title": "Add a retry to the sync call",
+    "body": null,
+    "state": "open",
+    "labels": [{"name": "kiln"}],
+    "assignees": [{"login": "hubot"}],
+    "user": {"login": "mallory"},
+    "html_url": "https://github.example.org/example-org/api/issues/43"
+  },
+  {
+    "number": 44,
+    "title": "Bump the parser dependency",
+    "body": "A pull request, which the issues endpoint also lists.",
+    "state": "open",
+    "labels": [],
+    "assignees": [],
+    "user": {"login": "octo"},
+    "html_url": "https://github.example.org/example-org/api/pull/44",
+    "pull_request": {"url": "https://api.example.org/repos/example-org/api/pulls/44"}
+  }
+]

@@ -10,6 +10,7 @@ mod agents;
 mod artifacts;
 mod cards;
 mod inbox;
+pub mod intake;
 pub mod poll;
 mod runs;
 mod settings;
@@ -84,6 +85,15 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("GetFullPayload", Level::Read),
     ("GetUsage", Level::Read),
     ("ListAutoDecisions", Level::Read),
+    ("SaveIntakeRule", Level::Run),
+    ("DeleteIntakeRule", Level::Run),
+    ("RefreshIntake", Level::Run),
+    ("ListIntakeRules", Level::Read),
+    ("PreviewIntake", Level::Read),
+    ("ListRepos", Level::Read),
+    ("ListOwners", Level::Read),
+    ("SearchIssues", Level::Read),
+    ("ListIssueComments", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -204,5 +214,14 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListActivity", activity::list_activity);
     let r = route(r, "GetFullPayload", activity::get_full_payload);
     let r = route(r, "ListAutoDecisions", activity::list_auto_decisions);
+    let r = route(r, "SaveIntakeRule", intake::save_intake_rule);
+    let r = route(r, "DeleteIntakeRule", intake::delete_intake_rule);
+    let r = route(r, "RefreshIntake", intake::refresh_intake);
+    let r = route(r, "ListIntakeRules", intake::list_intake_rules);
+    let r = route(r, "PreviewIntake", intake::preview_intake);
+    let r = route(r, "ListRepos", intake::list_repos);
+    let r = route(r, "ListOwners", intake::list_owners);
+    let r = route(r, "SearchIssues", intake::search_issues);
+    let r = route(r, "ListIssueComments", intake::list_issue_comments);
     route(r, "GetUsage", status::get_usage)
 }

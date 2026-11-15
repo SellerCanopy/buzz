@@ -1,0 +1,399 @@
+//! The GitHub adapter against the replay server: what it asks for, what it makes of the
+//! answers, and that a request nobody planned for fails the test and is named.
+
+mod support;
+
+use std::time::Duration;
+
+use buzz_hive::github_adapter::GitHub;
+use buzz_hive_core::domain::intake::{IssueFilter, IssueState, Page, RepoRef};
+use buzz_hive_core::ports::code_host::{CodeHost, HostError};
+use chrono::{TimeZone, Utc};
+use support::github_replay::{Exchange, Replay};
+
+const TOKEN: &str = "example-token";
+
+fn repo() -> RepoRef {
+    RepoRef::parse("example-org/api").unwrap()
+}
+
+fn open_issues() -> Exchange {
+    Exchange::get("/repos/example-org/api/issues").query("state", "open")
+}
+
+async fn github(replay: &Replay) -> GitHub {
+    GitHub::new(replay.url(), TOKEN).unwrap()
+}
+
+#[tokio::test]
+async fn issues_are_listed_with_the_token_and_pull_requests_are_left_out() {
+    let replay = Replay::start(vec![open_issues()
+        .query("per_page", "100")
+        .query("page", "1")
+        .query("labels", "kiln")
+        .query("assignee", "none")
+        .header("etag", "\"v1\"")
+        .fixture("issues_open.json")])
+    .await;
+    let filter = IssueFilter {
+        state: IssueState::Open,
+        label: Some("kiln".into()),
+        unassigned: true,
+    };
+    let issues = github(&replay)
+        .await
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap();
+    let numbers: Vec<u64> = issues.iter().map(|i| i.number).collect();
+    assert_eq!(
+        numbers,
+        [42, 43],
+        "the pull request, number 44, is not an issue"
+    );
+    assert_eq!(issues[0].title, "Crash when saving a draft");
+    assert_eq!(issues[0].labels, ["bug", "kiln"]);
+    assert_eq!(issues[0].author, "octo");
+    assert_eq!(issues[1].body, "", "a null body is an empty one");
+    assert_eq!(issues[1].assignees, ["hubot"]);
+
+    let sent = &replay.requests()[0];
+    assert_eq!(sent.header("authorization"), Some("Bearer example-token"));
+    assert_eq!(sent.header("accept"), Some("application/vnd.github+json"));
+    assert!(sent.header("if-none-match").is_none());
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_second_read_asks_if_the_answer_changed_and_a_304_returns_the_first_answer() {
+    let url = "/repos/example-org/api/issues";
+    let replay = Replay::start(vec![
+        Exchange::get(url)
+            .header("etag", "\"v1\"")
+            .fixture("issues_open.json"),
+        Exchange::get(url).status(304),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let first = github
+        .list_issues(&repo(), &IssueFilter::default(), Page::first(100))
+        .await
+        .unwrap();
+    let second = github
+        .list_issues(&repo(), &IssueFilter::default(), Page::first(100))
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    let requests = replay.requests();
+    assert_eq!(requests[1].header("if-none-match"), Some("\"v1\""));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn an_answer_with_a_new_etag_replaces_the_one_kept() {
+    let url = "/repos/example-org/api/issues";
+    let replay = Replay::start(vec![
+        Exchange::get(url).header("etag", "\"v1\"").body("[]"),
+        Exchange::get(url)
+            .header("etag", "\"v2\"")
+            .fixture("issues_open.json"),
+        Exchange::get(url).status(304),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let filter = IssueFilter::default();
+    assert!(github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        github
+            .list_issues(&repo(), &filter, Page::first(100))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        github
+            .list_issues(&repo(), &filter, Page::first(100))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(replay.requests()[2].header("if-none-match"), Some("\"v2\""));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_spent_limit_says_how_long_to_wait() {
+    let reset = Utc::now().timestamp() + 120;
+    let replay = Replay::start(vec![open_issues()
+        .status(403)
+        .header("x-ratelimit-remaining", "0")
+        .header("x-ratelimit-reset", &reset.to_string())
+        .body(r#"{"message":"API rate limit exceeded"}"#)])
+    .await;
+    let error = github(&replay)
+        .await
+        .list_issues(&repo(), &IssueFilter::default(), Page::first(100))
+        .await
+        .unwrap_err();
+    let HostError::RateLimited { retry_after } = error else {
+        panic!("expected a rate limit, got {error:?}");
+    };
+    assert!(
+        (Duration::from_secs(100)..=Duration::from_secs(121)).contains(&retry_after),
+        "{retry_after:?}"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn refusals_are_told_apart() {
+    let replay = Replay::start(vec![
+        open_issues()
+            .status(401)
+            .body(r#"{"message":"Bad credentials"}"#),
+        open_issues().status(404).body(r#"{"message":"Not Found"}"#),
+        open_issues().status(502).body("<html>bad gateway</html>"),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let filter = IssueFilter::default();
+    let first = github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&first, HostError::Unauthorized(m) if m == "Bad credentials"),
+        "{first:?}"
+    );
+    assert!(!format!("{first:?}").contains(TOKEN));
+    let second = github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap_err();
+    assert!(matches!(second, HostError::NotFound(_)), "{second:?}");
+    let third = github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&third, HostError::Other(m) if m.contains("502")),
+        "{third:?}"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn one_issue_is_read_with_its_etag_and_a_pull_request_is_not_found() {
+    let replay = Replay::start(vec![
+        Exchange::get("/repos/example-org/api/issues/42")
+            .header("etag", "\"i42\"")
+            .fixture("issue_42.json"),
+        Exchange::get("/repos/example-org/api/issues/44")
+            .body(r#"{"number":44,"state":"open","title":"x","pull_request":{}}"#),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let issue = github.get_issue(&repo(), 42).await.unwrap();
+    assert_eq!(issue.etag.as_deref(), Some("\"i42\""));
+    assert_eq!(
+        issue.url,
+        "https://github.example.org/example-org/api/issues/42"
+    );
+    assert!(matches!(
+        github.get_issue(&repo(), 44).await,
+        Err(HostError::NotFound(_))
+    ));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_search_names_the_repo_of_each_hit() {
+    let replay = Replay::start(vec![Exchange::get("/search/issues")
+        .query(
+            "q",
+            "is:issue repo:example-org/web repo:example-org/api crash",
+        )
+        .query("per_page", "30")
+        .query("page", "2")
+        .fixture("search_issues.json")])
+    .await;
+    let hits = github(&replay)
+        .await
+        .search_issues(
+            "is:issue repo:example-org/web repo:example-org/api crash",
+            Page {
+                number: 2,
+                size: 30,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].repo.to_string(), "example-org/web");
+    assert_eq!(hits[1].repo.to_string(), "example-org/api");
+    assert_eq!(hits[1].state, IssueState::Closed);
+    replay.finish();
+}
+
+#[tokio::test]
+async fn comments_are_read_from_a_time_and_ones_beehive_wrote_are_known() {
+    let since = Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap();
+    let replay = Replay::start(vec![Exchange::get(
+        "/repos/example-org/api/issues/42/comments",
+    )
+    .query("since", "2026-03-01T09:00:00Z")
+    .fixture("comments.json")])
+    .await;
+    let comments = github(&replay)
+        .await
+        .list_comments(&repo(), 42, Some(since))
+        .await
+        .unwrap();
+    assert_eq!(
+        comments.iter().map(|c| c.id).collect::<Vec<_>>(),
+        [9001, 9002, 9003]
+    );
+    assert_eq!(comments[1].author, "mallory");
+    assert!(!comments[0].from_hive);
+    assert!(comments[2].from_hive, "it carries Beehive's marker");
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_long_thread_is_read_page_by_page() {
+    let page = |from: u64, count: u64| {
+        let items: Vec<_> = (from..from + count)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id, "body": "x", "created_at": "2026-03-01T10:00:00Z",
+                    "user": {"login": "octo"}
+                })
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap()
+    };
+    let replay = Replay::start(vec![
+        Exchange::get("/repos/example-org/api/issues/42/comments")
+            .query("page", "1")
+            .body(&page(1, 100)),
+        Exchange::get("/repos/example-org/api/issues/42/comments")
+            .query("page", "2")
+            .body(&page(101, 3)),
+    ])
+    .await;
+    let comments = github(&replay)
+        .await
+        .list_comments(&repo(), 42, None)
+        .await
+        .unwrap();
+    assert_eq!(comments.len(), 103);
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_comment_is_written_once_for_a_key() {
+    let list = "/repos/example-org/api/issues/42/comments";
+    let replay = Replay::start(vec![
+        // The first try: nothing carries the key yet, so the comment is written.
+        Exchange::get(list).body("[]"),
+        Exchange::post(list).status(201).body(r#"{"id": 555}"#),
+        // A repeat after a failure: the comment is there, so nothing is written.
+        Exchange::get(list).body(
+            r#"[{"id":555,"body":"Card made.\n\n<!-- buzz-hive:card:example-org/api#42 -->","created_at":"2026-03-01T10:00:00Z","user":{"login":"hive-bot"}}]"#,
+        ),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let id = github
+        .comment(&repo(), 42, "Card made.", "card:example-org/api#42")
+        .await
+        .unwrap();
+    assert_eq!(id, 555);
+    let again = github
+        .comment(&repo(), 42, "Card made.", "card:example-org/api#42")
+        .await
+        .unwrap();
+    assert_eq!(again, 555);
+    let posts: Vec<_> = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&posts[0].body).unwrap();
+    let body = sent["body"].as_str().unwrap();
+    assert!(body.starts_with("Card made."));
+    assert!(
+        body.ends_with("<!-- buzz-hive:card:example-org/api#42 -->"),
+        "{body}"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn repos_are_listed_for_the_token_or_for_one_owner_and_owners_start_with_the_person() {
+    let replay = Replay::start(vec![
+        Exchange::get("/user/repos")
+            .query("sort", "pushed")
+            .fixture("repos.json")
+            .any_order(),
+        Exchange::get("/user").fixture("user.json").any_order(),
+        Exchange::get("/user/orgs").fixture("orgs.json").any_order(),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let all = github.list_repos("").await.unwrap();
+    assert_eq!(all.len(), 4);
+    let only: Vec<String> = github
+        .list_repos("Example-Org")
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(only, ["example-org/api", "example-org/web"]);
+    assert_eq!(
+        github.list_owners().await.unwrap(),
+        ["hive-bot", "example-org", "example-labs"]
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn an_enterprise_address_with_a_path_keeps_it() {
+    let replay = Replay::start(vec![Exchange::get(
+        "/api/v3/repos/example-org/api/issues/42",
+    )
+    .fixture("issue_42.json")])
+    .await;
+    let github = GitHub::new(&format!("{}/api/v3/", replay.url()), TOKEN).unwrap();
+    assert_eq!(github.get_issue(&repo(), 42).await.unwrap().number, 42);
+    replay.finish();
+}
+
+#[tokio::test]
+#[should_panic(expected = "GET /repos/example-org/api/issues/99")]
+async fn a_request_nobody_planned_fails_the_test_and_is_named() {
+    let replay = Replay::start(vec![
+        Exchange::get("/repos/example-org/api/issues/42").fixture("issue_42.json")
+    ])
+    .await;
+    let github = github(&replay).await;
+    github.get_issue(&repo(), 42).await.unwrap();
+    // The adapter reports the 418 as an ordinary failure; the replay still remembers it.
+    assert!(github.get_issue(&repo(), 99).await.is_err());
+    replay.finish();
+}
+
+#[tokio::test]
+#[should_panic(expected = "never asked for: GET /user/orgs")]
+async fn an_exchange_nobody_asked_for_fails_the_test_too() {
+    let replay = Replay::start(vec![Exchange::get("/user/orgs").fixture("orgs.json")]).await;
+    replay.finish();
+}

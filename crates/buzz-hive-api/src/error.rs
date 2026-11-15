@@ -1,6 +1,8 @@
 //! One error type, one mapping to the Connect JSON body and HTTP status.
 
+use buzz_hive_core::orchestrator::intake::IntakeError;
 use buzz_hive_core::orchestrator::OpError;
+use buzz_hive_core::ports::code_host::HostError;
 use buzz_hive_core::ports::store::StoreError;
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +86,31 @@ impl From<OpError> for HiveError {
             OpError::FailedPrecondition(message) => Self::FailedPrecondition(message),
             OpError::PermissionDenied(message) => Self::PermissionDenied(message),
             OpError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<HostError> for HiveError {
+    fn from(error: HostError) -> Self {
+        match error {
+            HostError::NotFound(message) => Self::NotFound(message),
+            HostError::RateLimited { retry_after } => Self::ResourceExhausted(format!(
+                "GitHub is rate limiting the team token; try again in {} seconds",
+                retry_after.as_secs().max(1)
+            )),
+            HostError::Unauthorized(message) => {
+                Self::FailedPrecondition(format!("GitHub refused the team token: {message}"))
+            }
+            HostError::Other(message) => Self::Unavailable(format!("GitHub failed: {message}")),
+        }
+    }
+}
+
+impl From<IntakeError> for HiveError {
+    fn from(error: IntakeError) -> Self {
+        match error {
+            IntakeError::Op(error) => error.into(),
+            IntakeError::Host(error) => error.into(),
         }
     }
 }

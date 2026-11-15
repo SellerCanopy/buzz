@@ -26,6 +26,8 @@ axum = { workspace = true }
 chrono = { workspace = true }
 nostr = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
@@ -38,9 +40,7 @@ base64 = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 jsonwebtoken = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 sqlx = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
