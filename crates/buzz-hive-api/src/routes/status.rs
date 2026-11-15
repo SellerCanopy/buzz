@@ -67,7 +67,9 @@ pub async fn get_usage(
     ctx: Ctx,
     _req: GetUsageRequest,
 ) -> Result<GetUsageResponse, HiveError> {
-    let usage = buzz_hive_core::orchestrator::usage::get(app.store.as_ref(), &ctx.op()).await?;
+    let usage =
+        buzz_hive_core::orchestrator::usage::get(app.store.as_ref(), &ctx.op(), &app.hive_pubkey)
+            .await?;
     let count = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
     let seconds = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     Ok(GetUsageResponse {

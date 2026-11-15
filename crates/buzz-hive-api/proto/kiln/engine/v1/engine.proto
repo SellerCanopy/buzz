@@ -83,8 +83,9 @@ service EngineService {
   // Beehive: an artifact the stage lists and the request leaves out is
   // approved at its latest version. The card needs an open approval item, else
   // FailedPrecondition, and a listed artifact with no saved version is
-  // FailedPrecondition too. Approve is the Run level; the agent that holds the
-  // stage may call it until auto mode (Phase 13) decides who may.
+  // FailedPrecondition too, for a person and for an agent, which is held to the
+  // rule auto mode uses and is told which artifact is missing. Approve is the
+  // Run level; the agent that holds the stage may call it.
   rpc Approve(ApproveRequest) returns (Card);
   // SendBack answers the card's open approval stage with comments and moves
   // the card on needs_work. The stage it goes to gets the comments.
@@ -114,6 +115,9 @@ service EngineService {
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
   // ListAutoDecisions returns the answers auto mode gave on a card, oldest
   // first.
+  //
+  // Beehive: the entries are the card's activity entries of type auto, with
+  // the reason each carries. An unknown card is NotFound. Read level.
   rpc ListAutoDecisions(ListAutoDecisionsRequest) returns (ListAutoDecisionsResponse);
   // ListActivity returns a card's activity entries, oldest first, and the
   // newest event seq from one snapshot. It fails with InvalidArgument for
@@ -282,6 +286,14 @@ service EngineService {
   // fails with InvalidArgument for an unknown key or a value of the wrong
   // type.
   rpc SetSetting(SetSettingRequest) returns (Setting);
+  // SetAutoMode turns auto mode on or off for a card and returns the card.
+  //
+  // Beehive addition: it changes the card.auto_mode setting, as SetSetting
+  // does, and is the one call an agent has for it. Run level. An agent may turn
+  // auto mode on only for a person at Run or above; one with no such requester
+  // is PermissionDenied, as is the same change through SetSetting. Turning it
+  // on answers what the card already waits on.
+  rpc SetAutoMode(SetAutoModeRequest) returns (Card);
   // ListAgentProfiles lists the agent profiles this engine can launch, with
   // whether each program is found on this machine, the profile the
   // agent.profile user setting names (empty when unset) and the one used
@@ -678,6 +690,8 @@ message Card {
   bool issue_without_repo = 20;
   // True when card.auto_mode is set on the card, so the engine answers
   // its inbox items on its own.
+  //
+  // Beehive: only GetCard sets it.
   bool auto_mode = 21;
   // True once the card has any run. A card that has run keeps its workflow.
   bool has_run = 22;
@@ -1264,13 +1278,15 @@ message ListRunsResponse {
 }
 
 message ListAutoDecisionsRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID.
+  string card_id = 1;
 }
 
 // AutoDecision is one answer auto mode gave on a card.
 message AutoDecision {
-  int64 item_id = 1;
-  // The answered item's kind, such as ask or approval.
+  // Beehive: the answered item's UUID.
+  string item_id = 1;
+  // The answered item's kind, such as approval or failure.
   string kind = 2;
   // The answered item's title.
   string title = 3;
@@ -2124,6 +2140,13 @@ message SetSettingRequest {
   string workflow = 5;
 }
 
+message SetAutoModeRequest {
+  // The card's UUID.
+  string card_id = 1;
+  // True turns auto mode on; false turns it off.
+  bool enabled = 2;
+}
+
 message ListAgentsRequest {}
 
 message ListAgentsResponse {
@@ -2881,6 +2904,9 @@ message GetFullPayloadResponse {
 // ActivityAuthor is who wrote an entry: kind is agent, person or kiln, and
 // id is a model ID, a person's user ID ("" before an owner is set on a
 // token-mode engine), or kiln.
+//
+// Beehive: an entry the Beehive account wrote, such as an answer auto mode gave,
+// has kind kiln and the account's key as its id.
 message ActivityAuthor {
   string kind = 1;
   string id = 2;

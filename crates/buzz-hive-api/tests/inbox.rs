@@ -405,3 +405,123 @@ async fn usage_counts_only_what_agents_started_and_has_no_cost_figures() {
         assert!(!text.contains(word), "{word} in {text}");
     }
 }
+
+#[tokio::test]
+async fn an_agent_with_no_person_behind_it_cannot_turn_on_auto_mode() {
+    let (app, card) = at_the_gate().await;
+    // The agent holds Run, so the route admits it; the rule is about who it acts for.
+    let (status, body) = call(
+        &app,
+        "SetAutoMode",
+        BUILDER,
+        json!({"cardId": card, "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("Run or above"),
+        "{body}"
+    );
+    // The setting is the same switch, so it is refused there as well.
+    let (status, body) = call(
+        &app,
+        "SetSetting",
+        BUILDER,
+        json!({"scope": "card", "scopeId": card, "key": "card.auto_mode", "valueJson": "true"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (_, got) = call(&app, "GetCard", MEMBER, json!({"cardId": card})).await;
+    assert_ne!(got["autoMode"], true, "the card stayed out of auto mode");
+    assert_eq!(inbox(&app, OWNER, &card, false).await.len(), 1);
+
+    // Turning it off needs no person: nothing is answered without one.
+    let (status, body) = call(
+        &app,
+        "SetAutoMode",
+        BUILDER,
+        json!({"cardId": card, "enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_reader_cannot_change_auto_mode() {
+    let (app, card) = at_the_gate().await;
+    let (status, body) = call(
+        &app,
+        "SetAutoMode",
+        MEMBER,
+        json!({"cardId": card, "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn a_person_turns_on_auto_mode_and_the_gate_passes_with_its_reason_in_activity() {
+    let (app, card) = at_the_gate().await;
+    assert_eq!(inbox(&app, OWNER, &card, false).await.len(), 1);
+
+    let (status, got) = call(
+        &app,
+        "SetAutoMode",
+        OWNER,
+        json!({"cardId": card, "enabled": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["autoMode"], true);
+    assert!(inbox(&app, OWNER, &card, false).await.is_empty());
+    assert_eq!(state(&app, &card).await, "running", "ship started");
+
+    // Read level lists the decisions.
+    let (status, decisions) =
+        call(&app, "ListAutoDecisions", MEMBER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let decisions = decisions["decisions"].as_array().unwrap();
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert_eq!(decisions[0]["kind"], "approval");
+    assert_eq!(decisions[0]["answer"], "approve");
+    assert_eq!(decisions[0]["reason"], "approved plan v1");
+    assert!(!decisions[0]["itemId"].as_str().unwrap().is_empty());
+
+    // The entry is in Activity, written by the Beehive account.
+    let (status, activity) = call(&app, "ListActivity", MEMBER, json!({"cardId": card})).await;
+    assert_eq!(status, StatusCode::OK, "{activity}");
+    let entry = activity["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == "auto")
+        .unwrap_or_else(|| panic!("no auto entry: {activity}"));
+    assert_eq!(entry["author"]["id"], HIVE);
+    assert_eq!(entry["author"]["kind"], "kiln");
+    assert_eq!(entry["detail"], "approved plan v1");
+
+    // Turning it off is the same call, and the card reads as out of auto mode.
+    let (status, got) = call(
+        &app,
+        "SetAutoMode",
+        OWNER,
+        json!({"cardId": card, "enabled": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_ne!(got["autoMode"], true);
+}
+
+#[tokio::test]
+async fn the_auto_decisions_of_a_card_that_does_not_exist_are_not_found() {
+    let (app, _card) = at_the_gate().await;
+    let (status, body) = call(
+        &app,
+        "ListAutoDecisions",
+        OWNER,
+        json!({"cardId": "00000000-0000-0000-0000-0000000000ff"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

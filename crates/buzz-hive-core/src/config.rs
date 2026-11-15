@@ -19,6 +19,8 @@ use crate::workflow::names::{check_param_value, param_name};
 
 /// The key that names the channel the engine posts in.
 pub const KEY_UPDATE_CHANNEL: &str = "update_channel";
+/// The card setting that puts a card in auto mode.
+pub const KEY_AUTO_MODE: &str = "card.auto_mode";
 /// A package parameter's value is the key `params.<name>`.
 pub const PARAM_PREFIX: &str = "params.";
 /// A workflow or card override for one stage is the key `stage.<id>.<key>`.
@@ -142,7 +144,7 @@ pub const KEYS: &[Key] = &[
         ValueType::Bool,
         Default::Bool(false),
     )),
-    card(key("card.auto_mode", ValueType::Bool, Default::Bool(false))),
+    card(key(KEY_AUTO_MODE, ValueType::Bool, Default::Bool(false))),
     engine(key("default_repo", ValueType::Text, Default::Text(""))),
     engine(key(KEY_UPDATE_CHANNEL, ValueType::Channel, Default::Unset)),
 ];

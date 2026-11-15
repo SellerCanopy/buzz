@@ -64,7 +64,17 @@ pub(super) async fn facts(
         visits: tx.runs().visit_counts(card.id).await?,
         plan,
         execution,
+        auto_mode: auto_mode_of(tx, card.id).await?,
     })
+}
+
+/// Whether the card is in auto mode.
+pub(super) async fn auto_mode_of(tx: &mut dyn Tx, card: Uuid) -> Result<bool, OpError> {
+    let value = tx
+        .settings()
+        .get("card", &card.to_string(), config::KEY_AUTO_MODE)
+        .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 /// A stage's timeout and retries from its resolved settings. A value that does not parse was
@@ -208,6 +218,9 @@ pub(super) async fn apply(
         directory: &directory,
         ..*env
     };
+    let opens_item = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenInbox { .. }));
     let channel = super::settings::update_channel(tx).await?;
     for effect in &effects {
         if let Effect::PostStageTask {
@@ -221,6 +234,14 @@ pub(super) async fn apply(
             env.directory
                 .member_of_channel(ctx.community, channel, &agent)
                 .await?;
+        }
+    }
+    // A card in auto mode may answer its own items below, and each answer posts to the next
+    // stage's agent. Ask for the workflow's agents now, before the first append, so those
+    // answers find them here.
+    if auto_mode_of(tx, card.id).await? {
+        if let Some(channel) = channel {
+            ask_directory(env, ctx, package, channel).await?;
         }
     }
     let next = if ended == Some(Ended::Done) && mode == Mode::Update {
@@ -454,7 +475,53 @@ pub(super) async fn apply(
     if let Some(next) = next {
         hand_off(env, ctx, tx, card, next).await?;
     }
+    // A card in auto mode answers the item this step opened, and whatever the answer opens in
+    // turn. The run and the card are then as the answers left them.
+    if opens_item && Box::pin(super::auto::settle(env, ctx, tx, card.id)).await? {
+        if let Some(current) = tx.cards().get(card.id).await? {
+            *card = current;
+        }
+        let latest = match tx.runs().active_for_card(card.id).await? {
+            Some(active) => Some(active),
+            None => tx.runs().get(run.id).await?,
+        };
+        if let Some(latest) = latest {
+            run = latest;
+        }
+    }
     Ok(run)
+}
+
+/// Asks the directory for what a step on the workflow's card may need: that the update channel
+/// exists, that the Beehive account and each agent the stages name are in it. A step that goes
+/// on to answer an item, or to start a run, finds the answers here instead of asking after its
+/// first append, which takes the log lock. An agent that cannot be found is left for the step
+/// that needs it to refuse.
+pub(super) async fn ask_directory(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    package: &Package,
+    channel: Uuid,
+) -> Result<(), OpError> {
+    env.directory.channel_exists(ctx.community, channel).await?;
+    env.directory
+        .member_of_channel(ctx.community, channel, env.hive)
+        .await?;
+    for stage in &package.workflow.stages {
+        let Some(name) = stage.agent.as_deref() else {
+            continue;
+        };
+        match find_agent(env, ctx, name, &package.meta.name, &stage.id).await {
+            Ok(agent) => {
+                env.directory
+                    .member_of_channel(ctx.community, channel, &agent)
+                    .await?;
+            }
+            Err(OpError::FailedPrecondition(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(())
 }
 
 fn need_channel(channel: Option<Uuid>) -> Result<Uuid, OpError> {

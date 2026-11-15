@@ -161,6 +161,13 @@ pub const TOOLS: &[Tool] = &[
         schema: set_setting,
     },
     Tool {
+        name: "set_auto_mode",
+        route: "SetAutoMode",
+        needs: Level::Run,
+        description: "Turn auto mode on or off for a card. In auto mode the engine approves a gate whose listed artifacts all have a saved version, starts a failed run again twice, and asks a stage that did not report to carry on twice. It leaves everything else to a person. You may turn it on only for a person at Run or above; with none named the call is refused.",
+        schema: set_auto_mode,
+    },
+    Tool {
         name: SAVE_ARTIFACT,
         route: "SaveArtifact",
         needs: Level::Run,
@@ -227,7 +234,7 @@ pub const TOOLS: &[Tool] = &[
         name: "approve_gate",
         route: "Approve",
         needs: Level::Run,
-        description: "Approve the approval stage the card waits at. Each artifact the stage lists is approved at its latest version, or at the version you name. A listed artifact with no saved version is refused.",
+        description: "Approve the approval stage the card waits at. Each artifact the stage lists is approved at its latest version, or at the version you name. A listed artifact with no saved version is refused by name, and the gate waits for a person.",
         schema: approve_gate,
     },
     Tool {
@@ -283,6 +290,10 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "ListCardFiles",
         "the Files tab lists a card's files; a stage task says how to download its inputs",
+    ),
+    (
+        "ListAutoDecisions",
+        "the Activity tab shows each auto answer with its reason; an agent reads get_inbox for what still waits",
     ),
     (
         "SkipStage",
@@ -761,6 +772,19 @@ fn get_settings() -> Value {
             ),
         ],
         &["scope"],
+    )
+}
+
+fn set_auto_mode() -> Value {
+    object(
+        vec![
+            ("cardId", string("The card's id.")),
+            (
+                "enabled",
+                json!({ "type": "boolean", "description": "True turns auto mode on, false turns it off." }),
+            ),
+        ],
+        &["cardId", "enabled"],
     )
 }
 

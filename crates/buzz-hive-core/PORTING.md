@@ -106,7 +106,7 @@ spec's title and are confirmed when that phase starts.
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
 | `artifacts` | changed (Phase 9 ports the contract: save, versions, read, hand-off, the stage-declared outputs rule and the task message naming inputs, in `tests/artifacts.rs` and `buzz-hive-api/tests/artifacts.rs`. The Go spec's approval and image-review screens are not ported; buzz-app `e2e` carries the Files tab) | 9 |
 | `assistant` | pending | 20 |
-| `auto-mode` | pending | 13 |
+| `auto-mode` | changed (Phase 13 ports the contract: a card in auto mode has its approval gates approved when every listed artifact has a saved version, a failed run started again twice and a stage with no result asked to carry on twice, each with its reason in Activity, and a loop that is never unbounded. The Go spec's cost-cap cases, its Ask recommendations and forms and its paused-turn reply are dropped, see the Phase 13 deliverables. The Switch and the Activity entry are covered in buzz-app `ActivityTab.test.tsx` and `BeehivePage.test.tsx`) | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
 | `boot` | pending | 3 |
 | `browse` | pending (the Go spec browses GitHub issues, which needs intake) | 16 |
@@ -285,7 +285,8 @@ spec's title and are confirmed when that phase starts.
 - `calls`: `then` is honored after a `passed` call. `give` waits for Phase 9.
 - A hand-off to a next workflow may leave the card done with an `activity.added` note.
   A run that ends in its start step does not hand off.
-- Loop count is per run. The Go `card.loop_limit` auto mode does not apply.
+- Loop count is per run. The Go `card.loop_limit` setting does not apply. Auto mode only fills in a
+  bound for a stage whose workflow sets none (Phase 13).
 - The card has no labels field yet, so `Facts.labels` is empty until Phase 16 and every
   stage that needs a label follows `else`. The plan score is (0, 0) until Phase 9.
 - Dropped: `DecidePermission` and `LevelAsks`. Buzz owns who may do what.
@@ -354,3 +355,61 @@ spec's title and are confirmed when that phase starts.
   There is no token or cost field.
 - Tests: core `tests/inbox.rs`, api `tests/inbox.rs`, store `tests/postgres_inbox.rs` and
   `buzz-hive/tests/e2e_approval.rs` (needs a local relay).
+
+## Phase 13 deliverables
+
+- Rules: `rules/auto.rs` ports `rules/autopilot.go` without its cost cap and its advisory
+  counter: `AUTO_RETRIES` and `AUTO_RESUMES` are 2, `AUTO_LOOP_LIMIT` is 10, `answer_gate`
+  approves only when every artifact an approval lists has a saved version (and names the first
+  one that has none), and `auto_answer` leaves everything else to a person. `rules/run.rs`
+  uses `auto_loop_limit(stage.loop_limit)` when `Facts.auto_mode` is set, so a loop with no
+  limit stops after 10 backward routes and opens a Route item for a person.
+- Setting: `card.auto_mode` stays a card-scope bool (the key already existed from Phase 6).
+  A new `SetAutoMode` rpc (Run) sets it and returns the card. It is the one call an agent has,
+  as the `set_auto_mode` tool. `SetSetting` for the same key is guarded in the same way. An
+  agent may turn it on only when the person it acts for is at Run or above. Phase 15 supplies
+  that claim, so until then an agent has no requester and is refused. A person at Run or above,
+  and turning it off, are always allowed. `GetCard` reports `auto_mode`.
+- Orchestrator: `orchestrator/auto.rs` runs at the end of every step that opens an item and
+  when auto mode is turned on for a card that already waits. It answers each item as the
+  Beehive account, through the path a person's answer takes, so a card's routing, outbox
+  posts and events are the same. The answer writes an activity entry of type `auto` with the
+  reason (`ListAutoDecisions` reads those entries, oldest first). An answer that cannot be
+  carried out (for example the next agent left the channel) is undone by a savepoint and left
+  for a person with a note, so it never fails the step that opened the item.
+- Attempts are counted from the inbox rows: consecutive items of the same kind and stage that
+  the Beehive account answered with `retry`. No migration was needed.
+- Agents: `approve_gate` is held to the same rule, with or without auto mode. A gate that lists
+  an artifact with no saved version is refused, naming it, and waits for a person.
+- Directory: the relay's directory is asked before the first append of a transaction (the
+  Phase 12 rule). `decide` did not do that for a person's answer to a gate; it now asks first,
+  and so does turning auto mode on.
+- Usage: `GetUsage` leaves out the Beehive account's own events, so a run auto mode started
+  again is not counted as started by an agent.
+- Dropped from `scenario_auto_mode_test.go`, with the reason:
+  - The ten cost-cap cases (`StopsACardAtItsCostCap`, `LetsACardUnderItsCostCapPass`,
+    `OverTheCostCapAnswersNothing`, `RaisingTheCostCapLetsTheCardStartAgain`,
+    `StopsACardWhoseSpendEqualsItsCap`, `CostCapOfZeroRefusesAFreshCard`,
+    `AutoStartLaneOverTheCostCapFailsNothing`, `OffStartsOverTheCostCap`,
+    `RefusesARetryOverTheCostCap`, `TestCardIgnoresTheCostCap`): Beehive has no cost figures.
+  - The Ask cases (`AnswersARecommendedAsk`, `AnswersAFormByTheTitleMark`,
+    `NudgesOnceThenAnswersTheMarkedAsk`, `LeavesASecondUnmarkedAskOpen`,
+    `AnswersAnUnmarkedAskWithTheAnsweringAgent`, `LeavesAnAskWhenTheAnsweringAgentFails`,
+    `RepliesToOnePausedTurn`, `KeepsAQuietAgentWaiting`, `SkipsATestCard`): a Beehive question
+    is an agent's `ask_gate` and always waits for a person, there is no test card, and a quiet
+    agent is handled by the stage timeout of Phase 11.
+  - `CardLoopLimitReplacesTheStages`: there is no `card.loop_limit` key.
+- Ported in `tests/auto_mode.rs`: `KeyBelongsToACard`, `OffLeavesTheAskOpen` (the gate),
+  `TurningAutoModeOnAnswersTheOpenAsk` (the gate), `ApprovesAReviewStage`,
+  `LeavesAnApprovalWithAMissingArtifact`, `RetriesTwiceThenLeavesTheFailure`,
+  `RetriesANoResultTwice`, `RouteBackCountsTowardTheLoopLimit` (as the 10-visit bound), and in
+  `buzz-hive-api/tests/inbox.rs` `ListAutoDecisionsRefusesAnUnknownCard`.
+- Differences from Go: a Route item, a Question and a missing output are left to a person (Go
+  retries a missing output); a retry or resume carries a reason in Activity as the other
+  answers do; the advisory counter is not ported because Buzz has no advisory inbox kind.
+- Port seams: the `Tx` port gained `savepoint`, `rollback_savepoint` and `release_savepoint`
+  (`MemStore`, `PgStore` and the directory spy implement them), and `UsageRepo::usage` takes the
+  engine's pubkey.
+- Tests: core `tests/auto_mode.rs` and `tests/directory_before_log.rs`, api `tests/inbox.rs`,
+  store `tests/postgres_savepoint.rs` and `buzz-hive/tests/e2e_auto_mode.rs` (needs a local
+  relay).

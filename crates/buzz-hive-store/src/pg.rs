@@ -40,6 +40,7 @@ impl Store for PgStore {
             tx,
             appended: Vec::new(),
             locked_log: false,
+            savepoints: Vec::new(),
         }))
     }
 }
@@ -51,6 +52,10 @@ struct PgTx {
     appended: Vec<Event>,
     /// Whether this transaction holds the event-log lock.
     locked_log: bool,
+    /// For each open savepoint, newest last: how many events were appended and whether the
+    /// log lock was held when it opened. Postgres releases a lock taken after a savepoint
+    /// when the savepoint is rolled back, so the flag goes back with it.
+    savepoints: Vec<(usize, bool)>,
 }
 
 #[async_trait::async_trait]
@@ -87,6 +92,43 @@ impl Tx for PgTx {
     }
     fn usage(&mut self) -> &mut dyn UsageRepo {
         self
+    }
+    async fn savepoint(&mut self) -> Result<(), StoreError> {
+        // Savepoints of one name nest: each statement below names the newest.
+        sqlx::query("SAVEPOINT hive_sp")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        self.savepoints.push((self.appended.len(), self.locked_log));
+        Ok(())
+    }
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError> {
+        let (appended, locked_log) = self
+            .savepoints
+            .pop()
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))?;
+        sqlx::query("ROLLBACK TO SAVEPOINT hive_sp")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        // The savepoint stays open after a rollback to it, so close it.
+        sqlx::query("RELEASE SAVEPOINT hive_sp")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        self.appended.truncate(appended);
+        self.locked_log = locked_log;
+        Ok(())
+    }
+    async fn release_savepoint(&mut self) -> Result<(), StoreError> {
+        self.savepoints
+            .pop()
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))?;
+        sqlx::query("RELEASE SAVEPOINT hive_sp")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        Ok(())
     }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let PgTx { tx, appended, .. } = *self;
@@ -1453,7 +1495,7 @@ impl InboxRepo for PgTx {
 
 #[async_trait::async_trait]
 impl UsageRepo for PgTx {
-    async fn usage(&mut self, weeks: u32) -> Result<Usage, StoreError> {
+    async fn usage(&mut self, weeks: u32, engine: &str) -> Result<Usage, StoreError> {
         let (runs, ended, average, longest): (i64, i64, Option<f64>, Option<f64>) = sqlx::query_as(
             "SELECT count(*), count(ended_at), \
                  avg(EXTRACT(EPOCH FROM (ended_at - started_at)))::float8, \
@@ -1473,13 +1515,15 @@ impl UsageRepo for PgTx {
                  count(e.seq) FILTER (WHERE e.kind = 'card.created'), \
                  count(e.seq) FILTER (WHERE e.kind = 'run.started') \
              FROM w LEFT JOIN hive.events e ON e.community_id = $1 \
-                 AND e.actor_kind = 'agent' AND e.kind IN ('card.created', 'run.started') \
+                 AND e.actor_kind = 'agent' AND e.actor_pubkey <> $3 \
+                 AND e.kind IN ('card.created', 'run.started') \
                  AND e.at >= w.starts AT TIME ZONE 'utc' \
                  AND e.at < (w.starts + interval '1 week') AT TIME ZONE 'utc' \
              GROUP BY w.starts ORDER BY w.starts",
         )
         .bind(self.community)
         .bind(i32::try_from(weeks).unwrap_or(i32::MAX))
+        .bind(engine)
         .fetch_all(&mut *self.tx)
         .await
         .map_err(store_error)?;

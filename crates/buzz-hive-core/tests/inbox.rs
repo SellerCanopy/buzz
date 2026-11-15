@@ -21,7 +21,7 @@ use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::{timers, OpError};
 use buzz_hive_core::ports::store::Store;
 use buzz_hive_core::testing::ManualClock;
-use common::{agent, ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
+use common::{agent, ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY, HIVE};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -627,7 +627,7 @@ async fn usage_counts_only_what_agents_started() {
     .0;
     start_run(&f.env(), &builder(), by_agent.id).await.unwrap();
 
-    let found = usage::get(&f.store, &person()).await.unwrap();
+    let found = usage::get(&f.store, &person(), HIVE).await.unwrap();
     assert_eq!(found.runs, 2);
     assert_eq!(found.ended_runs, 0);
     assert_eq!(found.weeks.len(), 8);

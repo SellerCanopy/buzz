@@ -5,6 +5,7 @@
 
 pub mod activity;
 pub mod artifacts;
+pub mod auto;
 pub mod cards;
 pub mod inbox;
 mod lookup;

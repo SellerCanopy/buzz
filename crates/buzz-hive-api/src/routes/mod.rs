@@ -48,6 +48,7 @@ pub const ROUTES: &[(&str, Level)] = &[
     // Run admits a card or workflow setting. The handler asks for Admin when the scope is
     // the community's own.
     ("SetSetting", Level::Run),
+    ("SetAutoMode", Level::Run),
     ("ListAgents", Level::Read),
     ("SkipStage", Level::Run),
     ("PauseCard", Level::Run),
@@ -78,6 +79,7 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListActivity", Level::Read),
     ("GetFullPayload", Level::Read),
     ("GetUsage", Level::Read),
+    ("ListAutoDecisions", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -164,6 +166,7 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListRuns", runs::list_runs);
     let r = route(r, "GetSettings", settings::get_settings);
     let r = route(r, "SetSetting", settings::set_setting);
+    let r = route(r, "SetAutoMode", settings::set_auto_mode);
     let r = route(r, "ListAgents", agents::list_agents);
     let r = route(r, "SkipStage", stages::skip_stage);
     let r = route(r, "PauseCard", stages::pause_card);
@@ -193,5 +196,6 @@ pub fn router() -> Router<App> {
     let r = route(r, "AnswerInbox", inbox::answer_inbox);
     let r = route(r, "ListActivity", activity::list_activity);
     let r = route(r, "GetFullPayload", activity::get_full_payload);
+    let r = route(r, "ListAutoDecisions", activity::list_auto_decisions);
     route(r, "GetUsage", status::get_usage)
 }

@@ -8,10 +8,14 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::auto::settle;
+use super::lookup::Memo;
+use super::routes::ask_directory;
 use super::{Ctx, Env, OpError};
 use crate::access::Level;
 use crate::config::{
-    self, lookup, split_stage, validate, Entry, Layer, Layers, Resolution, KEY_UPDATE_CHANNEL,
+    self, lookup, split_stage, validate, Entry, Layer, Layers, Resolution, KEY_AUTO_MODE,
+    KEY_UPDATE_CHANNEL,
 };
 use crate::domain::events::Event;
 use crate::ports::store::Tx;
@@ -207,6 +211,24 @@ pub async fn set_setting(
         let channel = parse_channel(value)?;
         check_channel(env, ctx, channel, JOIN_MESSAGE).await?;
     }
+    // Turning auto mode on answers what the card already waits on. Ask the directory for the
+    // card's agents first, before the first append takes the log lock.
+    let memo = Memo::new(env.directory);
+    let env = &Env {
+        directory: &memo,
+        ..*env
+    };
+    let enabling = match (scope, name, &value) {
+        (Scope::Card(id), KEY_AUTO_MODE, Some(Value::Bool(true))) => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = enabling {
+        let card = tx.cards().get(id).await?;
+        let package = card.and_then(|card| env.catalog.get(&card.workflow));
+        if let (Some(package), Some(channel)) = (package, update_channel(&mut *tx).await?) {
+            ask_directory(env, ctx, package, channel).await?;
+        }
+    }
     let (stored_scope, scope_id) = scope.stored();
     match &value {
         Some(value) => {
@@ -233,6 +255,9 @@ pub async fn set_setting(
         }),
     );
     tx.events().append(event).await?;
+    if let Some(id) = enabling {
+        settle(env, ctx, &mut *tx, id).await?;
+    }
     // Read the layers again so the answer reflects the write.
     let (layers, package, name) = layers_for(env, &mut *tx, scope).await?;
     let resolution = resolve_in(&layers, package, &name, scope, stage_id)?;

@@ -59,6 +59,13 @@ pub trait Tx: Send {
     fn timers(&mut self) -> &mut dyn TimersRepo;
     fn inbox(&mut self) -> &mut dyn InboxRepo;
     fn usage(&mut self) -> &mut dyn UsageRepo;
+    /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
+    /// [`Tx::release_savepoint`] close the newest one still open.
+    async fn savepoint(&mut self) -> Result<(), StoreError>;
+    /// Undoes everything written since the newest savepoint, events included, and closes it.
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError>;
+    /// Closes the newest savepoint and keeps what was written since.
+    async fn release_savepoint(&mut self) -> Result<(), StoreError>;
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError>;
 }
 
@@ -326,8 +333,13 @@ pub trait InboxRepo: Send {
 pub trait UsageRepo: Send {
     /// The community's runs and durations, and the last `weeks` weeks of what agents started,
     /// counted from the event log by the actor of each event. The weeks are the database's
-    /// own, the current one last.
-    async fn usage(&mut self, weeks: u32) -> Result<crate::domain::usage::Usage, StoreError>;
+    /// own, the current one last. Events of `engine`, the Beehive account, are not an agent's
+    /// doing, so they are left out: a run auto mode starts again is not one an agent started.
+    async fn usage(
+        &mut self,
+        weeks: u32,
+        engine: &str,
+    ) -> Result<crate::domain::usage::Usage, StoreError>;
 }
 
 /// The relay thread a stage task opened. Its root is the message that mentions the agent.

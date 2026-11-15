@@ -142,6 +142,24 @@ pub fn catalog() -> Catalog {
             ]
             .concat(),
         ),
+        // b sends a failure back to a, and no loop limit bounds it.
+        (
+            "unbounded",
+            [stage("a", ""), stage("b", "    on:\n      failed: a\n")].concat(),
+        ),
+        // Like gated, but the stage after the gate names an agent that does not exist, so
+        // approving the gate cannot post its task.
+        (
+            "gatedaway",
+            [
+                stage("draft", "    outputs:\n      - { artifact: plan }\n"),
+                "  - id: gate\n    kind: approval\n    approval:\n      artifacts: [plan]\n"
+                    .to_owned(),
+                "  - id: ship\n    kind: prompt\n    agent: ghost\n    prompt: Ship it\n"
+                    .to_owned(),
+            ]
+            .concat(),
+        ),
         // A stage that repeats until every item of its plan is checked.
         (
             "ticked",

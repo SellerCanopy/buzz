@@ -225,7 +225,7 @@ async fn usage_counts_agent_events_by_week_and_run_times() {
     tx.commit().await.unwrap();
 
     let mut tx = store.begin(community).await.unwrap();
-    let usage = tx.usage().usage(8).await.unwrap();
+    let usage = tx.usage().usage(8, "hive").await.unwrap();
     assert_eq!(usage.runs, 2);
     assert_eq!(usage.ended_runs, 1);
     assert_eq!(usage.average_run_seconds, 90);
@@ -249,7 +249,7 @@ async fn usage_counts_agent_events_by_week_and_run_times() {
 
     // Another community sees none of it.
     let mut other = store.begin(CommunityId::from_u128(2)).await.unwrap();
-    let nothing = other.usage().usage(8).await.unwrap();
+    let nothing = other.usage().usage(8, "hive").await.unwrap();
     assert_eq!(nothing.runs, 0);
     assert!(nothing.weeks.iter().all(|w| w.runs_started_by_agents == 0));
 }

@@ -17,6 +17,7 @@ pub(super) struct Memo<'a> {
     inner: &'a dyn Directory,
     agents: Mutex<HashMap<String, Vec<AgentInfo>>>,
     members: Mutex<HashMap<(uuid::Uuid, String), bool>>,
+    channels: Mutex<HashMap<uuid::Uuid, bool>>,
 }
 
 impl<'a> Memo<'a> {
@@ -25,6 +26,7 @@ impl<'a> Memo<'a> {
             inner,
             agents: Mutex::default(),
             members: Mutex::default(),
+            channels: Mutex::default(),
         }
     }
 }
@@ -70,7 +72,12 @@ impl Directory for Memo<'_> {
         community: CommunityId,
         channel: uuid::Uuid,
     ) -> Result<bool, StoreError> {
-        self.inner.channel_exists(community, channel).await
+        if let Some(exists) = self.channels.lock().unwrap().get(&channel) {
+            return Ok(*exists);
+        }
+        let exists = self.inner.channel_exists(community, channel).await?;
+        self.channels.lock().unwrap().insert(channel, exists);
+        Ok(exists)
     }
 
     async fn member_of_channel(

@@ -114,6 +114,7 @@ impl Store for MemStore {
             community,
             work,
             pending: Vec::new(),
+            savepoints: Vec::new(),
             shared: self.state.clone(),
             log: self.log.clone(),
             clock: self.clock.clone(),
@@ -126,6 +127,8 @@ struct MemTx {
     work: State,
     /// Appended in this transaction, with no seq yet.
     pending: Vec<Event>,
+    /// The state and the pending count at each open savepoint, newest last.
+    savepoints: Vec<(State, usize)>,
     shared: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
     clock: Arc<dyn Clock>,
@@ -166,11 +169,32 @@ impl Tx for MemTx {
     fn usage(&mut self) -> &mut dyn UsageRepo {
         self
     }
+    async fn savepoint(&mut self) -> Result<(), StoreError> {
+        self.savepoints
+            .push((self.work.clone(), self.pending.len()));
+        Ok(())
+    }
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError> {
+        let (work, pending) = self
+            .savepoints
+            .pop()
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))?;
+        self.work = work;
+        self.pending.truncate(pending);
+        Ok(())
+    }
+    async fn release_savepoint(&mut self) -> Result<(), StoreError> {
+        self.savepoints
+            .pop()
+            .map(|_| ())
+            .ok_or_else(|| StoreError::Conflict("no savepoint is open".into()))
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         let MemTx {
             community,
             work,
             pending,
+            savepoints: _,
             shared,
             log,
             clock: _,
@@ -970,7 +994,7 @@ impl TimersRepo for MemTx {
 
 #[async_trait::async_trait]
 impl UsageRepo for MemTx {
-    async fn usage(&mut self, weeks: u32) -> Result<Usage, StoreError> {
+    async fn usage(&mut self, weeks: u32, engine: &str) -> Result<Usage, StoreError> {
         let community = self.community;
         let mut runs = 0u32;
         let mut ended = Vec::new();
@@ -994,7 +1018,10 @@ impl UsageRepo for MemTx {
             .collect();
         let log = self.log.lock().unwrap();
         for (c, event) in &log.events {
-            if *c != community || event.actor.kind != ActorKind::Agent {
+            if *c != community
+                || event.actor.kind != ActorKind::Agent
+                || event.actor.pubkey == engine
+            {
                 continue;
             }
             let starts = week_start(event.at.date_naive());

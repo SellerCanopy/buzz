@@ -9,12 +9,16 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::routes::{append, apply, facts, resolved_payload, Mode};
+use super::auto::{artifacts_of, ACTIVITY_AUTO};
+use super::lookup::Memo;
+use super::routes::{append, apply, ask_directory, facts, resolved_payload, Mode};
 use super::run::{
     check_agent, check_position, locked, people_only, require_position, running_stage, start_in,
     stop_in,
 };
+use super::settings::update_channel;
 use super::{Ctx, Env, OpError};
+use crate::access::ActorKind;
 use crate::domain::card::Card;
 use crate::domain::events::Event;
 use crate::domain::inbox::{
@@ -23,6 +27,7 @@ use crate::domain::inbox::{
 };
 use crate::domain::run::{Run, RunState};
 use crate::ports::store::{Posting, Store, Tx};
+use crate::rules::auto::{answer_gate, AutoAnswer};
 use crate::rules::run::{step, task_key, Approved, Input};
 
 /// The longest reason, reply or question, in characters.
@@ -70,6 +75,7 @@ pub async fn answer(
         choice,
         text,
         &BTreeMap::new(),
+        None,
     )
     .await?;
     let events = tx.commit().await?;
@@ -94,6 +100,7 @@ pub async fn approve(
         ANSWER_APPROVE,
         "",
         versions,
+        None,
     )
     .await?;
     let events = tx.commit().await?;
@@ -119,6 +126,7 @@ pub async fn send_back(
         ANSWER_REJECT,
         comments,
         &BTreeMap::new(),
+        None,
     )
     .await?;
     let events = tx.commit().await?;
@@ -126,9 +134,11 @@ pub async fn send_back(
 }
 
 /// Answers an item, or the card's open approval when `item` is `None`, inside the caller's
-/// transaction. Returns the card as it is after the answer, and the item as resolved.
+/// transaction. Returns the card as it is after the answer, and the item as resolved. `auto` is
+/// the reason auto mode gives when the engine answers: it is recorded as an `auto` entry in the
+/// card's activity, and the rules of auto mode have already decided the answer.
 #[allow(clippy::too_many_arguments)]
-async fn decide(
+pub(super) async fn decide(
     env: &Env<'_>,
     ctx: &Ctx,
     tx: &mut dyn Tx,
@@ -137,6 +147,7 @@ async fn decide(
     choice: &str,
     text: &str,
     versions: &BTreeMap<String, i32>,
+    auto: Option<&str>,
 ) -> Result<(Card, InboxItem), OpError> {
     // The card first, as every other input takes it, then the item it holds.
     let held = tx
@@ -175,11 +186,24 @@ async fn decide(
         .get(found.run_id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("run {} does not exist", found.run_id)))?;
+    // The directory is asked before the first append of the transaction, which `resolve` makes.
+    let memo = Memo::new(env.directory);
+    let env = &Env {
+        directory: &memo,
+        ..*env
+    };
+    if !matches!(choice, ANSWER_STOP | ANSWER_DISMISS) {
+        let package = env.catalog.get(&held.workflow);
+        if let (Some(package), Some(channel)) = (package, update_channel(tx).await?) {
+            ask_directory(env, ctx, package, channel).await?;
+        }
+    }
     let summary = summary_of(&found, choice);
+    let by = Answered { auto, text };
     let card = match (found.kind, choice) {
         // An ended run has nothing to step: a retry starts a new one, and a dismiss only closes.
         (InboxKind::Failure, ANSWER_RETRY) => {
-            resolve(tx, ctx, &mut found, choice, text, &summary, &run).await?;
+            resolve(tx, ctx, &mut found, choice, &by, &summary, &run).await?;
             let parameters = run.parameters.clone();
             start_in(
                 env,
@@ -193,11 +217,11 @@ async fn decide(
             reload(tx, card_id).await?
         }
         (InboxKind::Failure, _) => {
-            resolve(tx, ctx, &mut found, choice, text, &summary, &run).await?;
+            resolve(tx, ctx, &mut found, choice, &by, &summary, &run).await?;
             held
         }
         (_, ANSWER_STOP) => {
-            resolve(tx, ctx, &mut found, choice, text, &summary, &run).await?;
+            resolve(tx, ctx, &mut found, choice, &by, &summary, &run).await?;
             stop_in(env, ctx, tx, card_id, Some(run.id)).await?;
             reload(tx, card_id).await?
         }
@@ -207,6 +231,16 @@ async fn decide(
                 return Err(OpError::FailedPrecondition(
                     "the run moved on; the item is out of date".into(),
                 ));
+            }
+            // An agent is held to the rule auto mode uses: a gate that lists an artifact with no
+            // saved version waits for a person, whether or not the card is in auto mode.
+            if choice == ANSWER_APPROVE && ctx.actor.kind == ActorKind::Agent && auto.is_none() {
+                let (listed, saved, _) = artifacts_of(env, tx, &found).await?;
+                if let AutoAnswer::Person { reason } = answer_gate(&listed, &saved) {
+                    return Err(OpError::FailedPrecondition(format!(
+                        "{reason}; the gate waits for a person"
+                    )));
+                }
             }
             let input = match choice {
                 ANSWER_APPROVE => Input::Approve {
@@ -237,7 +271,7 @@ async fn decide(
                     run.state.as_str()
                 )));
             }
-            resolve(tx, ctx, &mut found, choice, text, &summary, &run).await?;
+            resolve(tx, ctx, &mut found, choice, &by, &summary, &run).await?;
             apply(
                 env,
                 ctx,
@@ -357,6 +391,12 @@ fn summary_of(item: &InboxItem, choice: &str) -> String {
     said.chars().take(MAX_SUMMARY_CHARS).collect()
 }
 
+/// What an answer says for itself: a person's text, or the reason of the engine's rule.
+struct Answered<'a> {
+    auto: Option<&'a str>,
+    text: &'a str,
+}
+
 /// Closes the item with the answer, and writes what a person reads back later: the item's
 /// event and an entry in the card's activity with the reason.
 async fn resolve(
@@ -364,7 +404,7 @@ async fn resolve(
     ctx: &Ctx,
     item: &mut InboxItem,
     choice: &str,
-    text: &str,
+    by: &Answered<'_>,
     summary: &str,
     run: &Run,
 ) -> Result<(), OpError> {
@@ -395,13 +435,18 @@ async fn resolve(
         "activity.added",
         run,
         json!({
-            "type": "answer",
-            "summary": summary,
-            "detail": text.trim(),
+            "type": if by.auto.is_some() { ACTIVITY_AUTO } else { "answer" },
+            "summary": match by.auto {
+                Some(_) => format!("auto mode: {summary}"),
+                None => summary.to_owned(),
+            },
+            "detail": by.auto.unwrap_or(by.text).trim(),
             "stage": item.stage,
             "visit": item.visit,
             "kind": item.kind.as_str(),
             "choice": choice,
+            "item": item.id,
+            "title": item.title,
         }),
     )
     .await

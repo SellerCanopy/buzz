@@ -106,6 +106,15 @@ impl Tx for SpyTx {
     fn usage(&mut self) -> &mut dyn UsageRepo {
         self.inner.usage()
     }
+    async fn savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.savepoint().await
+    }
+    async fn rollback_savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.rollback_savepoint().await
+    }
+    async fn release_savepoint(&mut self) -> Result<(), StoreError> {
+        self.inner.release_savepoint().await
+    }
     async fn commit(self: Box<Self>) -> Result<Vec<Event>, StoreError> {
         self.inner.commit().await
     }
@@ -308,4 +317,87 @@ async fn starting_reporting_and_handing_off_ask_the_directory_before_the_first_a
     let run = tx.runs().active_for_card(card.id).await.unwrap().unwrap();
     assert_eq!(run.workflow, "second");
     assert_eq!(run.current_stage.as_deref(), Some("s1"));
+}
+
+/// A card on `gated` at its approval stage, with the plan saved. `auto` puts it in auto mode
+/// first, so the step that opens the gate answers it.
+async fn at_a_gate(w: &World, auto: bool) -> Uuid {
+    use buzz_hive_core::domain::artifact::ArtifactContent;
+    use buzz_hive_core::orchestrator::artifacts::save_artifact;
+
+    let agent = ctx_for(BUILDER, ActorKind::Agent);
+    let (card, _) = create_card(
+        &w.store,
+        &person(),
+        NewCard {
+            title: "Fix login".into(),
+            description: String::new(),
+            workflow: "gated".into(),
+        },
+    )
+    .await
+    .unwrap();
+    if auto {
+        set_setting(
+            &w.env(),
+            &person(),
+            &Scope::Card(card.id),
+            "card.auto_mode",
+            Some(json!(true)),
+        )
+        .await
+        .unwrap();
+    }
+    start_run(&w.env(), &person(), card.id).await.unwrap();
+    save_artifact(
+        &w.env(),
+        &agent,
+        card.id,
+        "plan",
+        ArtifactContent::Text("Step one.".into()),
+    )
+    .await
+    .unwrap();
+    w.spy.reset();
+    stage_done(&w.env(), &agent, card.id, "draft", 1, "passed", "")
+        .await
+        .unwrap();
+    card.id
+}
+
+async fn world_with_channel() -> World {
+    let w = World::new();
+    set_setting(
+        &w.env(),
+        &person(),
+        &Scope::User,
+        "update_channel",
+        Some(json!(CHANNEL.to_string())),
+    )
+    .await
+    .unwrap();
+    w
+}
+
+#[tokio::test]
+async fn a_gate_a_card_in_auto_mode_answers_asks_the_directory_before_the_first_append() {
+    let w = world_with_channel().await;
+    at_a_gate(&w, true).await;
+    w.assert_asked_first("stage_done that opens a gate auto mode approves");
+}
+
+#[tokio::test]
+async fn a_persons_answer_to_a_gate_asks_the_directory_before_the_first_append() {
+    let w = world_with_channel().await;
+    let card = at_a_gate(&w, false).await;
+    w.spy.reset();
+    buzz_hive_core::orchestrator::inbox::approve(
+        &w.env(),
+        &person(),
+        card,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    w.assert_asked_first("approve");
 }

@@ -60,5 +60,5 @@ path = "junit.xml"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "binary(e2e_start) or binary(e2e_one_stage) or binary(e2e_fresh_session) or binary(e2e_files) or binary(e2e_restart) or binary(e2e_approval)"
+filter = "binary(e2e_start) or binary(e2e_one_stage) or binary(e2e_fresh_session) or binary(e2e_files) or binary(e2e_restart) or binary(e2e_approval) or binary(e2e_auto_mode)"
 test-group = "hive-relay"

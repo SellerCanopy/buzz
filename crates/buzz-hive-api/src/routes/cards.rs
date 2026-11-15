@@ -2,6 +2,7 @@
 
 use buzz_hive_core::domain::card::{Card as DomainCard, CardState};
 use buzz_hive_core::domain::events::Event;
+use buzz_hive_core::orchestrator::auto;
 use buzz_hive_core::orchestrator::cards::{self, CardMove, NewCard};
 use uuid::Uuid;
 
@@ -45,6 +46,7 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
     // A card that was reset is idle and starts again at the first stage, so it has no current one.
     let idle = card.state == CardState::Idle;
     let mut proto = to_proto(card, true);
+    proto.auto_mode = auto::is_on(&mut *tx, id).await?;
     proto.stage_id = tx
         .runs()
         .list(Some(id))

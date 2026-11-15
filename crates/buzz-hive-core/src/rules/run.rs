@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::auto::auto_loop_limit;
 use super::conditions::{describe, unmet};
 use super::decide::{
     loop_count, over_loop_limit, resolve_route, retry_decision, routes_backward, Route,
@@ -110,6 +111,9 @@ pub struct Facts {
     /// How long each stage may run and how often it retries, from the settings, by stage id. A
     /// stage that is not listed has no timeout and no retries.
     pub execution: BTreeMap<String, Execution>,
+    /// Whether the card is in auto mode. A loop is then bounded even when its workflow sets no
+    /// loop limit.
+    pub auto_mode: bool,
 }
 
 impl Facts {
@@ -586,7 +590,12 @@ impl<'a> Walk<'a> {
                     return;
                 };
                 let backward = routes_backward(stages, from, to);
-                if limited && backward && stage.loop_limit > 0 {
+                let limit = if self.facts.auto_mode {
+                    auto_loop_limit(stage.loop_limit)
+                } else {
+                    stage.loop_limit
+                };
+                if limited && backward && limit > 0 {
                     // The entries before this one, oldest first.
                     let steps = &self.run.steps;
                     let earlier: Vec<bool> = steps[..steps.len().saturating_sub(1)]
@@ -595,13 +604,13 @@ impl<'a> Walk<'a> {
                         .map(|s| s.backward)
                         .collect();
                     let loops = loop_count(&earlier);
-                    if over_loop_limit(stage.loop_limit, loops) {
+                    if over_loop_limit(limit, loops) {
                         // The route did not happen, so the next backward route counts from one.
                         self.wait(format!(
                             "{} {said}, which routes back to {to} for the {} time; its loop limit is {}",
                             title(stage),
                             ordinal(loops + 1),
-                            stage.loop_limit
+                            limit
                         ));
                         return;
                     }
