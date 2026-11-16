@@ -2,8 +2,6 @@
 //! the host supervisor reads them (see `buzz-hive-supervisor`), and no type the engine holds
 //! can.
 
-use std::fmt;
-
 /// Who a secret belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretScope {
@@ -25,33 +23,7 @@ impl SecretScope {
     }
 }
 
-/// A secret value. It prints as `[redacted]` in `Debug` and `Display`, and has no
-/// serializer, so a log line, an error or a response cannot carry it by accident.
-#[derive(Clone, PartialEq, Eq)]
-pub struct SecretString(String);
-
-impl SecretString {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The value, for the one place that writes it to the store.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
-
-impl fmt::Display for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
+pub use crate::domain::secret::SecretString;
 
 /// Why a value was not stored. The text never holds the value.
 #[derive(Debug, thiserror::Error)]

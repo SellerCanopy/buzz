@@ -335,3 +335,89 @@ async fn a_change_is_kept_when_the_supervisor_cannot_apply_it() {
         [("coder".to_owned(), "GH_TOKEN".to_owned())]
     );
 }
+
+#[tokio::test]
+async fn a_failed_read_of_the_grants_cannot_leave_a_saved_change_that_reports_an_error() {
+    let (f, supervisor, sink) = world().await;
+    set_team(
+        &f.store,
+        Some(&sink),
+        Some(&supervisor),
+        &person(),
+        "GH_TOKEN",
+        secret(),
+    )
+    .await
+    .unwrap();
+    grant(&f.store, Some(&supervisor), &person(), "coder", "GH_TOKEN")
+        .await
+        .unwrap();
+    // The grants are read with the change, so a store that cannot read them saves nothing and
+    // says so, instead of committing the change and then returning an error for it.
+    f.store.fail_grant_reads(1);
+    let other = common::ctx_for("cc", buzz_hive_core::access::ActorKind::Person);
+    let err = set_team(
+        &f.store,
+        Some(&sink),
+        Some(&supervisor),
+        &other,
+        "GH_TOKEN",
+        SecretString::new("a-rotated-value-9876"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OpError::Store(_)), "{err}");
+    let kept = list(&f.store, &person()).await.unwrap();
+    assert_eq!(kept.team[0].updated_by, person().actor.pubkey);
+}
+
+/// A secret store that, while a value is being put, gives the agent one more team secret, as
+/// a grant from another admin would.
+struct RacingSink {
+    store: buzz_hive_core::testing::MemStore,
+}
+
+#[async_trait::async_trait]
+impl buzz_hive_core::ports::secrets::SecretSink for RacingSink {
+    async fn put(&self, _: SecretScope, _: &str, _: SecretString) -> Result<(), SecretError> {
+        let mut tx = buzz_hive_core::ports::store::Store::begin(&self.store, COMMUNITY)
+            .await
+            .unwrap();
+        tx.secrets().set_team("TEAM_RACE", "aa").await.unwrap();
+        tx.secrets().grant("coder", "TEAM_RACE").await.unwrap();
+        tx.commit().await.unwrap();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_agent_secret_is_refused_when_a_grant_took_the_last_room_while_it_was_being_put() {
+    use buzz_hive_core::domain::secret::MAX_SECRETS_PER_AGENT;
+    let (f, supervisor, _) = world().await;
+    // One name short of the most: the count before the put passes.
+    let mut tx = buzz_hive_core::ports::store::Store::begin(&f.store, COMMUNITY)
+        .await
+        .unwrap();
+    for i in 0..MAX_SECRETS_PER_AGENT - 1 {
+        let var = format!("TEAM_{i}");
+        tx.secrets().set_team(&var, "aa").await.unwrap();
+        tx.secrets().grant("coder", &var).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    let racing = RacingSink {
+        store: f.store.clone(),
+    };
+    let err = set_agent(
+        &f.store,
+        Some(&racing),
+        Some(&supervisor),
+        &person(),
+        "coder",
+        "DOCS_TOKEN",
+        secret(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, OpError::FailedPrecondition(_)), "{err}");
+    assert!(list(&f.store, &person()).await.unwrap().agents.is_empty());
+}

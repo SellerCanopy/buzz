@@ -1,0 +1,18 @@
+# Agent names and whether each is valid, read by the bash pattern in scripts/aws/lib.sh
+# (tests/aws/test-lib.sh) and by check_agent in crates/buzz-hive-core/src/domain/tool_server.rs.
+# One per line: "ok <name>" or "bad <name>".
+ok a
+ok coder
+ok code-r2
+ok a-
+ok abcdefghijklmnopqrstuvwx
+bad abcdefghijklmnopqrstuvwxy
+bad 1coder
+bad -coder
+bad Coder
+bad coDer
+bad co_der
+bad co.der
+bad co der
+bad co/der
+bad ..

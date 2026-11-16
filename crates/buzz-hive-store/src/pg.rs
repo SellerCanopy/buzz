@@ -1130,6 +1130,21 @@ impl AgentToolsRepo for PgTx {
         .map_err(store_error)
     }
 
+    async fn lock_agent(&mut self, agent: &str) -> Result<bool, StoreError> {
+        // The row lock also makes a grant or an own secret for the agent (a foreign key to
+        // this row) wait, so every change that counts an agent's rows takes its turn.
+        let locked: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM hive.agent_tool_agents WHERE community_id = $1 AND agent = $2 \
+             FOR UPDATE",
+        )
+        .bind(self.community)
+        .bind(agent)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(locked.is_some())
+    }
+
     async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError> {
         let rows: Vec<(String, String, String, serde_json::Value)> = sqlx::query_as(
             "SELECT agent, name, transport, spec FROM hive.agent_tool_servers \

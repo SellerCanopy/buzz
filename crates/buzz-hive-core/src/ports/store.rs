@@ -329,6 +329,10 @@ pub trait CardReposRepo: Send {
 pub trait AgentToolsRepo: Send {
     /// The agents whose folder was read, by name.
     async fn agents(&mut self) -> Result<Vec<String>, StoreError>;
+    /// Whether the agent is known, and holds its lock until the transaction ends: another
+    /// transaction that locks the same agent waits, so a count taken after the lock is still
+    /// true at commit.
+    async fn lock_agent(&mut self, agent: &str) -> Result<bool, StoreError>;
     /// Every server with its agent, by agent then name.
     async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError>;
     /// One agent's servers, by name.

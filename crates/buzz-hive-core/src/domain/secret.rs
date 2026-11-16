@@ -4,6 +4,8 @@
 //! A value is held only in the secret store, written by the engine and read by the supervisor.
 //! Everything here that is saved, logged or sent is a name.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The longest variable name.
@@ -12,6 +14,34 @@ pub const MAX_VAR_CHARS: usize = 64;
 pub const MAX_VALUE_BYTES: usize = 4096;
 /// The most secrets one agent may be given, its own and granted together.
 pub const MAX_SECRETS_PER_AGENT: usize = 64;
+
+/// A secret value. It prints as `[redacted]` in `Debug` and `Display`, and has no
+/// serializer, so a log line, an error or a response cannot carry it by accident.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The value, for the one place that writes it to the store.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
 
 /// Variables every container already has, which a secret may not shadow.
 const AMBIENT: &[&str] = &["HOME", "PATH", "PWD", "USER", "SHELL"];

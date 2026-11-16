@@ -4,14 +4,13 @@ use std::sync::Arc;
 
 use buzz_hive::config::SecretsBackend;
 use buzz_hive::{
-    agent_seed, config, dir_source, drain, file_secrets, github_adapter, intake, relay_adapter,
-    ssm_adapter, supervisor_client, timers,
+    agent_seed, commands, config, dir_source, drain, file_secrets, github_adapter, intake,
+    relay_adapter, ssm_adapter, supervisor_client, timers,
 };
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
 use buzz_hive_api::{ApiConfig, App};
 use buzz_hive_core::bus::Bus;
-use buzz_hive_core::orchestrator::agent_tools;
 use buzz_hive_core::orchestrator::workflows::record_builtins;
 use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::ports::secrets::SecretSink;
@@ -46,8 +45,7 @@ async fn main() {
 }
 
 /// Prints the two public keys the host supervisor is configured with, as `NAME=value` lines
-/// for its environment file: the key the engine signs calls with, and the Beehive account's.
-/// Only public keys leave this command.
+/// for its environment file. Only public keys leave this command.
 fn keys() -> Result<(), String> {
     let get = |name: &str| {
         std::env::var(name)
@@ -55,16 +53,12 @@ fn keys() -> Result<(), String> {
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| format!("{name} is required"))
     };
-    let signer = buzz_hive_core::supervisor_wire::Signer::from_secret(
-        get("BUZZ_HIVE_TOKEN_SECRET")?.as_bytes(),
-    )?;
-    let account = nostr::Keys::parse(&get("BUZZ_HIVE_NOSTR_KEY")?)
-        .map_err(|_| "BUZZ_HIVE_NOSTR_KEY is not an nsec or 64 hex characters".to_owned())?;
-    println!("BUZZ_HIVE_SUPERVISOR_PUBKEY={}", signer.public_hex());
-    println!(
-        "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY={}",
-        account.public_key().to_hex()
-    );
+    for line in commands::key_lines(
+        &get("BUZZ_HIVE_TOKEN_SECRET")?,
+        &get("BUZZ_HIVE_NOSTR_KEY")?,
+    )? {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -91,20 +85,11 @@ async fn apply_agents() -> Result<(), String> {
         let mut tx = store.begin(community).await.map_err(|e| e.to_string())?;
         tx.agent_tools().agents().await.map_err(|e| e.to_string())?
     };
-    let mut failed = 0;
-    for agent in &agents {
-        match agent_tools::apply(&store, Some(&supervisor), community, agent).await {
-            Ok(restarted) => println!("{agent}: applied, restarted: {restarted}"),
-            Err(error) => {
-                failed += 1;
-                eprintln!("{agent}: not applied: {error}");
-            }
-        }
+    let applied = commands::apply_all(&store, &supervisor, community, &agents).await;
+    for line in &applied.lines {
+        println!("{line}");
     }
-    match failed {
-        0 => Ok(()),
-        n => Err(format!("{n} of {} agents were not applied", agents.len())),
-    }
+    applied.result(agents.len())
 }
 
 async fn run() -> Result<(), String> {

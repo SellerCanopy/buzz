@@ -315,6 +315,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The names the deploy's bash pattern (`AGENT_NAME_PATTERN` in `scripts/aws/lib.sh`) is
+    /// tested on. Both sides read this one list, so they cannot drift apart unnoticed.
+    const AGENT_NAMES: &str = include_str!("../../../../tests/aws/fixtures/agent-names.txt");
+
+    #[test]
+    fn check_agent_agrees_with_the_deploys_list_of_agent_names() {
+        let mut seen = 0;
+        for line in AGENT_NAMES.lines() {
+            let Some((verdict, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if verdict.starts_with('#') {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                check_agent(name).is_ok(),
+                verdict == "ok",
+                "{verdict} {name}"
+            );
+        }
+        assert!(seen >= 10, "the list was read: {seen}");
+    }
+
     #[test]
     fn an_entry_becomes_a_server_and_renders_back_the_same() {
         let stdio = ToolServer::from_entry(

@@ -54,6 +54,17 @@ impl SecretSource for FileSecretSource {
 /// engine does not.
 pub struct SsmSecretSource {
     pub cli: PathBuf,
+    /// The longest a read of one parameter may take.
+    pub timeout: Duration,
+}
+
+impl SsmSecretSource {
+    pub fn new(cli: PathBuf) -> Self {
+        Self {
+            cli,
+            timeout: READ_TIMEOUT,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -69,7 +80,7 @@ impl SecretSource for SsmSecretSource {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(READ_TIMEOUT, command.output())
+        let output = tokio::time::timeout(self.timeout, command.output())
             .await
             .map_err(|_| format!("reading {name} took too long"))?
             .map_err(|e| format!("could not run {}: {e}", self.cli.display()))?;

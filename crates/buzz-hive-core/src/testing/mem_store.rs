@@ -113,6 +113,7 @@ pub struct MemStore {
 struct Failures {
     kept_versions: std::sync::atomic::AtomicUsize,
     commits: std::sync::atomic::AtomicUsize,
+    grants: std::sync::atomic::AtomicUsize,
 }
 
 impl Failures {
@@ -157,6 +158,13 @@ impl MemStore {
     pub fn fail_next_commits(&self, times: usize) {
         self.failures
             .commits
+            .store(times, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next `times` reads of the secret grants fail as unavailable.
+    pub fn fail_grant_reads(&self, times: usize) {
+        self.failures
+            .grants
             .store(times, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1238,6 +1246,13 @@ impl AgentToolsRepo for MemTx {
             .collect())
     }
 
+    async fn lock_agent(&mut self, agent: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .work
+            .tool_agents
+            .contains(&(self.community, agent.to_owned())))
+    }
+
     async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError> {
         Ok(self
             .work
@@ -1338,6 +1353,9 @@ impl SecretsRepo for MemTx {
     }
 
     async fn grants(&mut self) -> Result<Vec<(String, String)>, StoreError> {
+        if Failures::take(&self.failures.grants) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
         Ok(self
             .work
             .secret_grants

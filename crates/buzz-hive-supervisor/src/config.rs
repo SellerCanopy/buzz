@@ -262,6 +262,126 @@ mod tests {
         .is_err());
     }
 
+    fn with_values(pairs: &'static [(&'static str, &'static str)]) -> Result<Config, String> {
+        let key = "ab".repeat(32);
+        Config::from_lookup(|name| {
+            if let Some((_, v)) = pairs.iter().find(|(k, _)| *k == name) {
+                return Some((*v).to_owned());
+            }
+            match name {
+                "BUZZ_HIVE_SUPERVISOR_SOCKET" => Some("/run/s.sock".into()),
+                "BUZZ_HIVE_SUPERVISOR_PUBKEY" | "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY" => {
+                    Some(key.clone())
+                }
+                "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
+                "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn both_keys_must_be_64_lowercase_hex_characters_and_the_error_names_the_variable() {
+        let good = "ab".repeat(32);
+        assert_eq!(
+            with_values(&[]).unwrap().engine_key,
+            good,
+            "a good key is kept as it is"
+        );
+        let bad: [&'static str; 5] = [
+            // 63 and 65 characters.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            // Uppercase hex.
+            "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB",
+            // A 'g' in an otherwise right-sized key.
+            "gbabababababababababababababababababababababababababababababababab",
+            // An nsec is not the hex form the allowlist and the verifier take.
+            "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+        ];
+        assert_eq!(bad[0].len(), 63);
+        assert_eq!(bad[1].len(), 65);
+        for variable in [
+            "BUZZ_HIVE_SUPERVISOR_PUBKEY",
+            "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY",
+        ] {
+            for value in bad {
+                let key = "ab".repeat(32);
+                let error = Config::from_lookup(|name| match name {
+                    n if n == variable => Some(value.to_owned()),
+                    "BUZZ_HIVE_SUPERVISOR_SOCKET" => Some("/run/s.sock".into()),
+                    "BUZZ_HIVE_SUPERVISOR_PUBKEY" | "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY" => {
+                        Some(key.clone())
+                    }
+                    "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
+                    "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
+                    _ => None,
+                })
+                .unwrap_err();
+                assert!(error.contains(variable), "{variable} {value}: {error}");
+                assert!(error.contains("64 lowercase hex"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_socket_owner_is_a_user_id_or_nothing() {
+        assert_eq!(with_values(&[]).unwrap().socket_uid, None);
+        assert_eq!(
+            with_values(&[("BUZZ_HIVE_SUPERVISOR_SOCKET_UID", "1000")])
+                .unwrap()
+                .socket_uid,
+            Some(1000)
+        );
+        // Padding around a value is not part of it.
+        assert_eq!(
+            with_values(&[("BUZZ_HIVE_SUPERVISOR_SOCKET_UID", " 7 ")])
+                .unwrap()
+                .socket_uid,
+            Some(7)
+        );
+        for value in ["abc", "-1", "1.5", "4294967296"] {
+            let pairs: &'static [(&str, &str)] = Box::leak(Box::new([(
+                "BUZZ_HIVE_SUPERVISOR_SOCKET_UID",
+                Box::leak(value.to_owned().into_boxed_str()) as &'static str,
+            )]));
+            let error = with_values(pairs).unwrap_err();
+            assert!(
+                error.contains("BUZZ_HIVE_SUPERVISOR_SOCKET_UID"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_value_is_a_missing_one_and_a_root_agents_folder_is_refused() {
+        for name in [
+            "BUZZ_HIVE_SUPERVISOR_SOCKET",
+            "BUZZ_HIVE_SUPERVISOR_RENDER_DIR",
+            "BUZZ_HIVE_SUPERVISOR_PUBKEY",
+        ] {
+            let pairs: &'static [(&str, &str)] = Box::leak(Box::new([(name_static(name), "   ")]));
+            let error = with_values(pairs).unwrap_err();
+            assert!(
+                error.contains(name) && error.contains("is required"),
+                "{name}: {error}"
+            );
+        }
+        // A blank restart program is the default restart, not a program named "".
+        assert!(matches!(
+            with_values(&[("BUZZ_HIVE_SUPERVISOR_RESTART_CMD", "  ")])
+                .unwrap()
+                .restart,
+            Restart::Compose { .. }
+        ));
+        let error = with_values(&[("BUZZ_HIVE_SUPERVISOR_AGENTS_SRC", "/")]).unwrap_err();
+        assert!(error.contains("no parent folder"), "{error}");
+    }
+
+    fn name_static(name: &str) -> &'static str {
+        Box::leak(name.to_owned().into_boxed_str())
+    }
+
     #[test]
     fn every_setting_but_the_restart_is_required() {
         for name in [

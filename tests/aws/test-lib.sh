@@ -299,4 +299,27 @@ else
   bad "tf_output calls terraform output -raw (got: $out)"
 fi
 
+# The agent name rule is one pattern, and it agrees with the names the Rust check is tested on.
+(
+  . "$REPO_ROOT/scripts/aws/lib.sh"
+  bad_names=""
+  while read -r verdict name; do
+    case "$verdict" in "" | "#"*) continue ;; esac
+    if [[ "$name" =~ $AGENT_NAME_PATTERN ]]; then got=ok; else got=bad; fi
+    [ "$got" = "$verdict" ] || bad_names="$bad_names $name"
+  done < "$REPO_ROOT/tests/aws/fixtures/agent-names.txt"
+  [ -z "$bad_names" ] || { echo "disagree:$bad_names"; exit 1; }
+)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  pass "AGENT_NAME_PATTERN agrees with the shared list of agent names"
+else
+  bad "AGENT_NAME_PATTERN agrees with the shared list of agent names"
+fi
+if grep -q "NAME_PATTERN=" "$REPO_ROOT/scripts/aws/render-agents-env.sh"; then
+  bad "render-agents-env.sh uses the pattern of lib.sh and defines none"
+else
+  pass "render-agents-env.sh uses the pattern of lib.sh and defines none"
+fi
+
 exit "$fail"

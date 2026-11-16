@@ -32,6 +32,11 @@ const INJECTED: &str = "# buzz-hive-injected: ";
 
 /// The longest a restart may take. Compose waits up to the container's 60 second stop grace.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(180);
+/// The longest a call waits for the change ahead of it. The engine stops waiting for a reply
+/// after two minutes, so a call that has waited this long says so and does not run late.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How long a client has to send its line before the connection is closed.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Service {
     config: Config,
@@ -40,6 +45,10 @@ pub struct Service {
     secrets: Arc<dyn SecretSource>,
     /// One change at a time, so two applies never interleave their files and restarts.
     writes: Mutex<()>,
+    /// How long a call waits for `writes`.
+    lock_wait: Duration,
+    /// How long a client has to send its line.
+    read_timeout: Duration,
     /// The sign-ins waiting for a paste.
     logins: Logins,
 }
@@ -63,7 +72,7 @@ impl Service {
         let secrets: Arc<dyn SecretSource> = match &config.secrets {
             Secrets::None => Arc::new(NoSecrets),
             Secrets::Dir(dir) => Arc::new(FileSecretSource { dir: dir.clone() }),
-            Secrets::Ssm { cli } => Arc::new(SsmSecretSource { cli: cli.clone() }),
+            Secrets::Ssm { cli } => Arc::new(SsmSecretSource::new(cli.clone())),
         };
         Self::with_secrets(config, secrets)
     }
@@ -76,6 +85,8 @@ impl Service {
             verifier,
             secrets,
             writes: Mutex::new(()),
+            lock_wait: LOCK_WAIT,
+            read_timeout: READ_TIMEOUT,
             logins: Logins::new(Limits::default()),
         })
     }
@@ -84,6 +95,35 @@ impl Service {
     pub fn with_login_limits(mut self, limits: Limits) -> Self {
         self.logins = Logins::new(limits);
         self
+    }
+
+    /// The same service waiting `wait` for the change ahead of a call, which a test shortens.
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
+    }
+
+    /// The same service giving a client `wait` to send its line, which a test shortens.
+    pub fn with_read_timeout(mut self, wait: Duration) -> Self {
+        self.read_timeout = wait;
+        self
+    }
+
+    /// How long a client has to send its line.
+    pub fn read_timeout(&self) -> Duration {
+        self.read_timeout
+    }
+
+    /// Takes the turn to change files, restart an agent or sign one in. A call that waits past
+    /// the limit fails and does nothing, since nobody is still waiting for its answer.
+    async fn one_at_a_time(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, Failure> {
+        tokio::time::timeout(self.lock_wait, self.writes.lock())
+            .await
+            .map_err(|_| {
+                Failure::failed(
+                    "another change to the agents is still running; try again in a minute",
+                )
+            })
     }
 
     pub fn config(&self) -> &Config {
@@ -186,7 +226,7 @@ impl Service {
         secrets: &SecretNames,
     ) -> Result<bool, Failure> {
         self.known(agent)?;
-        let _one_at_a_time = self.writes.lock().await;
+        let _one_at_a_time = self.one_at_a_time().await?;
         let paths = self.paths(agent);
         let before = read_env(&paths.env)?;
         let mut base = parse_env(&before);
@@ -266,23 +306,15 @@ impl Service {
 
     async fn restart_known(&self, agent: &str) -> Result<(), Failure> {
         self.known(agent)?;
-        let _one_at_a_time = self.writes.lock().await;
+        let _one_at_a_time = self.one_at_a_time().await?;
         self.restart(agent).await
     }
 
+    /// Restarts the agent. The caller holds the turn to change things. The agent's waiting
+    /// sign-ins end first: the container they run in is about to be recreated.
     async fn restart(&self, agent: &str) -> Result<(), Failure> {
-        let mut command = match &self.config.restart {
-            Restart::Command(program) => {
-                let mut command = Command::new(program);
-                command.arg(agent);
-                command
-            }
-            Restart::Compose { compose_file } => {
-                let mut command = compose(&self.config, compose_file, agent);
-                command.args(["up", "-d", "--force-recreate"]);
-                command
-            }
-        };
+        self.logins.end_agent(agent).await;
+        let mut command = restart_command(&self.config, agent);
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -316,9 +348,20 @@ impl Service {
     fn known_http_server(&self, agent: &str, server: &str) -> Result<(), Failure> {
         self.known(agent)?;
         check_name(server).map_err(Failure::failed)?;
-        let listed = read_if_there(&self.paths(agent).mcp)
-            .and_then(|text| parse_mcp(&text).ok())
-            .unwrap_or_default();
+        let path = self.paths(agent).mcp;
+        // A file that is not there has no servers. One that cannot be read or parsed is a
+        // fault to name, not a server that does not exist.
+        let listed = match fs::read_to_string(&path) {
+            Ok(text) => parse_mcp(&text)
+                .map_err(|e| Failure::failed(format!("could not read {}: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(Failure::failed(format!(
+                    "could not read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
         if listed
             .iter()
             .any(|s| s.name == server && s.transport == Transport::Http)
@@ -332,6 +375,9 @@ impl Service {
     }
 
     async fn login_start(&self, agent: &str, server: &str) -> Result<serde_json::Value, Failure> {
+        // Under the turn that applies and restarts take, so an apply that removes the server
+        // cannot run between the check and the CLI starting.
+        let _one_at_a_time = self.one_at_a_time().await?;
         self.known_http_server(agent, server)?;
         let link = self
             .logins
@@ -347,6 +393,9 @@ impl Service {
         server: &str,
         url: &CallbackUrl,
     ) -> Result<serde_json::Value, Failure> {
+        // Held until the CLI has saved its sign-in, so a restart cannot recreate the container
+        // in the middle of it.
+        let _one_at_a_time = self.one_at_a_time().await?;
         self.known_http_server(agent, server)?;
         self.logins
             .paste(agent, server, url)
@@ -382,6 +431,23 @@ impl Service {
             "session_policy": env.get("BUZZ_ACP_SESSION_POLICY").map_or("channel", String::as_str),
             "allowlisted": allowlisted,
         }))
+    }
+}
+
+/// The command that restarts `agent`: the configured program, or Compose recreating the
+/// container, which is what makes it read its env file and `mcp.json` again.
+fn restart_command(config: &Config, agent: &str) -> Command {
+    match &config.restart {
+        Restart::Command(program) => {
+            let mut command = Command::new(program);
+            command.arg(agent);
+            command
+        }
+        Restart::Compose { compose_file } => {
+            let mut command = compose(config, compose_file, agent);
+            command.args(["up", "-d", "--force-recreate"]);
+            command
+        }
     }
 }
 
@@ -504,8 +570,11 @@ fn read_if_there(path: &Path) -> Option<String> {
 }
 
 fn read_env(path: &Path) -> Result<String, Failure> {
-    fs::read_to_string(path).map_err(|_| {
-        Failure::NotFound("the agent has no rendered environment yet; run a deploy".into())
+    fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            Failure::NotFound("the agent has no rendered environment yet; run a deploy".into())
+        }
+        _ => Failure::failed(format!("could not read {}: {e}", path.display())),
     })
 }
 
@@ -548,6 +617,59 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).into(), (*v).into()))
             .collect()
+    }
+
+    fn config(restart: Option<&str>) -> Config {
+        let key = "ab".repeat(32);
+        Config::from_lookup(|name| match name {
+            "BUZZ_HIVE_SUPERVISOR_SOCKET" => Some("/run/s.sock".into()),
+            "BUZZ_HIVE_SUPERVISOR_PUBKEY" | "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY" => Some(key.clone()),
+            "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
+            "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
+            "BUZZ_HIVE_SUPERVISOR_RESTART_CMD" => restart.map(str::to_owned),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    fn argv(command: &Command) -> (String, Vec<String>) {
+        let command = command.as_std();
+        (
+            command.get_program().to_string_lossy().into_owned(),
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_production_restart_recreates_the_agents_compose_project_with_its_env_file() {
+        // Only a create reads the env file again, so this is `up -d --force-recreate`, never
+        // `restart`.
+        let (program, args) = argv(&restart_command(&config(None), "coder"));
+        assert_eq!(program, "docker");
+        assert_eq!(
+            args,
+            [
+                "compose",
+                "-p",
+                "buzz-agent-coder",
+                "-f",
+                "/opt/buzz/deploy/aws/compose.agents.yml",
+                "--env-file",
+                "/opt/buzz/agents/coder.compose.env",
+                "up",
+                "-d",
+                "--force-recreate",
+            ]
+        );
+        // A configured program is run with the agent's name and nothing else.
+        let (program, args) = argv(&restart_command(&config(Some("/usr/bin/stub")), "coder"));
+        assert_eq!(
+            (program.as_str(), args),
+            ("/usr/bin/stub", vec!["coder".to_owned()])
+        );
     }
 
     #[test]

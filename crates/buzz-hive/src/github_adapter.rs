@@ -28,8 +28,12 @@ use serde_json::{json, Value};
 /// The REST API of github.com.
 pub const DEFAULT_API_URL: &str = "https://api.github.com";
 
-/// Entries the etag cache holds. When it is full it is emptied, which only costs reads.
-const CACHE_ENTRIES: usize = 256;
+/// Entries the etag cache holds. A full cache gives up its least recently used entry, so a busy
+/// fleet of cards keeps the answers it asks for again every minute. Each watched pull request
+/// costs about five entries, and a comment read adds one for each time its cursor moved.
+const CACHE_ENTRIES: usize = 4096;
+/// The bodies the etag cache holds in all. Bodies are small, so this is rarely what ends an entry.
+const CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// A body larger than this is read but not kept for the next request.
 const CACHE_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// The largest answer read.
@@ -50,10 +54,62 @@ const MARKER_SUFFIX: &str = " -->";
 
 type Cached = (String, Arc<Value>);
 
+/// The entity tags and bodies kept for conditional reads, bounded by entry count and total size.
+/// Making room gives up the entry used longest ago, one at a time.
+struct EtagCache {
+    entries: HashMap<String, (u64, usize, Cached)>,
+    /// Counts uses; an entry's stamp is the count at its last use.
+    clock: u64,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl EtagCache {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Cached> {
+        self.clock += 1;
+        let (used, _, cached) = self.entries.get_mut(key)?;
+        *used = self.clock;
+        Some(cached.clone())
+    }
+
+    fn insert(&mut self, key: String, cached: Cached, size: usize) {
+        if let Some((_, old, _)) = self.entries.remove(&key) {
+            self.bytes -= old;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= self.max_entries || self.bytes + size > self.max_bytes)
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _, _))| *used)
+                .map(|(key, _)| key.clone())
+                .expect("the cache is not empty");
+            if let Some((_, old, _)) = self.entries.remove(&oldest) {
+                self.bytes -= old;
+            }
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.entries.insert(key, (self.clock, size, cached));
+    }
+}
+
 pub struct GitHub {
     client: reqwest::Client,
     base: Url,
-    cache: Mutex<HashMap<String, Cached>>,
+    cache: Mutex<EtagCache>,
     /// The token's own login, read from the host the first time it is needed.
     login: tokio::sync::OnceCell<String>,
 }
@@ -92,7 +148,7 @@ impl GitHub {
         Ok(Self {
             client,
             base,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(EtagCache::new(CACHE_ENTRIES, CACHE_TOTAL_BYTES)),
             login: tokio::sync::OnceCell::new(),
         })
     }
@@ -113,7 +169,7 @@ impl GitHub {
     /// A conditional GET. A `304` returns the body kept from the last `200` for the URL.
     async fn get(&self, url: Url) -> Result<(Arc<Value>, Option<String>), HostError> {
         let key = url.to_string();
-        let cached = self.cache.lock().unwrap().get(&key).cloned();
+        let cached = self.cache.lock().unwrap().get(&key);
         let mut request = self.client.get(url);
         if let Some((etag, _)) = &cached {
             request = request.header(IF_NONE_MATCH, etag);
@@ -142,11 +198,10 @@ impl GitHub {
             .map(str::to_owned);
         if let Some(etag) = &etag {
             if bytes.len() <= CACHE_BODY_BYTES {
-                let mut cache = self.cache.lock().unwrap();
-                if cache.len() >= CACHE_ENTRIES {
-                    cache.clear();
-                }
-                cache.insert(key, (etag.clone(), body.clone()));
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, (etag.clone(), body.clone()), bytes.len());
             }
         }
         Ok((body, etag))
@@ -1016,6 +1071,44 @@ mod tests {
 
     fn at(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).unwrap()
+    }
+
+    fn kept(tag: &str) -> Cached {
+        (tag.to_owned(), Arc::new(json!([])))
+    }
+
+    #[test]
+    fn a_full_cache_gives_up_one_entry_the_least_recently_used() {
+        let mut cache = EtagCache::new(3, usize::MAX);
+        for key in ["a", "b", "c"] {
+            cache.insert(key.into(), kept(key), 1);
+        }
+        // Reading "a" makes "b" the one used longest ago.
+        assert!(cache.get("a").is_some());
+        cache.insert("d".into(), kept("d"), 1);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(cache.get("b").is_none());
+        for key in ["a", "c", "d"] {
+            assert_eq!(cache.get(key).unwrap().0, key);
+        }
+        // A new answer for a key replaces it without costing another entry.
+        cache.insert("a".into(), kept("a2"), 1);
+        assert_eq!(cache.entries.len(), 3);
+        assert_eq!(cache.get("a").unwrap().0, "a2");
+    }
+
+    #[test]
+    fn the_cache_also_holds_to_a_total_size() {
+        let mut cache = EtagCache::new(100, 10);
+        cache.insert("a".into(), kept("a"), 4);
+        cache.insert("b".into(), kept("b"), 4);
+        cache.insert("c".into(), kept("c"), 6);
+        // Only "a" had to go to make room for six more.
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("b").is_some() && cache.get("c").is_some());
+        assert_eq!(cache.bytes, 10);
+        cache.insert("c".into(), kept("c"), 3);
+        assert_eq!(cache.bytes, 7);
     }
 
     #[test]

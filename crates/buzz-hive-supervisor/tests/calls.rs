@@ -326,3 +326,126 @@ async fn agent_settings_reads_the_rendered_env_and_changes_nothing() {
         .await;
     assert_eq!(none.error.as_deref(), Some("not_found"));
 }
+
+#[tokio::test]
+async fn applies_that_arrive_together_take_turns_and_restart_the_agent_once() {
+    let rig = Rig::new();
+    // The first restart is held, so the others are all waiting for their turn when it ends.
+    rig.hold_restarts(true);
+    let release = rig.release_restarts_once_one_has_begun();
+    let (a, b, c, d, e, ()) = tokio::join!(
+        rig.apply("coder", servers()),
+        rig.apply("coder", servers()),
+        rig.apply("coder", servers()),
+        rig.apply("coder", servers()),
+        rig.apply("coder", servers()),
+        release,
+    );
+    let restarted = [a, b, c, d, e]
+        .iter()
+        .filter(|reply| ok(reply) == &json!({"restarted": true}))
+        .count();
+    assert_eq!(restarted, 1);
+    assert_eq!(rig.restarts(), ["coder"]);
+    golden(
+        "apply/mcp.json",
+        &std::fs::read_to_string(rig.render("coder/config/mcp.json")).unwrap(),
+    );
+    golden(
+        "apply/coder.env",
+        &std::fs::read_to_string(rig.render("coder.env")).unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_waits_too_long_for_the_change_ahead_of_it_fails_and_does_nothing() {
+    let rig = Rig::with_lock_wait(std::time::Duration::from_millis(300));
+    rig.hold_restarts(true);
+    let mut fewer = servers();
+    fewer.pop();
+    let (first, second) = tokio::join!(rig.apply("coder", servers()), async {
+        // Begins once the first has its turn, and is let go after the second gave up.
+        while !rig.restart_started() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let second = rig.apply("coder", fewer.clone()).await;
+        rig.hold_restarts(false);
+        second
+    });
+    assert!(first.ok, "{first:?}");
+    assert_eq!(second.error.as_deref(), Some("failed"), "{second:?}");
+    assert!(
+        second.message.as_deref().unwrap().contains("try again"),
+        "{second:?}"
+    );
+    assert_eq!(rig.restarts(), ["coder"]);
+    // The late call wrote nothing: the agent still has the first call's list.
+    golden(
+        "apply/mcp.json",
+        &std::fs::read_to_string(rig.render("coder/config/mcp.json")).unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_read_is_a_failure_that_names_it_and_not_a_missing_agent() {
+    let rig = Rig::new();
+    assert!(rig.apply("coder", servers()).await.ok);
+    let is_root = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| o.stdout == b"0\n")
+        .unwrap_or(false);
+
+    // An env file that is a folder cannot be read, and is not "run a deploy".
+    let env = rig.render("coder.env");
+    let saved = std::fs::read(&env).unwrap();
+    std::fs::remove_file(&env).unwrap();
+    std::fs::create_dir(&env).unwrap();
+    let settings = rig
+        .call(&Call::AgentSettings {
+            agent: "coder".into(),
+        })
+        .await;
+    assert_eq!(settings.error.as_deref(), Some("failed"), "{settings:?}");
+    assert!(
+        settings.message.as_deref().unwrap().contains("coder.env"),
+        "{settings:?}"
+    );
+    std::fs::remove_dir(&env).unwrap();
+    std::fs::write(&env, saved).unwrap();
+    // A file that is not there is the case "run a deploy" is for.
+    let missing = rig
+        .call(&Call::AgentSettings {
+            agent: "researcher".into(),
+        })
+        .await;
+    assert_eq!(missing.error.as_deref(), Some("not_found"), "{missing:?}");
+
+    // An mcp.json that does not parse, or cannot be read, is named by a sign-in call.
+    let mcp = rig.render("coder/config/mcp.json");
+    let status = Call::LoginStatus {
+        agent: "coder".into(),
+        server: "docs".into(),
+    };
+    std::fs::write(&mcp, "{ not json").unwrap();
+    let broken = rig.call(&status).await;
+    assert_eq!(broken.error.as_deref(), Some("failed"), "{broken:?}");
+    assert!(
+        broken.message.as_deref().unwrap().contains("mcp.json"),
+        "{broken:?}"
+    );
+    if !is_root {
+        std::fs::write(&mcp, "{}").unwrap();
+        std::fs::set_permissions(&mcp, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = rig.call(&status).await;
+        assert_eq!(
+            unreadable.error.as_deref(),
+            Some("failed"),
+            "{unreadable:?}"
+        );
+    }
+    // No file at all has no such server.
+    std::fs::remove_file(&mcp).unwrap();
+    let none = rig.call(&status).await;
+    assert_eq!(none.error.as_deref(), Some("not_found"), "{none:?}");
+}

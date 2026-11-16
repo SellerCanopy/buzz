@@ -150,10 +150,16 @@ impl Logins {
             stdin,
             readers,
         };
+        // The first link that is a sign-in address. One that is not (a link in an MCP server's
+        // own output, say) is never returned, since the admin would trust it as the provider's.
+        let mut refused = false;
         let link = tokio::time::timeout(self.limits.start_wait, async {
             while let Some(line) = seen.recv().await {
                 if let Some(link) = link_in(&line) {
-                    return Some(link);
+                    if is_sign_in_link(&link) {
+                        return Some(link);
+                    }
+                    refused = true;
                 }
             }
             None
@@ -163,9 +169,11 @@ impl Logins {
             Ok(Some(link)) => link,
             Ok(None) => {
                 session.end().await;
-                return Err(LoginError::Failed(
-                    "the sign-in ended before it printed a link",
-                ));
+                return Err(LoginError::Failed(if refused {
+                    "the sign-in printed a link that is not a sign-in address"
+                } else {
+                    "the sign-in ended before it printed a link"
+                }));
             }
             Err(_) => {
                 session.end().await;
@@ -175,10 +183,16 @@ impl Logins {
             }
         };
         drop(seen);
-        self.table
+        // A start that ran at the same time and finished first is replaced, and its process is
+        // ended here rather than left to be dropped: the last start wins.
+        let replaced = self
+            .table
             .lock()
             .expect("the session table is never poisoned")
             .insert(key.clone(), session);
+        if let Some(old) = replaced {
+            old.end().await;
+        }
         // A session nobody pastes into is ended when it expires, so no process waits forever.
         let table = self.table.clone();
         let ttl = self.limits.ttl;
@@ -276,6 +290,22 @@ impl Logins {
         Ok(parse_list(&String::from_utf8_lossy(&output.stdout), server))
     }
 
+    /// Ends every sign-in waiting in `agent`'s container. A restart recreates the container, so
+    /// each one is already lost, and a later paste then says to start again.
+    pub async fn end_agent(&self, agent: &str) {
+        let ended: Vec<Session> = {
+            let mut table = self
+                .table
+                .lock()
+                .expect("the session table is never poisoned");
+            let keys: Vec<Key> = table.keys().filter(|k| k.0 == agent).cloned().collect();
+            keys.iter().filter_map(|k| table.remove(k)).collect()
+        };
+        for session in ended {
+            session.end().await;
+        }
+    }
+
     fn take(&self, key: &Key) -> Option<Session> {
         self.table
             .lock()
@@ -352,6 +382,79 @@ fn link_in(line: &str) -> Option<String> {
     usable.then(|| candidate.to_owned())
 }
 
+/// Whether `link` is the authorization address of a sign-in this supervisor started: `https`,
+/// a host with no user in front of it, and a `redirect_uri` that is a localhost callback
+/// (`http://localhost:PORT/...`, or `127.0.0.1`), which is where the CLI waits for the browser.
+///
+/// The shape is the one the stub prints and the OAuth authorization-code flow defines. What the
+/// real `claude mcp login --no-browser` prints is not verified (see PORTING.md, spike 8).
+fn is_sign_in_link(link: &str) -> bool {
+    let Some(rest) = link.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    if authority.is_empty() || authority.contains(['@', '\\']) || authority.starts_with(':') {
+        return false;
+    }
+    let Some((_, query)) = tail.split_once('?') else {
+        return false;
+    };
+    let query = query.split('#').next().unwrap_or_default();
+    let mut redirects = query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("redirect_uri="));
+    let (Some(redirect), None) = (redirects.next(), redirects.next()) else {
+        return false;
+    };
+    let Some(redirect) = percent_decode(redirect) else {
+        return false;
+    };
+    let Some(after) = redirect.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, rest)) = after.split_once(':') else {
+        return false;
+    };
+    let port = rest.split(['/', '?']).next().unwrap_or_default();
+    (host == "localhost" || host == "127.0.0.1")
+        && !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `text` with its `%XX` escapes decoded, or `None` for a bad escape or non-UTF-8 result.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let pair = text.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(pair, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The state the Claude CLI's `mcp list` prints on a server's line (the text after the last
+/// ` - `): `Needs authentication` or `Connected`, with or without a mark in front. Anything
+/// else (`Failed to connect`, a state this does not know) is `None`. The format is the CLI's,
+/// so it is read here beside the rest of it and the engine sees only the wire form.
+fn state_from_cli(status: &str) -> Option<LoginState> {
+    let status = status.to_ascii_lowercase();
+    if status.contains("needs auth") || status.contains("needs sign") {
+        Some(LoginState::NeedsSignIn)
+    } else if status.contains("connected") && !status.contains("not connected") {
+        Some(LoginState::Connected)
+    } else {
+        None
+    }
+}
+
 /// The state `claude mcp list` prints for `server`, whose line reads
 /// `<server>: <command or url> - <mark> <state>`. `None` when no line is for the server, and
 /// `Some(Err(()))` when it is in a state that is neither of the two (it failed to connect).
@@ -359,13 +462,77 @@ pub fn parse_list(output: &str, server: &str) -> Option<Result<LoginState, ()>> 
     output.lines().find_map(|line| {
         let rest = line.strip_prefix(server)?.strip_prefix(": ")?;
         let status = rest.rsplit_once(" - ").map_or(rest, |(_, status)| status);
-        Some(LoginState::from_list_status(status).ok_or(()))
+        Some(state_from_cli(status).ok_or(()))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cli_status_text_maps_to_a_state() {
+        assert_eq!(
+            state_from_cli("⚠ Needs authentication"),
+            Some(LoginState::NeedsSignIn)
+        );
+        assert_eq!(state_from_cli("✓ Connected"), Some(LoginState::Connected));
+        assert_eq!(state_from_cli("✗ Failed to connect"), None);
+        assert_eq!(state_from_cli("Not connected"), None);
+    }
+
+    #[test]
+    fn the_production_exec_runs_the_cli_in_the_agents_container_through_compose() {
+        let config = Config::from_lookup(|name| match name {
+            "BUZZ_HIVE_SUPERVISOR_SOCKET" => Some("/run/s.sock".into()),
+            "BUZZ_HIVE_SUPERVISOR_PUBKEY" | "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY" => {
+                Some("ab".repeat(32))
+            }
+            "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
+            "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
+            _ => None,
+        })
+        .unwrap();
+        let command = exec_command(
+            &config,
+            "coder",
+            &["claude", "mcp", "login", "docs", "--no-browser"],
+        );
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "docker");
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "compose",
+                "-p",
+                "buzz-agent-coder",
+                "-f",
+                "/opt/buzz/deploy/aws/compose.agents.yml",
+                "--env-file",
+                "/opt/buzz/agents/coder.compose.env",
+                "exec",
+                "-T",
+                "agent",
+                "claude",
+                "mcp",
+                "login",
+                "docs",
+                "--no-browser",
+            ]
+        );
+        // The stand-in program gets the agent's name first and then the whole argv.
+        let mut config = config;
+        config.exec = Exec::Command("/usr/bin/stub".into());
+        let command = exec_command(&config, "coder", &["claude", "mcp", "list"]);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy())
+            .collect();
+        assert_eq!(command.as_std().get_program(), "/usr/bin/stub");
+        assert_eq!(args, ["coder", "claude", "mcp", "list"]);
+    }
 
     #[test]
     fn a_link_is_the_first_https_address_on_a_line() {
@@ -380,6 +547,36 @@ mod tests {
         assert_eq!(link_in("redirect http://localhost:1/cb"), None);
         assert_eq!(link_in("https://"), None);
         assert_eq!(link_in("Paste the final address here:"), None);
+    }
+
+    #[test]
+    fn only_an_authorization_link_with_a_localhost_callback_is_a_sign_in() {
+        let good = "https://auth.example.org/oauth/authorize?client_id=stub&state=S&redirect_uri=http%3A%2F%2Flocalhost%3A45219%2Fcallback";
+        assert!(is_sign_in_link(good));
+        assert!(is_sign_in_link(
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2F127.0.0.1%3A1%2Fcb#frag"
+        ));
+        for bad in [
+            // Not https, or no address at all.
+            "http://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb",
+            "https://",
+            // A user in front of the host, or a backslash that some parsers read as a slash.
+            "https://auth.example.org@evil.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb",
+            "https://evil.example.org\\@auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb",
+            // No redirect, or one that is not a localhost callback.
+            "https://auth.example.org/a?client_id=x",
+            "https://auth.example.org/a?redirect_uri=https%3A%2F%2Fevil.example.org%2Fcb",
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost.evil.example.org%3A1%2Fcb",
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%2Fcb",
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1x%2Fcb",
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb&redirect_uri=http%3A%2F%2Fevil.example.org",
+            // The callback sits in another parameter's value, not in redirect_uri.
+            "https://auth.example.org/a?next=redirect_uri%3Dhttp%3A%2F%2Flocalhost%3A1%2Fcb",
+            // A bad escape.
+            "https://auth.example.org/a?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcb%zz",
+        ] {
+            assert!(!is_sign_in_link(bad), "{bad}");
+        }
     }
 
     #[test]

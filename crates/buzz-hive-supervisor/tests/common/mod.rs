@@ -45,6 +45,15 @@ impl Rig {
 
     /// A rig whose sign-ins use `limits`, so a test can expire one in a moment.
     pub fn with_limits(limits: Limits) -> Self {
+        Self::build(limits, None)
+    }
+
+    /// A rig whose calls wait `wait` for the change ahead of them.
+    pub fn with_lock_wait(wait: std::time::Duration) -> Self {
+        Self::build(Limits::default(), Some(wait))
+    }
+
+    fn build(limits: Limits, lock_wait: Option<std::time::Duration>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         for agent in ["coder", "researcher"] {
@@ -58,8 +67,12 @@ impl Rig {
             format!(
                 "#!/bin/sh\n[ $# -eq 1 ] || exit 2\n\
                  if [ -e '{fail}' ]; then echo \"refusing $1\" >&2; exit 1; fi\n\
+                 : > '{started}'\n\
+                 while [ -e '{gate}' ]; do sleep 0.02; done\n\
                  echo \"$1\" >> '{log}'\n",
                 fail = root.join("restart-fails").display(),
+                started = root.join("restart-started").display(),
+                gate = root.join("restart-gate").display(),
                 log = root.join("restarts.log").display(),
             ),
         )
@@ -88,10 +101,14 @@ impl Rig {
             secrets: Secrets::Dir(root.join("secrets")),
             socket_uid: None,
         };
+        let mut service = Service::new(config.clone())
+            .unwrap()
+            .with_login_limits(limits);
+        if let Some(wait) = lock_wait {
+            service = service.with_lock_wait(wait);
+        }
         Self {
-            service: Service::new(config.clone())
-                .unwrap()
-                .with_login_limits(limits),
+            service,
             signer,
             config,
             dir,
@@ -171,7 +188,7 @@ impl Rig {
         self.root().join("stub-state").join(relative)
     }
 
-    /// Makes the stub CLI `normal`, `reject`, `hang`, `silent` or `list-failed`.
+    /// Makes the stub CLI `normal`, `reject`, `hang`, `silent`, `bad-link` or `list-failed`.
     pub fn set_stub_mode(&self, mode: &str) {
         std::fs::create_dir_all(self.root().join("stub-state")).unwrap();
         std::fs::write(self.stub("mode"), mode).unwrap();
@@ -184,6 +201,29 @@ impl Rig {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// While held, a restart starts (`restart_started`) and waits to be let go.
+    pub fn hold_restarts(&self, held: bool) {
+        let gate = self.root().join("restart-gate");
+        if held {
+            std::fs::write(gate, "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(gate);
+        }
+    }
+
+    /// Whether a restart has begun.
+    pub fn restart_started(&self) -> bool {
+        self.root().join("restart-started").exists()
+    }
+
+    /// Waits until a restart has begun, then lets restarts go.
+    pub async fn release_restarts_once_one_has_begun(&self) {
+        while !self.restart_started() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.hold_restarts(false);
     }
 
     pub fn make_restart_fail(&self, fails: bool) {

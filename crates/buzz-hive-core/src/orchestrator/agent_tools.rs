@@ -112,7 +112,9 @@ pub(super) async fn known(
     agent: &str,
 ) -> Result<(), OpError> {
     check_agent(agent).map_err(OpError::InvalidArgument)?;
-    if !tx.agent_tools().agents().await?.iter().any(|a| a == agent) {
+    // Holds the agent until the transaction ends, so a cap checked after this stays true at
+    // commit: two changes for one agent take turns.
+    if !tx.agent_tools().lock_agent(agent).await? {
         return Err(OpError::NotFound(format!(
             "no agent {agent} has a folder in deploy/aws/agents; add the folder and deploy first"
         )));

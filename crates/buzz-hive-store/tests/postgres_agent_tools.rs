@@ -136,3 +136,98 @@ async fn the_table_refuses_a_transport_it_does_not_know() {
     .await;
     assert!(bad.is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn locking_an_agent_makes_another_transaction_for_it_wait_until_the_first_ends() {
+    let (store, _guard, relay) = store().await;
+    let store = std::sync::Arc::new(store);
+    let community = CommunityId::from_u128(1);
+    let mut tx = store.begin(community).await.unwrap();
+    tx.agent_tools().seed("coder", &[]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut first = store.begin(community).await.unwrap();
+    assert!(first.agent_tools().lock_agent("coder").await.unwrap());
+    let other = store.clone();
+    let second = tokio::spawn(async move {
+        let mut tx = other.begin(community).await.unwrap();
+        let known = tx.agent_tools().lock_agent("coder").await.unwrap();
+        // An agent nobody seeded is not known, and is not locked.
+        let stranger = tx.agent_tools().lock_agent("stranger").await.unwrap();
+        (known, stranger)
+    });
+    // The second transaction is waiting on the row lock: Postgres says so.
+    let mut waiting = false;
+    for _ in 0..250 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND query LIKE '%agent_tool_agents%FOR UPDATE%'",
+        )
+        .fetch_one(&relay)
+        .await
+        .unwrap();
+        if n == 1 {
+            waiting = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting, "the second lock did not wait for the first");
+    assert!(!second.is_finished());
+    first.commit().await.unwrap();
+    assert_eq!(second.await.unwrap(), (true, false));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn simultaneous_sets_for_an_agent_one_short_of_the_cap_never_pass_it() {
+    use buzz_hive_core::access::ActorKind;
+    use buzz_hive_core::domain::events::Actor;
+    use buzz_hive_core::domain::tool_server::MAX_SERVERS_PER_AGENT;
+    use buzz_hive_core::orchestrator::agent_tools::set;
+    use buzz_hive_core::orchestrator::Ctx;
+
+    let (store, _guard, _relay) = store().await;
+    let store = std::sync::Arc::new(store);
+    let community = CommunityId::from_u128(1);
+    let held: Vec<ToolServer> = (0..MAX_SERVERS_PER_AGENT - 1)
+        .map(|i| stdio(&format!("held-{i}"), "x"))
+        .collect();
+    let mut tx = store.begin(community).await.unwrap();
+    tx.agent_tools().seed("coder", &held).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let ctx = Ctx {
+        community,
+        actor: Actor {
+            pubkey: "aa".into(),
+            kind: ActorKind::Person,
+        },
+        requester: None,
+    };
+    let mut sets = Vec::new();
+    for i in 0..8 {
+        let (store, ctx) = (store.clone(), ctx.clone());
+        sets.push(tokio::spawn(async move {
+            set(
+                &*store,
+                None,
+                &ctx,
+                "coder",
+                stdio(&format!("new-{i}"), "x"),
+            )
+            .await
+        }));
+    }
+    let mut saved = 0;
+    for done in sets {
+        if done.await.unwrap().is_ok() {
+            saved += 1;
+        }
+    }
+    let mut tx = store.begin(community).await.unwrap();
+    let have = tx.agent_tools().of_agent("coder").await.unwrap().len();
+    assert_eq!(saved, 1);
+    assert_eq!(have, MAX_SERVERS_PER_AGENT);
+}

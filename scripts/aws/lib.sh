@@ -8,6 +8,11 @@ if [ -z "${REPO_ROOT:-}" ]; then
 fi
 export REPO_ROOT
 
+# The name of an agent: a lowercase letter, then lowercase letters, digits or hyphens, at most
+# 24 characters. crates/buzz-hive-core/src/domain/tool_server.rs check_agent is the same rule,
+# and tests/aws/fixtures/agent-names.txt holds the names both are tested against.
+AGENT_NAME_PATTERN='^[a-z][a-z0-9-]{0,23}$'
+
 # die <message>: prints the message to stderr and exits 1.
 die() {
   echo "error: $*" >&2
@@ -128,7 +133,7 @@ load_settings() {
           ;;
         *) die "AGENTS contains unknown agent '$entry' (allowed: claude, codex, or name:runtime)" ;;
       esac
-      [[ "$name" =~ ^[a-z][a-z0-9-]{0,23}$ ]] \
+      [[ "$name" =~ $AGENT_NAME_PATTERN ]] \
         || die "AGENTS has an invalid agent name '$name' (lowercase letter first, then lowercase letters, digits, or hyphens, at most 24 characters)"
       local seen
       for seen in "${seen_names[@]+"${seen_names[@]}"}"; do

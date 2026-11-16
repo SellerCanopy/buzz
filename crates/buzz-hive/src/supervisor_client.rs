@@ -15,19 +15,37 @@ use buzz_hive_core::supervisor_wire::{Call, Reply, Signer, MAX_LINE_BYTES};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-/// An apply waits for the agent's restart, which can take a while.
-const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
-/// Reading settings only reads a file.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// A sign-in start waits up to 30 seconds for the CLI's link, a paste up to 30 for it to take
-/// the address. These leave room for the socket round trip.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(40);
-/// `claude mcp list` health-checks every server, so a status can take a minute.
-const LOGIN_STATUS_TIMEOUT: Duration = Duration::from_secs(70);
+/// How long each kind of call waits for the supervisor's answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// An apply waits for the agent's restart, which can take a while. The supervisor itself
+    /// gives up on a call that waited more than 30 seconds for the change ahead of it, and
+    /// drops a call whose connection this side has closed.
+    pub apply: Duration,
+    /// Reading settings only reads a file.
+    pub read: Duration,
+    /// A sign-in start waits up to 30 seconds for the CLI's link, a paste up to 30 for it to
+    /// take the address. This leaves room for the socket round trip.
+    pub login: Duration,
+    /// `claude mcp list` health-checks every server, so a status can take a minute.
+    pub login_status: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            apply: Duration::from_secs(120),
+            read: Duration::from_secs(10),
+            login: Duration::from_secs(40),
+            login_status: Duration::from_secs(70),
+        }
+    }
+}
 
 pub struct UnixSupervisor {
     socket: PathBuf,
     signer: Signer,
+    timeouts: Timeouts,
 }
 
 impl UnixSupervisor {
@@ -37,7 +55,14 @@ impl UnixSupervisor {
         Ok(Self {
             socket,
             signer: Signer::from_secret(token_secret)?,
+            timeouts: Timeouts::default(),
         })
+    }
+
+    /// The same client waiting `timeouts` for its answers, which a test shortens.
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// The key the supervisor's `BUZZ_HIVE_SUPERVISOR_PUBKEY` must hold.
@@ -86,7 +111,7 @@ impl Supervisor for UnixSupervisor {
                     servers: servers.to_vec(),
                     secrets: secrets.clone(),
                 },
-                APPLY_TIMEOUT,
+                self.timeouts.apply,
             )
             .await?;
         result["restarted"]
@@ -100,7 +125,7 @@ impl Supervisor for UnixSupervisor {
                 &Call::AgentSettings {
                     agent: agent.to_owned(),
                 },
-                READ_TIMEOUT,
+                self.timeouts.read,
             )
             .await?;
         match (
@@ -128,7 +153,7 @@ impl Supervisor for UnixSupervisor {
                     agent: agent.to_owned(),
                     server: server.to_owned(),
                 },
-                LOGIN_TIMEOUT,
+                self.timeouts.login,
             )
             .await?;
         // The reply is dropped here whatever it holds: only the link leaves, wrapped.
@@ -151,7 +176,7 @@ impl Supervisor for UnixSupervisor {
                     server: server.to_owned(),
                     url: url.clone(),
                 },
-                LOGIN_TIMEOUT,
+                self.timeouts.login,
             )
             .await?;
         match result["signed_in"].as_bool() {
@@ -169,7 +194,7 @@ impl Supervisor for UnixSupervisor {
                     agent: agent.to_owned(),
                     server: server.to_owned(),
                 },
-                LOGIN_STATUS_TIMEOUT,
+                self.timeouts.login_status,
             )
             .await?;
         result["state"]

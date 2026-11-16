@@ -310,6 +310,16 @@ impl Verifier {
         if (now_ms - envelope.timestamp).abs() > WINDOW_MS {
             return Err(Refusal::Stale);
         }
+        // `hex::decode` takes either case, so the replay set below would count `ab` and `AB` as
+        // two signatures. Only the one canonical text is a signature.
+        if envelope.signature.len() != 128
+            || !envelope
+                .signature
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(Refusal::BadSignature);
+        }
         let signature = hex::decode(&envelope.signature).map_err(|_| Refusal::BadSignature)?;
         UnparsedPublicKey::new(&ED25519, &self.public)
             .verify(
@@ -449,6 +459,52 @@ mod tests {
         );
         // The same line twice.
         assert!(verifier.open(&line, now).is_ok());
+        assert_eq!(verifier.open(&line, now), Err(Refusal::Replayed));
+    }
+
+    #[test]
+    fn a_replay_with_the_signature_in_another_case_or_length_is_refused() {
+        let (signer, verifier) = pair();
+        let now = 5_000_000;
+        let line = signer.sign(&apply(), now);
+        assert!(verifier.open(&line, now).is_ok());
+        let with = |signature: String| {
+            let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            value["signature"] = json!(signature);
+            value.to_string()
+        };
+        let original = serde_json::from_str::<serde_json::Value>(&line).unwrap()["signature"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(original.bytes().any(|b| b.is_ascii_lowercase()));
+        // The same bytes in upper or mixed case would verify, and must not run a second time.
+        let mixed: String = original
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        for changed in [original.to_ascii_uppercase(), mixed] {
+            assert_eq!(
+                verifier.open(&with(changed), now),
+                Err(Refusal::BadSignature)
+            );
+        }
+        // Wrong length, with or without padding that would still decode.
+        assert_eq!(
+            verifier.open(&with(format!("{original}00")), now),
+            Err(Refusal::BadSignature)
+        );
+        assert_eq!(
+            verifier.open(&with(original[..126].to_owned()), now),
+            Err(Refusal::BadSignature)
+        );
         assert_eq!(verifier.open(&line, now), Err(Refusal::Replayed));
     }
 

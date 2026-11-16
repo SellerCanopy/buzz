@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::timers::sleep_or_stop;
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::orchestrator::outbox::{drain_outbox_with, Actions};
 use buzz_hive_core::orchestrator::Env;
@@ -187,14 +188,6 @@ pub fn retry_after(failures: u32) -> Duration {
         .min(MAX_RETRY);
     let extra = rand::random_range(0..=base.as_millis() as u64 / 4);
     base + Duration::from_millis(extra)
-}
-
-/// Sleeps for `wait`. Returns true when `stop` changed first.
-async fn sleep_or_stop(wait: Duration, stop: &mut watch::Receiver<bool>) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(wait) => false,
-        _ = stop.changed() => true,
-    }
 }
 
 #[cfg(test)]

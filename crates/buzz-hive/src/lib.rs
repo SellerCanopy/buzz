@@ -3,6 +3,7 @@
 //! and carry out timers. `main.rs` wires them to the HTTP routes.
 
 pub mod agent_seed;
+pub mod commands;
 pub mod config;
 pub mod dir_source;
 pub mod drain;

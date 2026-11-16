@@ -7,7 +7,7 @@
 //! that does not repeat it. The same check runs where the admin pastes it and in the host
 //! supervisor, which writes it to the waiting process.
 
-use crate::ports::secrets::SecretString;
+use crate::domain::secret::SecretString;
 
 /// The longest address accepted.
 pub const MAX_CALLBACK_CHARS: usize = 2048;
@@ -97,20 +97,6 @@ impl LoginState {
             _ => None,
         }
     }
-
-    /// The state the Claude CLI's `mcp list` prints on a server's line (the text after the
-    /// last ` - `): `Needs authentication` or `Connected`, with or without a mark in front.
-    /// Anything else (`Failed to connect`, a state this does not know) is `None`.
-    pub fn from_list_status(status: &str) -> Option<Self> {
-        let status = status.to_ascii_lowercase();
-        if status.contains("needs auth") || status.contains("needs sign") {
-            Some(Self::NeedsSignIn)
-        } else if status.contains("connected") && !status.contains("not connected") {
-            Some(Self::Connected)
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -170,15 +156,8 @@ mod tests {
     }
 
     #[test]
-    fn the_cli_status_text_maps_to_a_state() {
+    fn a_state_is_read_back_from_its_wire_form() {
         use LoginState::*;
-        assert_eq!(
-            LoginState::from_list_status("⚠ Needs authentication"),
-            Some(NeedsSignIn)
-        );
-        assert_eq!(LoginState::from_list_status("✓ Connected"), Some(Connected));
-        assert_eq!(LoginState::from_list_status("✗ Failed to connect"), None);
-        assert_eq!(LoginState::from_list_status("Not connected"), None);
         assert_eq!(LoginState::parse("connected"), Some(Connected));
         assert_eq!(LoginState::parse(Connected.as_str()), Some(Connected));
         assert_eq!(LoginState::parse(NeedsSignIn.as_str()), Some(NeedsSignIn));

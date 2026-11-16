@@ -11,8 +11,8 @@
 # URL). AGENTS (empty or unset: no agents), AGENTS_ECR_REPO (required when AGENTS
 # is set; the agents image is $AGENTS_ECR_REPO:<tag>), AGENT_RESPOND_TO and
 # AGENT_RESPOND_TO_ALLOWLIST (read by render-agents-env.sh), AGENT_SETTLE_SECONDS
-# (how long an agent must stay up, default 15). BUZZ_HOME overrides /opt/buzz for
-# tests.
+# (how long an agent must stay up, default 15). BUZZ_HOME overrides /opt/buzz and BUZZ_ETC_DIR
+# overrides /etc for tests.
 # The whole agent phase (render, start, stale cleanup) runs after `run.sh upgrade`
 # returns, which waits for the relay to be healthy. The first deploy has no agent
 # keys or credentials yet, because registering an agent needs a running relay. So
@@ -33,6 +33,7 @@ tag="$1"
 : "${RELAY_OWNER_PUBKEY:?RELAY_OWNER_PUBKEY must be set}"
 : "${ECR_REPO:?ECR_REPO must be set}"
 BUZZ_HOME="${BUZZ_HOME:-/opt/buzz}"
+BUZZ_ETC_DIR="${BUZZ_ETC_DIR:-/etc}"
 AGENTS="${AGENTS:-}"
 AGENT_SETTLE_SECONDS="${AGENT_SETTLE_SECONDS:-15}"
 export BUZZ_DOMAIN RELAY_OWNER_PUBKEY AGENTS
@@ -127,7 +128,7 @@ stop_stale_agents() {
 supervise_agents() {
   local image="${BUZZ_HIVE_IMAGE:-}" env_file="$BUZZ_HOME/.env.hive" unit_src unit_env keys cid hive
   unit_src="$BUZZ_HOME/deploy/aws/buzz-hive-supervisor.service"
-  unit_env=/etc/buzz-hive-supervisor.env
+  unit_env="$BUZZ_ETC_DIR/buzz-hive-supervisor.env"
   if [ -z "$image" ] || [ ! -f "$env_file" ] || [ ! -f "$unit_src" ]; then
     echo "supervisor: skipped (no BUZZ_HIVE_IMAGE, $env_file or unit file)"
     return 0
@@ -153,7 +154,8 @@ supervise_agents() {
   } > "$unit_env"
   chmod 600 "$unit_env"
   mkdir -p "$agents_dir"
-  cp "$unit_src" /etc/systemd/system/buzz-hive-supervisor.service
+  mkdir -p "$BUZZ_ETC_DIR/systemd/system"
+  cp "$unit_src" "$BUZZ_ETC_DIR/systemd/system/buzz-hive-supervisor.service"
   systemctl daemon-reload
   systemctl enable buzz-hive-supervisor.service > /dev/null 2>&1 || true
   # A restart, so a new binary or new keys take effect.

@@ -6,8 +6,12 @@
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use buzz_hive_core::ports::secrets::{SecretError, SecretScope, SecretSink, SecretString};
+
+/// Makes each write's temporary name its own, so two writes of one secret never share a file.
+static WRITES: AtomicU64 = AtomicU64::new(0);
 
 pub struct FileSecretSink {
     dir: PathBuf,
@@ -54,7 +58,11 @@ impl SecretSink for FileSecretSink {
                 .map_err(|e| io("could not restrict", e))?;
         }
         // Written beside the file and renamed, so a reader never sees half a value.
-        let temp = parent.join(format!(".{var}.tmp"));
+        let temp = parent.join(format!(
+            ".{var}.{}.{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
         let written = (|| {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -104,7 +112,52 @@ mod tests {
         assert_eq!(mode(&dir.path().join("team/env")), 0o700);
         assert_eq!(mode(&dir.path().join("agents/coder")), 0o700);
         // No temporary file is left behind.
-        assert!(!dir.path().join("team/env/.GH_TOKEN.tmp").exists());
+        assert_eq!(no_temporary_files(dir.path()), Vec::<String>::new());
+    }
+
+    fn no_temporary_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(no_temporary_files(&path));
+            } else if path.extension().is_some_and(|e| e == "tmp") {
+                found.push(path.display().to_string());
+            }
+        }
+        found
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_of_one_secret_at_once_leave_one_whole_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = std::sync::Arc::new(FileSecretSink::new(dir.path().to_owned()));
+        // Long values and short ones, so a mix of two would be neither.
+        let values: Vec<String> = (0..16)
+            .map(|i| {
+                char::from(b'a' + i as u8)
+                    .to_string()
+                    .repeat(if i % 2 == 0 { 4000 } else { 10 })
+            })
+            .collect();
+        let mut tasks = Vec::new();
+        for value in values.clone() {
+            let sink = sink.clone();
+            tasks.push(tokio::spawn(async move {
+                sink.put(SecretScope::Team, "GH_TOKEN", SecretString::new(&value))
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        let stored = std::fs::read_to_string(dir.path().join("team/env/GH_TOKEN")).unwrap();
+        assert!(
+            values.contains(&stored),
+            "a mixed value: {} bytes",
+            stored.len()
+        );
+        assert_eq!(no_temporary_files(dir.path()), Vec::<String>::new());
     }
 
     #[tokio::test]

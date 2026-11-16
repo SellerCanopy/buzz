@@ -25,7 +25,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/aws/lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
-NAME_PATTERN='^[a-z][a-z0-9-]{0,23}$'
 PLAIN_PATTERN='^[A-Za-z0-9._-]+$'
 # Agent secrets for ${VAR} references in mcp.json. Values land unquoted in an env
 # file, so $, #, quotes, backslash, spaces, and line breaks are not allowed.
@@ -139,7 +138,7 @@ if not isinstance(cfg, dict) or not isinstance(cfg.get("mcpServers"), dict):
 agents="$(agent_list)"
 while read -r name runtime; do
   [ -n "$name" ] || continue
-  [[ "$name" =~ $NAME_PATTERN ]] || die "invalid agent name: $name"
+  [[ "$name" =~ $AGENT_NAME_PATTERN ]] || die "invalid agent name: $name"
   agent_env "$name" "$runtime" > /dev/null || exit 1
   check_config "$name" || exit 1
 done <<< "$agents"
@@ -190,7 +189,7 @@ for f in "$outdir"/*.env "$outdir"/*/; do
   stem="$(basename "$f")"
   stem="${stem%.compose.env}"
   stem="${stem%.env}"
-  [[ "$stem" =~ $NAME_PATTERN ]] || continue
+  [[ "$stem" =~ $AGENT_NAME_PATTERN ]] || continue
   case "$names" in
     *$'\n'"$stem"$'\n'*) ;;
     *) rm -rf "${outdir:?}/$stem" "$outdir/$stem.env" "$outdir/$stem.compose.env" ;;

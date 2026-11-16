@@ -279,6 +279,143 @@ scenario_stale_project_with_wanted_prefix() {
   [ "$(log_count '^docker compose -p buzz-agent-b down$')" -eq 0 ]
 }
 
+# The Beehive host supervisor. The stub docker answers create, run and ps from files, and the
+# stub systemctl logs. docker cp is a stub too, so the binary it would copy is put in place.
+
+HIVE_IMAGE="123456789012.dkr.ecr.us-east-1.amazonaws.com/buzz/hive:abc1234"
+SUPERVISOR_PUBKEY="$(printf '1%.0s' $(seq 1 64))"
+HIVE_PUBKEY="$(printf '2%.0s' $(seq 1 64))"
+ETC_DIR="$WORK/etc"
+
+# with_supervisor: everything a deploy needs to install the supervisor.
+with_supervisor() {
+  new_home; with_secrets
+  rm -rf "$ETC_DIR"
+  mkdir -p "$ETC_DIR"
+  echo "POSTGRES_PASSWORD=x" > "$HOME_DIR/.env.hive"
+  mkdir -p "$HOME_DIR/bin"
+  printf '#!/bin/sh\n' > "$HOME_DIR/bin/buzz-hive-supervisor"
+  chmod +x "$HOME_DIR/bin/buzz-hive-supervisor"
+  echo "cid-1" > "$STUB_DIR/docker-create.out"
+  printf 'BUZZ_HIVE_SUPERVISOR_PUBKEY=%s\nBUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY=%s\n' "$SUPERVISOR_PUBKEY" "$HIVE_PUBKEY" > "$STUB_DIR/docker-run.out"
+  echo "hive-container" > "$STUB_DIR/docker-ps.out"
+}
+
+run_supervised() {
+  local dir="$1"
+  shift
+  run_remote "$dir" "BUZZ_HIVE_IMAGE=$HIVE_IMAGE" "BUZZ_ETC_DIR=$ETC_DIR" ${@+"$@"}
+}
+
+scenario_supervisor_installed_and_agents_applied() {
+  with_supervisor
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] || return 1
+  local env_file="$ETC_DIR/buzz-hive-supervisor.env"
+  [ "$(mode_of "$env_file")" = "-rw-------" ] || return 1
+  # The keys the image printed, then the paths the unit reads, and nothing else.
+  [ "$(cat "$env_file")" = "$(printf '%s\n' \
+    "BUZZ_HIVE_SUPERVISOR_PUBKEY=$SUPERVISOR_PUBKEY" \
+    "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY=$HIVE_PUBKEY" \
+    "BUZZ_HIVE_SUPERVISOR_SOCKET=/run/buzz-hive/supervisor.sock" \
+    "BUZZ_HIVE_SUPERVISOR_SOCKET_UID=1000" \
+    "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC=$HOME_DIR/deploy/aws/agents" \
+    "BUZZ_HIVE_SUPERVISOR_RENDER_DIR=$HOME_DIR/agents" \
+    "BUZZ_HIVE_SUPERVISOR_SECRETS=ssm")" ] || return 1
+  cmp -s "$HOME_DIR/deploy/aws/buzz-hive-supervisor.service" "$ETC_DIR/systemd/system/buzz-hive-supervisor.service" || return 1
+  # The image the service runs supplies the binary and the keys.
+  [ "$(log_count "^docker create $HIVE_IMAGE\$")" -eq 1 ] || return 1
+  [ "$(log_count "^docker cp cid-1:/usr/local/bin/buzz-hive-supervisor $HOME_DIR/bin/buzz-hive-supervisor\$")" -eq 1 ] || return 1
+  [ "$(log_count "^docker rm cid-1\$")" -eq 1 ] || return 1
+  [ "$(log_count "^docker run --rm --env-file $HOME_DIR/.env.hive $HIVE_IMAGE keys\$")" -eq 1 ] || return 1
+  # Reload, enable, restart, in that order, and only then the apply.
+  local reload enable restart apply prev=0 n
+  reload="$(log_line '^systemctl daemon-reload$')"
+  enable="$(log_line '^systemctl enable buzz-hive-supervisor.service$')"
+  restart="$(log_line '^systemctl restart buzz-hive-supervisor.service$')"
+  apply="$(log_line '^docker exec hive-container /usr/local/bin/buzz-hive apply-agents$')"
+  for n in "$reload" "$enable" "$restart" "$apply"; do
+    [ -n "$n" ] && [ "$n" -gt "$prev" ] || return 1
+    prev="$n"
+  done
+  # No secret and no key of the deploy is in the file or the output.
+  ! grep -q "value-of" "$env_file" "$WORK/out" "$WORK/err"
+}
+
+scenario_supervisor_skipped_without_its_inputs() {
+  local what
+  for what in no-image no-env-file no-unit; do
+    with_supervisor
+    case "$what" in
+      no-image) run_remote "$1" "BUZZ_ETC_DIR=$ETC_DIR" ;;
+      no-env-file) rm "$HOME_DIR/.env.hive"; run_supervised "$1" ;;
+      no-unit) rm "$HOME_DIR/deploy/aws/buzz-hive-supervisor.service"; run_supervised "$1" ;;
+    esac
+    [ "$RC" -eq 0 ] || return 1
+    grep -qF "supervisor: skipped" "$WORK/out" || return 1
+    [ "$(log_count '^docker (create|run|exec) ')" -eq 0 ] || return 1
+    [ "$(log_count '^systemctl ')" -eq 0 ] || return 1
+    [ ! -e "$ETC_DIR/buzz-hive-supervisor.env" ] || return 1
+  done
+}
+
+scenario_supervisor_skipped_for_an_image_name_that_is_not_one() {
+  with_supervisor
+  run_remote "$1" "BUZZ_HIVE_IMAGE=repo/hive;touch pwned" "BUZZ_ETC_DIR=$ETC_DIR"
+  [ "$RC" -eq 0 ] || return 1
+  grep -qF "BUZZ_HIVE_IMAGE is not an image name" "$WORK/err" || return 1
+  [ "$(log_count '^docker (create|run|exec) ')" -eq 0 ] || return 1
+  [ ! -e "$ETC_DIR/buzz-hive-supervisor.env" ] && [ ! -e pwned ]
+}
+
+scenario_supervisor_trouble_warns_and_never_fails_the_deploy() {
+  # The image has no supervisor binary.
+  with_supervisor
+  rm "$HOME_DIR/bin/buzz-hive-supervisor"
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] && grep -qF "the image has no buzz-hive-supervisor" "$WORK/err" || return 1
+  [ ! -e "$ETC_DIR/buzz-hive-supervisor.env" ] || return 1
+  # The keys cannot be read.
+  with_supervisor
+  echo 1 > "$STUB_DIR/docker-run.rc"
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] && grep -qF "cannot read the Beehive keys" "$WORK/err" || return 1
+  [ ! -e "$ETC_DIR/buzz-hive-supervisor.env" ] || return 1
+  # The unit does not start: nothing is applied.
+  with_supervisor
+  echo 1 > "$STUB_DIR/systemctl-restart.rc"
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] && grep -qF "the supervisor did not start" "$WORK/err" || return 1
+  [ "$(log_count 'apply-agents')" -eq 0 ] || return 1
+  # The hive service is not running yet: installed, nothing applied.
+  with_supervisor
+  : > "$STUB_DIR/docker-ps.out"
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] && grep -qF "the hive service is not running" "$WORK/out" || return 1
+  [ "$(log_count 'apply-agents')" -eq 0 ] || return 1
+  # Some agent is not applied: a warning, and the deploy still succeeds.
+  with_supervisor
+  echo 1 > "$STUB_DIR/docker-exec.rc"
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] && grep -qF "not every agent was given its tool servers" "$WORK/err"
+}
+
+scenario_the_unit_runs_what_the_deploy_installs() {
+  with_supervisor
+  run_supervised "$1"
+  [ "$RC" -eq 0 ] || return 1
+  local unit="$ETC_DIR/systemd/system/buzz-hive-supervisor.service"
+  # The unit reads the file the deploy wrote, under the folder the deploy defaults to, and runs
+  # the binary the deploy copied, under the home it defaults to.
+  grep -qF 'BUZZ_ETC_DIR="${BUZZ_ETC_DIR:-/etc}"' "$1/remote-deploy.sh" || return 1
+  grep -qF 'BUZZ_HOME="${BUZZ_HOME:-/opt/buzz}"' "$1/remote-deploy.sh" || return 1
+  grep -qxF "EnvironmentFile=/etc/$(basename "$ETC_DIR"/buzz-hive-supervisor.env)" "$unit" || return 1
+  [ -x "$HOME_DIR/bin/buzz-hive-supervisor" ] || return 1
+  grep -qxF "ExecStart=/opt/buzz/bin/$(basename "$HOME_DIR/bin/buzz-hive-supervisor")" "$unit" || return 1
+  # And it may write where the deploy renders the agents.
+  grep -qF "ReadWritePaths=/opt/buzz/agents " "$unit"
+}
+
 R="$REPO_ROOT/scripts/aws"
 expect_ok "writes a 0600 .env and runs run.sh upgrade with TLS" scenario_deploys "$R"
 expect_ok "logs in to ECR before the upgrade" scenario_logs_in_before_upgrade "$R"
@@ -300,6 +437,12 @@ expect_ok "a failed agent render leaves the relay up, fails the deploy, and says
 expect_ok "a failed cleanup of old agent files fails the deploy with the relay-is-up message" scenario_agent_cleanup_failure_fails_deploy "$R"
 expect_ok "agent files are rendered after the relay upgrade" scenario_agents_render_after_upgrade "$R"
 expect_ok "a stale project named like a wanted agent plus a suffix is stopped" scenario_stale_project_with_wanted_prefix "$R"
+
+expect_ok "the supervisor is installed from the hive image and every agent applied" scenario_supervisor_installed_and_agents_applied "$R"
+expect_ok "the supervisor is skipped without its image, env file or unit" scenario_supervisor_skipped_without_its_inputs "$R"
+expect_ok "the supervisor is skipped for a name that is not an image" scenario_supervisor_skipped_for_an_image_name_that_is_not_one "$R"
+expect_ok "supervisor trouble warns and never fails the deploy" scenario_supervisor_trouble_warns_and_never_fails_the_deploy "$R"
+expect_ok "the unit runs the binary and reads the file the deploy installs" scenario_the_unit_runs_what_the_deploy_installs "$R"
 
 expect_caught "TLS flag dropped" scenario_deploys remote-deploy.sh \
   's/^BUZZ_COMPOSE_TLS=true \.\/run\.sh upgrade$/.\/run.sh upgrade/'
@@ -350,5 +493,16 @@ expect_caught "rendered agents image uses the relay repository" scenario_agents_
 
 expect_caught "failed cleanup of old agent files ignored" scenario_agent_cleanup_failure_fails_deploy remote-deploy.sh \
   's/-exec rm -rf \{\} \+ \|\| return 1$/-exec rm -rf {} +/'
+
+expect_caught "supervisor unit not reloaded before it starts" scenario_supervisor_installed_and_agents_applied remote-deploy.sh \
+  's/^  systemctl daemon-reload$/  true/'
+expect_caught "supervisor keys not read from the image" scenario_supervisor_installed_and_agents_applied remote-deploy.sh \
+  's/^  keys="\$\(docker run --rm --env-file "\$env_file" "\$image" keys\)".*$/  keys="BUZZ_HIVE_SUPERVISOR_PUBKEY=x"/'
+expect_caught "image name not checked" scenario_supervisor_skipped_for_an_image_name_that_is_not_one remote-deploy.sh \
+  's/^  \[\[ "\$image" =~ .*$/  true/'
+expect_caught "a supervisor that did not start fails the deploy" scenario_supervisor_trouble_warns_and_never_fails_the_deploy remote-deploy.sh \
+  's/ \|\| \{ echo "warning: the supervisor did not start" >&2; return 0; \}//'
+expect_caught "skip conditions dropped" scenario_supervisor_skipped_without_its_inputs remote-deploy.sh \
+  's/^  if \[ -z "\$image" \] \|\| .*$/  if false; then/'
 
 exit "$fail"

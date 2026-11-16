@@ -274,12 +274,17 @@ fn stub_aws(root: &std::path::Path) -> std::path::PathBuf {
              echo \"$@\" >> '{args}'\n\
              [ \"$1 $2\" = 'ssm get-parameter' ] || exit 2\n\
              while [ $# -gt 0 ]; do [ \"$1\" = --name ] && name=$2; shift; done\n\
+             case \"$(cat '{mode}' 2>/dev/null)\" in\n\
+               denied) echo 'An error occurred (AccessDeniedException) when calling the GetParameter operation: not allowed' >&2; exit 254;;\n\
+               hang) sleep 30;;\n\
+             esac\n\
              f='{store}'\"$name\"\n\
              if [ -f \"$f\" ]; then cat \"$f\"; echo; exit 0; fi\n\
              echo 'An error occurred (ParameterNotFound) when calling the GetParameter operation' >&2\n\
              exit 254\n",
             args = root.join("aws-args.log").display(),
             store = root.join("ssm").display(),
+            mode = root.join("aws-mode").display(),
         ),
     )
     .unwrap();
@@ -296,7 +301,7 @@ async fn the_ssm_source_asks_the_aws_program_for_the_decrypted_parameter() {
     std::fs::write(dir.join("GH_TOKEN"), TEAM_VALUE).unwrap();
 
     let service =
-        Service::with_secrets(rig.config.clone(), Arc::new(SsmSecretSource { cli })).unwrap();
+        Service::with_secrets(rig.config.clone(), Arc::new(SsmSecretSource::new(cli))).unwrap();
     let now = rig.now() + 1000;
     let line = rig.signer.sign(
         &buzz_hive_core::supervisor_wire::Call::ApplyAgentConfig {
@@ -353,4 +358,72 @@ async fn a_supervisor_with_no_store_fails_a_named_secret_and_not_an_apply_that_n
         )
         .await;
     assert_eq!(some.error.as_deref(), Some("failed"), "{some:?}");
+}
+
+#[tokio::test]
+async fn an_ssm_failure_that_is_not_a_missing_parameter_is_an_error_and_not_an_unset_secret() {
+    let rig = Rig::new();
+    let cli = stub_aws(rig.root());
+    let before = env_of(&rig);
+    let scope = SecretScope::Team;
+    let source = SsmSecretSource::new(cli.clone());
+
+    // AccessDenied is a fault with the reason, which is what an admin needs to read.
+    std::fs::write(rig.root().join("aws-mode"), "denied").unwrap();
+    let error = source.read(&scope, "GH_TOKEN").await.unwrap_err();
+    assert!(error.contains("failed"), "{error}");
+    assert!(error.contains("AccessDeniedException"), "{error}");
+    assert!(error.contains("/buzz/team/env/GH_TOKEN"), "{error}");
+
+    // And an apply reports it and leaves the agent's file and process alone.
+    let service =
+        Service::with_secrets(rig.config.clone(), Arc::new(SsmSecretSource::new(cli))).unwrap();
+    let now = rig.now() + 1000;
+    let line = rig.signer.sign(
+        &buzz_hive_core::supervisor_wire::Call::ApplyAgentConfig {
+            agent: "coder".into(),
+            servers: servers(),
+            secrets: names(&[], &["GH_TOKEN"]),
+        },
+        now,
+    );
+    let reply = service.handle(&line, now).await;
+    assert_eq!(reply.error.as_deref(), Some("failed"), "{reply:?}");
+    assert!(
+        reply.message.as_deref().unwrap().contains("AccessDenied"),
+        "{reply:?}"
+    );
+    assert_eq!(env_of(&rig), before);
+    assert!(rig.restarts().is_empty());
+}
+
+#[tokio::test]
+async fn a_read_that_hangs_or_a_program_that_is_not_there_is_an_error() {
+    let rig = Rig::new();
+    let scope = SecretScope::Team;
+
+    let missing = SsmSecretSource::new(rig.root().join("no-such-aws"));
+    let error = missing.read(&scope, "GH_TOKEN").await.unwrap_err();
+    assert!(error.contains("could not run"), "{error}");
+
+    let cli = stub_aws(rig.root());
+    std::fs::write(rig.root().join("aws-mode"), "hang").unwrap();
+    let mut slow = SsmSecretSource::new(cli);
+    slow.timeout = std::time::Duration::from_millis(300);
+    let error = slow.read(&scope, "GH_TOKEN").await.unwrap_err();
+    assert!(error.contains("took too long"), "{error}");
+}
+
+#[tokio::test]
+async fn a_secret_path_that_is_a_folder_is_an_error_and_not_an_unset_secret() {
+    let rig = Rig::new();
+    let dir = rig.root().join("secrets");
+    std::fs::create_dir_all(dir.join("team/env/GH_TOKEN")).unwrap();
+    let source = FileSecretSource { dir };
+    let error = source
+        .read(&SecretScope::Team, "GH_TOKEN")
+        .await
+        .unwrap_err();
+    assert!(error.contains("could not read"), "{error}");
+    assert!(error.contains("GH_TOKEN"), "{error}");
 }

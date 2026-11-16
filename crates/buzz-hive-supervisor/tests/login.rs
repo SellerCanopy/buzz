@@ -168,14 +168,15 @@ async fn a_session_older_than_its_time_is_dropped_and_its_process_ended() {
     assert!(rig.call(&start("coder", "docs")).await.ok);
     let waiting = pid(&rig);
     assert!(alive(&waiting));
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // Nothing calls the supervisor from here until the process is gone: it is the expiry
+    // timer that ends it, not a later call sweeping the table.
+    assert!(gone(&waiting).await, "the process was ended by the timer");
     let reply = rig.call(&paste("coder", "docs", ADDRESS)).await;
     assert_eq!(reply.error.as_deref(), Some("not_found"), "{reply:?}");
     assert!(
         !rig.stub("last-paste").exists(),
         "an expired session is never written to"
     );
-    assert!(gone(&waiting).await, "the process was ended");
 }
 
 #[tokio::test]
@@ -189,6 +190,47 @@ async fn a_second_start_replaces_the_session_and_ends_the_first_process() {
     assert!(gone(&first).await);
     assert!(alive(&second));
     assert!(rig.call(&paste("coder", "docs", ADDRESS)).await.ok);
+}
+
+#[tokio::test]
+async fn two_starts_at_once_leave_one_sign_in_and_the_other_process_ended() {
+    let rig = rig_with(Limits::default()).await;
+    let call = start("coder", "docs");
+    let (a, b) = tokio::join!(rig.call(&call), rig.call(&call));
+    assert!(a.ok && b.ok, "{a:?} {b:?}");
+    let pids: Vec<String> = std::fs::read_to_string(rig.stub("login.pids"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(pids.len(), 2, "{pids:?}");
+    for pid in &pids[..1] {
+        assert!(gone(pid).await, "the sign-in that was replaced is ended");
+    }
+    assert!(alive(&pids[1]), "the last start is the one that is waiting");
+    // The address goes to the process that is waiting and the sign-in finishes.
+    assert!(rig.call(&paste("coder", "docs", ADDRESS)).await.ok);
+}
+
+#[tokio::test]
+async fn a_restart_ends_the_sign_ins_waiting_in_that_agents_container() {
+    let rig = rig_with(Limits::default()).await;
+    assert!(rig.call(&start("coder", "docs")).await.ok);
+    let waiting = pid(&rig);
+    assert!(alive(&waiting));
+    assert!(
+        rig.call(&Call::RestartAgent {
+            agent: "coder".into()
+        })
+        .await
+        .ok
+    );
+    assert!(
+        gone(&waiting).await,
+        "the sign-in did not outlive its container"
+    );
+    let reply = rig.call(&paste("coder", "docs", ADDRESS)).await;
+    assert_eq!(reply.error.as_deref(), Some("not_found"), "{reply:?}");
 }
 
 #[tokio::test]
@@ -286,6 +328,20 @@ async fn a_process_that_never_prints_a_link_or_never_exits_fails_and_is_ended() 
     assert_eq!(reply.error.as_deref(), Some("failed"), "{reply:?}");
     assert!(!format!("{reply:?}").contains(CODE));
     assert!(gone(&hung).await, "the hung process was ended");
+}
+
+#[tokio::test]
+async fn a_link_that_is_not_a_sign_in_address_is_never_returned() {
+    let rig = rig_with(limits(|l| l.start_wait = Duration::from_millis(600))).await;
+    rig.set_stub_mode("bad-link");
+    let reply = rig.call(&start("coder", "docs")).await;
+    assert_eq!(reply.error.as_deref(), Some("failed"), "{reply:?}");
+    let text = format!("{reply:?}");
+    assert!(!text.contains("phish.example.net"), "{text}");
+    assert!(gone(&pid(&rig)).await, "the process was ended");
+    // Nothing is waiting, so a paste has nowhere to go.
+    let again = rig.call(&paste("coder", "docs", ADDRESS)).await;
+    assert_eq!(again.error.as_deref(), Some("not_found"), "{again:?}");
 }
 
 #[tokio::test]

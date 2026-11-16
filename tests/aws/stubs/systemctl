@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fake systemctl for tests/aws. Never touches a service.
+# Contract (all paths under $STUB_DIR, the call log is $STUB_LOG):
+#   - Appends "systemctl <args>" to $STUB_LOG.
+#   - Prints $STUB_DIR/systemctl-<subcommand>.out when it exists, and exits with the number in
+#     $STUB_DIR/systemctl-<subcommand>.rc (default 0).
+set -u
+: "${STUB_DIR:?STUB_DIR must be set}"
+: "${STUB_LOG:?STUB_LOG must be set}"
+
+echo "systemctl $*" >> "$STUB_LOG"
+
+name="systemctl-${1:-}"
+[ -f "$STUB_DIR/$name.out" ] && cat "$STUB_DIR/$name.out"
+rc=0
+[ -f "$STUB_DIR/$name.rc" ] && rc="$(cat "$STUB_DIR/$name.rc")"
+exit "$rc"

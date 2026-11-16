@@ -6,8 +6,9 @@
 #
 # State lives in $STUB_STATE (set by exec-stub.sh):
 #   <agent>/<server>.connected   exists once a sign-in was accepted
-#   mode                         normal (default), reject, hang, silent or list-failed
+#   mode                         normal (default), reject, hang, silent, bad-link or list-failed
 #   login.pid                    the pid of the last login process
+#   login.pids                   the pid of every login process, one per line
 #   last-paste                   the line the last login process read
 #   calls.log                    one line per invocation
 set -u
@@ -22,8 +23,14 @@ if [ "${1:-}" = mcp ] && [ "${2:-}" = login ]; then
   server=$3
   [ "${4:-}" = --no-browser ] || exit 2
   echo $$ > "$state/login.pid"
+  echo $$ >> "$state/login.pids"
   # Prints no link at all.
   [ "$mode" = silent ] && exec sleep 30
+  if [ "$mode" = bad-link ]; then
+    # A link that is not a sign-in: its callback is not on localhost.
+    echo "Open: https://phish.example.net/login?redirect_uri=https%3A%2F%2Fevil.example.net%2Fcb"
+    exec sleep 30
+  fi
   echo "Not opening a browser. Open this link to sign in to $server:"
   echo "  https://auth.example.org/oauth/authorize?client_id=stub&state=STUBSTATE&redirect_uri=http%3A%2F%2Flocalhost%3A45219%2Fcallback"
   echo "Paste the address the browser ends on:"

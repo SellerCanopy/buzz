@@ -244,3 +244,165 @@ async fn sign_in_replies_that_are_not_what_was_asked_for_are_unavailable_and_a_r
         SupervisorError::NotFound(_)
     ));
 }
+
+/// A socket that reads one line and then does `what` with the connection.
+fn serve_raw(
+    socket: &Path,
+    what: fn(
+        tokio::net::UnixStream,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) {
+    let listener = UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(what(stream));
+        }
+    });
+}
+
+fn quick(socket: &Path) -> UnixSupervisor {
+    UnixSupervisor::new(socket.to_owned(), SECRET)
+        .unwrap()
+        .with_timeouts(buzz_hive::supervisor_client::Timeouts {
+            apply: std::time::Duration::from_millis(300),
+            read: std::time::Duration::from_millis(300),
+            login: std::time::Duration::from_millis(300),
+            login_status: std::time::Duration::from_millis(300),
+        })
+}
+
+fn unavailable(error: SupervisorError) -> String {
+    match error {
+        SupervisorError::Unavailable(text) => text,
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_supervisor_that_never_answers_or_answers_something_else_is_unavailable_with_its_reason()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let url = CallbackUrl::parse(ADDRESS).unwrap();
+
+    // Accepts, reads the line and says nothing: every kind of call gives up after its own time.
+    let silent = dir.path().join("silent.sock");
+    serve_raw(&silent, |stream| {
+        Box::pin(async move {
+            let (read, _write) = stream.into_split();
+            let mut line = String::new();
+            let _ = BufReader::new(read).read_line(&mut line).await;
+            std::future::pending::<()>().await;
+        })
+    });
+    let c = quick(&silent);
+    for text in [
+        unavailable(
+            c.apply("coder", &[], &Default::default())
+                .await
+                .unwrap_err(),
+        ),
+        unavailable(c.settings("coder").await.unwrap_err()),
+        unavailable(c.login_start("coder", "docs").await.unwrap_err()),
+        unavailable(c.login_paste("coder", "docs", &url).await.unwrap_err()),
+        unavailable(c.login_status("coder", "docs").await.unwrap_err()),
+    ] {
+        assert_eq!(text, "the supervisor did not answer in time");
+    }
+
+    // Closes without a word: the line is empty, which is not a reply.
+    let closed = dir.path().join("closed.sock");
+    serve_raw(&closed, |stream| {
+        Box::pin(async move {
+            let (read, _write) = stream.into_split();
+            let mut line = String::new();
+            let _ = BufReader::new(read).read_line(&mut line).await;
+        })
+    });
+    assert_eq!(
+        unavailable(
+            quick(&closed)
+                .apply("coder", &[], &Default::default())
+                .await
+                .unwrap_err()
+        ),
+        "the supervisor's answer is not a reply"
+    );
+
+    // Answers with something that is not JSON, or with a line longer than a reply may be.
+    for (name, body) in [
+        ("garbage.sock", b"not json at all\n".to_vec()),
+        ("long.sock", vec![b'x'; (1 << 20) + 100]),
+    ] {
+        let socket = dir.path().join(name);
+        let body: &'static [u8] = Box::leak(body.into_boxed_slice());
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    let _ = BufReader::new(read).read_line(&mut line).await;
+                    let _ = write.write_all(body).await;
+                });
+            }
+        });
+        assert_eq!(
+            unavailable(quick(&socket).settings("coder").await.unwrap_err()),
+            "the supervisor's answer is not a reply",
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_reply_that_leaves_out_what_the_call_needs_is_unavailable_and_says_which() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.sock");
+    serve(&empty, Reply::done(json!({})));
+    let c = client(&empty);
+    assert_eq!(
+        unavailable(
+            c.apply("coder", &[], &Default::default())
+                .await
+                .unwrap_err()
+        ),
+        "the reply has no restarted"
+    );
+    assert_eq!(
+        unavailable(c.settings("coder").await.unwrap_err()),
+        "the reply does not carry the agent's settings"
+    );
+    assert_eq!(
+        unavailable(c.login_status("coder", "docs").await.unwrap_err()),
+        "the reply has no sign-in state"
+    );
+
+    // Half of the settings is not the settings.
+    for (name, body) in [
+        ("policy.sock", json!({"session_policy": "thread"})),
+        ("allow.sock", json!({"allowlisted": true})),
+    ] {
+        let socket = dir.path().join(name);
+        serve(&socket, Reply::done(body));
+        assert_eq!(
+            unavailable(client(&socket).settings("coder").await.unwrap_err()),
+            "the reply does not carry the agent's settings",
+            "{name}"
+        );
+    }
+
+    // A state the engine does not know is not guessed at.
+    let odd = dir.path().join("odd.sock");
+    serve(&odd, Reply::done(json!({"state": "half-signed-in"})));
+    assert_eq!(
+        unavailable(
+            client(&odd)
+                .login_status("coder", "docs")
+                .await
+                .unwrap_err()
+        ),
+        "the reply has no sign-in state"
+    );
+}

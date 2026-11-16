@@ -16,7 +16,7 @@ use super::agent_tools::{apply, known};
 use super::{Ctx, OpError};
 use crate::access::ActorKind;
 use crate::domain::events::Event;
-use crate::domain::secret::{check_value, check_var, MAX_SECRETS_PER_AGENT};
+use crate::domain::secret::{check_value, check_var, SecretNames, MAX_SECRETS_PER_AGENT};
 use crate::ports::secrets::{SecretError, SecretScope, SecretSink, SecretString};
 use crate::ports::store::{AgentSecret, Store, StoreError, TeamSecret};
 use crate::ports::supervisor::{Supervisor, SupervisorError};
@@ -73,17 +73,16 @@ pub async fn set_team(
     let mut tx = store.begin(ctx.community).await?;
     tx.secrets().set_team(var, &ctx.actor.pubkey).await?;
     changed(&mut *tx, ctx, None, var, "set").await?;
+    // Read with the change, so a failed read cannot leave a saved change with no agent applied.
+    let granted: Vec<String> = tx
+        .secrets()
+        .grants()
+        .await?
+        .into_iter()
+        .filter(|(_, v)| v == var)
+        .map(|(agent, _)| agent)
+        .collect();
     let events = tx.commit().await?;
-    let granted: Vec<String> = {
-        let mut tx = store.begin(ctx.community).await?;
-        tx.secrets()
-            .grants()
-            .await?
-            .into_iter()
-            .filter(|(_, v)| v == var)
-            .map(|(agent, _)| agent)
-            .collect()
-    };
     log(ctx, None, var, "set");
     Ok(Saved {
         events,
@@ -104,17 +103,18 @@ pub async fn set_agent(
     people_only(ctx)?;
     check(var, &value)?;
     {
+        // A fast path, so a refusal does not wait for the store: the count is taken again
+        // under the agent's lock before the name is saved.
         let mut tx = store.begin(ctx.community).await?;
         known(&mut *tx, agent).await?;
-        let names = tx.secrets().names_of(agent).await?;
-        if !names.own.iter().any(|v| v == var)
-            && names.own.len() + names.team.len() >= MAX_SECRETS_PER_AGENT
-        {
-            return Err(too_many());
-        }
+        check_room(&mut *tx, agent, |n| n.own.iter().any(|v| v == var)).await?;
     }
     put(sink, SecretScope::Agent(agent.to_owned()), var, value).await?;
     let mut tx = store.begin(ctx.community).await?;
+    // The count above was taken before the (slow) put, in a transaction that is gone. Count
+    // again under the agent's lock, so a grant or secret that landed meanwhile is seen.
+    known(&mut *tx, agent).await?;
+    check_room(&mut *tx, agent, |n| n.own.iter().any(|v| v == var)).await?;
     tx.secrets()
         .set_agent(agent, var, &ctx.actor.pubkey)
         .await?;
@@ -140,12 +140,7 @@ pub async fn grant(
     check_var(var).map_err(OpError::InvalidArgument)?;
     let mut tx = store.begin(ctx.community).await?;
     known(&mut *tx, agent).await?;
-    let names = tx.secrets().names_of(agent).await?;
-    if !names.team.iter().any(|v| v == var)
-        && names.own.len() + names.team.len() >= MAX_SECRETS_PER_AGENT
-    {
-        return Err(too_many());
-    }
+    check_room(&mut *tx, agent, |n| n.team.iter().any(|v| v == var)).await?;
     let added = tx.secrets().grant(agent, var).await?;
     if added {
         changed(&mut *tx, ctx, Some(agent), var, "granted").await?;
@@ -201,10 +196,21 @@ fn check(var: &str, value: &SecretString) -> Result<(), OpError> {
     check_value(value.expose()).map_err(OpError::InvalidArgument)
 }
 
-fn too_many() -> OpError {
-    OpError::FailedPrecondition(format!(
-        "an agent may have at most {MAX_SECRETS_PER_AGENT} secrets"
-    ))
+/// Refuses a name that is new to the agent (`held` says whether it already has it) when the
+/// agent already holds the most it may. Call it after [`known`], which takes the agent's lock,
+/// so the count holds until the commit.
+async fn check_room(
+    tx: &mut dyn crate::ports::store::Tx,
+    agent: &str,
+    held: impl FnOnce(&SecretNames) -> bool,
+) -> Result<(), OpError> {
+    let names = tx.secrets().names_of(agent).await?;
+    if !held(&names) && names.own.len() + names.team.len() >= MAX_SECRETS_PER_AGENT {
+        return Err(OpError::FailedPrecondition(format!(
+            "an agent may have at most {MAX_SECRETS_PER_AGENT} secrets"
+        )));
+    }
+    Ok(())
 }
 
 async fn put(
