@@ -153,6 +153,8 @@ fn in_process(world: &World, address: SocketAddr) -> App {
         hive_pubkey: world.hive.public_key().to_hex(),
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
+        code_host: None,
+        intake: Arc::new(tokio::sync::Notify::new()),
     }
 }
 

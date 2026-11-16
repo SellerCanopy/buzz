@@ -18,6 +18,7 @@ use crate::domain::run::{Run, RunState};
 use crate::domain::workflow::RESULT_PASSED;
 use crate::ports::store::{Posting, Tx};
 use crate::rules::run::{entry_stage, step, task_key, Input};
+use crate::rules::wait::waiting_of;
 use crate::tool_names::STAGE_DONE;
 use crate::workflow::load::Package;
 use crate::workflow::routes::reportable_results;
@@ -271,7 +272,14 @@ pub async fn skip_stage(
     people_only(ctx, "skip a stage")?;
     let mut tx = env.store.begin(ctx.community).await?;
     let (mut card, run, package) = locked(env, &mut *tx, card_id).await?;
-    if !matches!(run.state, RunState::Waiting | RunState::Paused) {
+    // A stage that waits on outside state is running with nobody to ask, so it may be skipped.
+    let waits_on_outside = run.state == RunState::Running
+        && run
+            .current_stage
+            .as_deref()
+            .and_then(|id| package.stage(id))
+            .is_some_and(|(stage, _)| waiting_of(stage).is_some());
+    if !matches!(run.state, RunState::Waiting | RunState::Paused) && !waits_on_outside {
         return Err(OpError::FailedPrecondition(format!(
             "the run is {}; only a card that waits or is held can skip its stage",
             run.state.as_str()

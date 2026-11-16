@@ -1,0 +1,13 @@
+{
+  "state": "pending",
+  "statuses": [
+    {
+      "context": "ci/legacy",
+      "state": "success"
+    },
+    {
+      "context": "ci/deploy",
+      "state": "pending"
+    }
+  ]
+}

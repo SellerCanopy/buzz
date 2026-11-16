@@ -64,6 +64,18 @@ pub async fn create_card(
     ctx: &Ctx,
     input: NewCard,
 ) -> Result<(Card, Vec<Event>), OpError> {
+    let mut tx = store.begin(ctx.community).await?;
+    let card = insert_card(&mut *tx, ctx, input).await?;
+    let events = tx.commit().await?;
+    Ok((card, events))
+}
+
+/// Checks `input`, adds the card and appends `card.created`, in the caller's transaction.
+pub(crate) async fn insert_card(
+    tx: &mut dyn Tx,
+    ctx: &Ctx,
+    input: NewCard,
+) -> Result<Card, OpError> {
     let title = input.title.trim();
     if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
         return Err(OpError::InvalidArgument(format!(
@@ -84,11 +96,9 @@ pub async fn create_card(
         archived: false,
         created_by: ctx.actor.pubkey.clone(),
     };
-    let mut tx = store.begin(ctx.community).await?;
     tx.cards().insert(&card).await?;
-    append(&mut *tx, ctx, "card.created", card.id, summary(&card)).await?;
-    let events = tx.commit().await?;
-    Ok((card, events))
+    append(tx, ctx, "card.created", card.id, summary(&card)).await?;
+    Ok(card)
 }
 
 /// Moves a card to another workflow (`card.moved`) or changes its state (`card.state`).

@@ -11,11 +11,14 @@ use serde_json::json;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::Env;
+use super::{pull_request, Env};
 use crate::access::ActorKind;
 use crate::domain::events::{Actor, Event};
+use crate::domain::intake::RepoRef;
+use crate::ports::code_host::{CodeHost, HostError, NewPullRequest};
 use crate::ports::relay::{Delivery, Relay, RelayError};
-use crate::ports::store::{OutboxRow, Posting, StageThread, StoreError};
+use crate::ports::store::{OutboxRow, Posting, PullCall, StageThread, StoreError};
+use crate::workflow::source::CatalogSource;
 
 /// How long a drainer owns a post it claimed. It is longer than the relay adapter's
 /// 60 second send limit. A drainer that dies mid-send loses the post after this long, and
@@ -53,6 +56,29 @@ pub async fn drain_outbox(
     skip: &[Uuid],
     stop: &watch::Receiver<bool>,
 ) -> Result<Drained, StoreError> {
+    drain_outbox_with(env, community, relay, None, skip, stop).await
+}
+
+/// What the drain needs to run the calls of action stages that sit in the outbox.
+pub struct Actions<'a> {
+    /// The code host, or `None` when the service has no token: the stage then fails and says so.
+    pub host: Option<&'a dyn CodeHost>,
+    /// Read when a call is made, so a pass with none reads no workflow from disk.
+    pub catalog: &'a dyn CatalogSource,
+}
+
+/// [`drain_outbox`] that also makes the code host calls in the outbox: a pull request is opened
+/// through `actions.host`, and the stage that asked for it reports the result. A host that is
+/// busy or down leaves the call queued, and it fails and backs off like a post the relay
+/// refused. Without `actions` a call stays queued.
+pub async fn drain_outbox_with(
+    env: &Env<'_>,
+    community: Uuid,
+    relay: &dyn Relay,
+    actions: Option<&Actions<'_>>,
+    skip: &[Uuid],
+    stop: &watch::Receiver<bool>,
+) -> Result<Drained, StoreError> {
     let mut drained = Drained::default();
     let mut blocked: Vec<Uuid> = skip.to_vec();
     loop {
@@ -75,28 +101,128 @@ pub async fn drain_outbox(
         };
         tx.commit().await?;
 
-        match send(relay, &row, root).await {
-            Ok(root) => {
-                if record_sent(env, community, &row, &root, &mut drained).await? {
+        let sent = if matches!(
+            row.posting,
+            Posting::PullRequest { .. } | Posting::PullCall { .. }
+        ) {
+            host_call(env, community, actions, &row)
+                .await
+                .map(|events| {
+                    drained.events.extend(events);
                     drained.posted += 1;
+                })
+        } else {
+            match send(relay, &row, root).await {
+                Ok(root) => {
+                    if record_sent(env, community, &row, &root, &mut drained).await? {
+                        drained.posted += 1;
+                    }
+                    Ok(())
                 }
+                Err(error) => Err(error.to_string()),
             }
-            Err(error) => {
-                let cause = error.to_string();
-                let mut tx = env.store.begin(community).await?;
-                match tx.outbox().mark_failed(row.id, &cause).await {
-                    Ok(()) | Err(StoreError::NotFound(_)) => {}
-                    Err(other) => return Err(other),
-                }
-                tx.commit().await?;
-                blocked.push(row.card_id);
-                drained.failed += 1;
-                drained.failed_cards.push(row.card_id);
-                drained.first_error.get_or_insert(cause);
+        };
+        if let Err(cause) = sent {
+            let mut tx = env.store.begin(community).await?;
+            match tx.outbox().mark_failed(row.id, &cause).await {
+                Ok(()) | Err(StoreError::NotFound(_)) => {}
+                Err(other) => return Err(other),
             }
+            tx.commit().await?;
+            blocked.push(row.card_id);
+            drained.failed += 1;
+            drained.failed_cards.push(row.card_id);
+            drained.first_error.get_or_insert(cause);
         }
     }
 }
+
+/// Makes the call of `row`, a pull request or a call on one, and reports its stage's result.
+/// `Err` is the cause of a failure to try again: the host is busy or down, or the stage could
+/// not be told. A host that refuses the call, or none at all, is the stage's failure, not the
+/// drain's.
+async fn host_call(
+    env: &Env<'_>,
+    community: Uuid,
+    actions: Option<&Actions<'_>>,
+    row: &OutboxRow,
+) -> Result<Vec<Event>, String> {
+    let Some(actions) = actions else {
+        return Err("this drain does not run action stages".into());
+    };
+    let (host, catalog) = (actions.host, actions.catalog.load());
+    let env = &Env {
+        catalog: &catalog,
+        ..*env
+    };
+    let wanted = pull_request::wanted(env, community, row)
+        .await
+        .map_err(|error| error.to_string())?;
+    // A busy or broken host is not the stage's failure: the call is made again.
+    let retry =
+        |error: &HostError| matches!(error, HostError::RateLimited { .. } | HostError::Other(_));
+    let finished = match &row.posting {
+        Posting::PullRequest {
+            repo,
+            head,
+            base,
+            title,
+            body,
+            draft,
+            ..
+        } => {
+            let outcome = match (host, RepoRef::parse(repo)) {
+                _ if !wanted => Err("the run no longer waits for the pull request".to_owned()),
+                (_, Err(reason)) => Err(reason),
+                (None, _) => Err(NO_HOST.to_owned()),
+                (Some(host), Ok(repo)) => {
+                    let request = NewPullRequest {
+                        repo,
+                        head: head.clone(),
+                        base: base.clone(),
+                        title: title.clone(),
+                        body: body.clone(),
+                        draft: *draft,
+                    };
+                    match host.open_pull_request(&request, &row.key).await {
+                        Ok(pull) => Ok(pull),
+                        Err(error) if retry(&error) => return Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            };
+            pull_request::finish(env, community, row, outcome).await
+        }
+        Posting::PullCall {
+            repo, number, call, ..
+        } => {
+            let outcome = match (host, RepoRef::parse(repo)) {
+                _ if !wanted => Err("the run no longer waits for the pull request".to_owned()),
+                (_, Err(reason)) => Err(reason),
+                (None, _) => Err(NO_HOST.to_owned()),
+                (Some(host), Ok(repo)) => {
+                    let made = match call {
+                        PullCall::MarkReady => host.mark_ready(&repo, *number).await,
+                        PullCall::Merge { method, head_sha } => {
+                            host.merge(&repo, *number, *method, head_sha.as_deref())
+                                .await
+                        }
+                    };
+                    match made {
+                        Ok(()) => Ok(()),
+                        Err(error) if retry(&error) => return Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            };
+            pull_request::finish_call(env, community, row, outcome).await
+        }
+        _ => return Err("the post is not a call to the code host".into()),
+    };
+    finished.map_err(|error| error.to_string())
+}
+
+const NO_HOST: &str = "no code host is set up; set GH_TOKEN for buzz-hive";
 
 /// Records a post the relay accepted: marks it done and, for a stage task, keeps the thread
 /// it opened. Returns false when the card was deleted while the post was in flight, because
@@ -180,6 +306,9 @@ async fn send(
                 .post_stage_task(*channel, agent, text, &delivery)
                 .await
         }
+        Posting::PullRequest { .. } | Posting::PullCall { .. } => Err(RelayError::Unavailable(
+            "a call to the code host is not a post for the relay".into(),
+        )),
         Posting::StageReply {
             channel,
             agent,

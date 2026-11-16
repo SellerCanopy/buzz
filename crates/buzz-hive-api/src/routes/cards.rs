@@ -1,9 +1,11 @@
 //! Card procedures: list, read, create, archive, restore, remove and add a note.
 
-use buzz_hive_core::domain::card::{Card as DomainCard, CardState};
+use buzz_hive_core::domain::card::{card_branch, Card as DomainCard, CardState};
 use buzz_hive_core::domain::events::Event;
+use buzz_hive_core::domain::intake::RepoRef;
 use buzz_hive_core::orchestrator::auto;
 use buzz_hive_core::orchestrator::cards::{self, CardMove, NewCard};
+use buzz_hive_core::orchestrator::intake::card_from_issue;
 use uuid::Uuid;
 
 use crate::app::App;
@@ -11,9 +13,10 @@ use crate::error::HiveError;
 use crate::proto::{
     ActivityAuthor, ActivityEntry, AddNoteRequest, AddNoteResponse, ArchiveCardsRequest,
     ArchiveCardsResponse, Card, CreateCardRequest, CreateTaskRequest, GetCardRequest,
-    ListCardsRequest, ListCardsResponse, RemoveCardRequest, RemoveCardResponse, RestoreCardRequest,
-    SetCardWorkflowRequest, SetCardWorkflowResponse, StageThread,
+    ListCardsRequest, ListCardsResponse, PullRequest, RemoveCardRequest, RemoveCardResponse,
+    RestoreCardRequest, SetCardWorkflowRequest, SetCardWorkflowResponse, StageThread,
 };
+use crate::routes::intake::{fill_issues, fill_one};
 use crate::unary::Ctx;
 
 pub async fn list_cards(
@@ -27,10 +30,10 @@ pub async fn list_cards(
     // as a no-op. The other order would lose it.
     let seq = tx.events().latest_seq().await?;
     let cards = tx.cards().list(req.archived).await?;
-    Ok(ListCardsResponse {
-        cards: cards.into_iter().map(|c| to_proto(c, false)).collect(),
-        seq,
-    })
+    drop(tx);
+    let mut cards: Vec<Card> = cards.into_iter().map(|c| to_proto(c, false)).collect();
+    fill_issues(&app, &ctx, &mut cards).await?;
+    Ok(ListCardsResponse { cards, seq })
 }
 
 pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, HiveError> {
@@ -56,6 +59,18 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         .and_then(|run| run.current_stage)
         .filter(|_| !idle)
         .unwrap_or_default();
+    proto.pull_request = tx
+        .pull_requests()
+        .by_card(id)
+        .await?
+        .map(|pull| PullRequest {
+            number: i32::try_from(pull.number).unwrap_or(i32::MAX),
+            url: pull.url,
+            state: pull.state,
+            draft: pull.draft,
+            checks: pull.checks,
+            ..PullRequest::default()
+        });
     proto.stages = tx
         .runs()
         .threads(id)
@@ -69,14 +84,17 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
             channel_id: t.channel_id.to_string(),
         })
         .collect();
+    drop(tx);
+    if let Some(row) = fill_one(&app, &ctx, &mut proto).await? {
+        proto.issue_labels = row.issue.labels;
+        proto.branch = card_branch(id, &proto.title);
+    }
     Ok(proto)
 }
 
 pub async fn create_card(app: App, ctx: Ctx, req: CreateCardRequest) -> Result<Card, HiveError> {
-    if req.issue.is_some() {
-        return Err(HiveError::InvalidArgument(
-            "a card has no issue until issue intake exists; leave issue empty".into(),
-        ));
+    if let Some(issue) = req.issue {
+        return create_from_issue(&app, &ctx, issue, &req.workflow).await;
     }
     create(
         &app,
@@ -88,6 +106,44 @@ pub async fn create_card(app: App, ctx: Ctx, req: CreateCardRequest) -> Result<C
         },
     )
     .await
+}
+
+/// Puts an issue on the board, or returns the card it already has.
+async fn create_from_issue(
+    app: &App,
+    ctx: &Ctx,
+    issue: crate::proto::IssueRef,
+    workflow: &str,
+) -> Result<Card, HiveError> {
+    if !issue.host.is_empty() && !issue.host.eq_ignore_ascii_case(crate::routes::intake::HOST) {
+        return Err(HiveError::InvalidArgument(format!(
+            "host {:?} is not supported; the only host is {}",
+            issue.host,
+            crate::routes::intake::HOST
+        )));
+    }
+    let repo = RepoRef::parse(&format!("{}/{}", issue.owner, issue.repo))
+        .map_err(HiveError::InvalidArgument)?;
+    let number = u64::try_from(issue.number)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| HiveError::InvalidArgument("issue number must be at least 1".into()))?;
+    let host = app.require_host()?;
+    let op = app.op(false)?;
+    let (card, _, events) = card_from_issue(
+        &op.env(),
+        &ctx.op(),
+        host,
+        &repo,
+        number,
+        workflow,
+        chrono::Utc::now(),
+    )
+    .await?;
+    op.settle(&events);
+    let mut proto = to_proto(card, false);
+    fill_one(app, ctx, &mut proto).await?;
+    Ok(proto)
 }
 
 /// `CreateTask` with the Go task shape. A task is a card with a title and no issue.
@@ -137,7 +193,7 @@ pub async fn restore_card(app: App, ctx: Ctx, req: RestoreCardRequest) -> Result
     let id = parse_id(&req.card_id, "card_id")?;
     let (card, events) = cards::restore_card(app.store.as_ref(), &ctx.op(), id).await?;
     app.bus.publish(&events);
-    Ok(to_proto(card, false))
+    reply(&app, &ctx, card).await
 }
 
 pub async fn remove_card(
@@ -171,9 +227,9 @@ pub async fn set_card_workflow(
     let op = app.op(false)?;
     let (cards, events) = cards::set_card_workflow(&op.env(), &ctx.op(), &moves).await?;
     op.settle(&events);
-    Ok(SetCardWorkflowResponse {
-        cards: cards.into_iter().map(|c| to_proto(c, false)).collect(),
-    })
+    let mut cards: Vec<Card> = cards.into_iter().map(|c| to_proto(c, false)).collect();
+    fill_issues(&app, &ctx, &mut cards).await?;
+    Ok(SetCardWorkflowResponse { cards })
 }
 
 pub async fn add_note(
@@ -212,6 +268,14 @@ pub(super) fn to_proto(card: DomainCard, with_body: bool) -> Card {
         },
         ..Default::default()
     }
+}
+
+/// A card for a reply: its issue is filled in, so a client that replaces the card it holds
+/// with the reply does not lose it.
+pub(super) async fn reply(app: &App, ctx: &Ctx, card: DomainCard) -> Result<Card, HiveError> {
+    let mut proto = to_proto(card, false);
+    fill_one(app, ctx, &mut proto).await?;
+    Ok(proto)
 }
 
 /// The card as it is now, for a procedure that returns the card it changed.

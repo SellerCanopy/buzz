@@ -1,0 +1,28 @@
+{
+  "total_count": 2,
+  "incomplete_results": false,
+  "items": [
+    {
+      "number": 7,
+      "title": "Slow query on the board",
+      "body": "It takes ten seconds.",
+      "state": "open",
+      "labels": [{"name": "perf"}],
+      "assignees": [{"login": "hubot"}],
+      "user": {"login": "octo"},
+      "html_url": "https://github.example.org/example-org/web/issues/7",
+      "repository_url": "https://api.example.org/repos/example-org/web"
+    },
+    {
+      "number": 9,
+      "title": "Typo in the empty state",
+      "body": "",
+      "state": "closed",
+      "labels": [],
+      "assignees": [],
+      "user": {"login": "reporter"},
+      "html_url": "https://github.example.org/example-org/api/issues/9",
+      "repository_url": "https://api.example.org/repos/example-org/api"
+    }
+  ]
+}

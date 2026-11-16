@@ -85,6 +85,8 @@ async fn run(world: &World) {
         hive_pubkey: adapter.pubkey(),
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
+        code_host: None,
+        intake: Arc::new(tokio::sync::Notify::new()),
     };
     let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -145,6 +147,8 @@ async fn scenario(
         bus: app.bus.clone(),
         community: world.community,
         hive: app.hive_pubkey.clone(),
+        catalog: app.catalog.clone(),
+        code_host: None,
         wake: app.outbox.clone(),
     };
     let drain_task = tokio::spawn(drain.run(stopped));

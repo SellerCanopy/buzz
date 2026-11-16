@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use buzz_hive_core::access::ActorKind;
 use buzz_hive_core::domain::card::CardState;
 use buzz_hive_core::domain::events::Event;
+use buzz_hive_core::domain::intake::{Issue, IssueState, RepoRef};
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::orchestrator::cards::{create_card, set_card_workflow, CardMove, NewCard};
 use buzz_hive_core::orchestrator::run::{
@@ -302,6 +303,41 @@ async fn a_stage_whose_labels_are_missing_follows_else() {
     assert!(root_of(&f, card, "c", 1).await.is_some());
     assert!(run.steps[1].skipped);
     assert_eq!(run.steps[1].routed_to.as_deref(), Some("c"));
+}
+
+#[tokio::test]
+async fn a_stage_runs_when_the_cards_issue_has_the_label() {
+    let (f, card) = started("cond").await;
+    let issue = Issue {
+        repo: RepoRef::parse("example-org/api").unwrap(),
+        number: 7,
+        title: "Button misaligned".into(),
+        body: String::new(),
+        labels: vec!["frontend".into(), "bug".into()],
+        assignees: Vec::new(),
+        author: "octo".into(),
+        state: IssueState::Open,
+        url: "https://github.example.org/example-org/api/issues/7".into(),
+        etag: None,
+    };
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    tx.issues()
+        .upsert(&issue, chrono::Utc::now())
+        .await
+        .unwrap();
+    tx.issues()
+        .attach(&issue.repo, 7, card, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let (run, events) = report(&f, card, "passed").await;
+    assert_eq!(
+        run.current_stage.as_deref(),
+        Some("b"),
+        "{:?}",
+        kinds(&events)
+    );
+    assert!(!kinds(&events).contains(&"condition.unmet"));
 }
 
 #[tokio::test]

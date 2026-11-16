@@ -271,7 +271,8 @@ async fn stage_templates_are_the_shipped_ones_sorted_by_id() {
             "plan_review",
             "pull_request",
             "research",
-            "wait_for_merge"
+            "wait_for_merge",
+            "worktree"
         ]
     );
     for template in templates {

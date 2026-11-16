@@ -265,7 +265,7 @@ enum Pass {
 }
 
 /// Sleeps for `wait`. Returns true when `stop` changed first.
-async fn sleep_or_stop(wait: Duration, stop: &mut watch::Receiver<bool>) -> bool {
+pub(crate) async fn sleep_or_stop(wait: Duration, stop: &mut watch::Receiver<bool>) -> bool {
     if wait.is_zero() {
         return *stop.borrow();
     }

@@ -224,7 +224,8 @@ fn every_built_in_stage_template_decodes() {
             "plan_review",
             "pull_request",
             "research",
-            "wait_for_merge"
+            "wait_for_merge",
+            "worktree"
         ]
     );
     for template in &templates {

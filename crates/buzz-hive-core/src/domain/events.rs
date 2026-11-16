@@ -104,6 +104,25 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // An admin set a person's or an agent's access level. The payload has the pubkey, its
     // kind, the level it had and the level it has now.
     ("access.changed", 14),
+    // A pass over an intake rule read the host. The payload has the rule, the repo, how many
+    // issues matched, how many cards were added and how many issues left the search.
+    ("intake.refreshed", 16),
+    // A pass over an intake rule failed. The payload has the rule, the repo, why, and how many
+    // passes in a row have failed.
+    ("intake.failed", 16),
+    // A card's issue is no longer in its rule's search. The payload has the rule, the repo, the
+    // issue number and why (closed or unmatched).
+    ("card.left_intake", 16),
+    // A comment appeared on a card's issue. The payload has the repo, the issue number, the
+    // comment's id and author, and whether it was handed to the stage's agent.
+    ("comment.received", 16),
+    // A comment on a card's issue was queued into the stage's thread. The payload names the
+    // stage, the visit and the comment.
+    ("comment.delivered", 16),
+    // The sync read a card's pull request and it differs from what Beehive kept: its state,
+    // whether it is a draft or approved, or how its checks stand. The payload has the repo, the
+    // number and each of those.
+    ("pull_request.changed", 18),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

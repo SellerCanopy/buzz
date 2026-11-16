@@ -22,12 +22,13 @@ use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::timers;
 use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::ports::store::Store;
 use buzz_hive_core::testing::ManualClock;
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 14;
+const CURRENT_PHASE: u8 = 16;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -256,6 +257,98 @@ async fn access_scenarios(f: &Fixture) {
         .unwrap();
 }
 
+/// Phase 16: a rule makes a card, a failed pass is recorded, a closed issue leaves the search,
+/// and a comment on a running card's issue is read and handed to its agent.
+async fn intake_scenarios(f: &Fixture) {
+    use buzz_hive_core::background::comments::poll_comments;
+    use buzz_hive_core::background::intake::{record_failure, refresh_rule};
+    use buzz_hive_core::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, RuleFilter};
+    use buzz_hive_core::orchestrator::intake::save_rule;
+    use buzz_hive_core::testing::FakeCodeHost;
+
+    set_setting(
+        &f.env(),
+        &person(),
+        &Scope::User,
+        "update_channel",
+        Some(serde_json::json!(CHANNEL.to_string())),
+    )
+    .await
+    .unwrap();
+    let repo = RepoRef::parse("example-org/api").unwrap();
+    let issue = |number: u64, state: IssueState| Issue {
+        repo: repo.clone(),
+        number,
+        title: format!("Issue {number}"),
+        body: String::new(),
+        labels: Vec::new(),
+        assignees: Vec::new(),
+        author: "octo".into(),
+        state,
+        url: String::new(),
+        etag: None,
+    };
+    let host = FakeCodeHost::new();
+    host.put_issue(issue(1, IssueState::Open));
+    host.put_issue(issue(2, IssueState::Open));
+    let rule = save_rule(
+        &f.env(),
+        COMMUNITY,
+        IntakeRule {
+            id: uuid::Uuid::nil(),
+            name: "all".into(),
+            repo: repo.clone(),
+            filter: RuleFilter {
+                authors: vec!["octo".into()],
+                ..RuleFilter::default()
+            },
+            workflow: "demo".into(),
+            enabled: true,
+            interval_s: 60,
+        },
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now();
+    refresh_rule(&f.env(), &host, COMMUNITY, rule.id, now)
+        .await
+        .unwrap();
+    record_failure(&f.env(), COMMUNITY, rule.id, "example-org/api", "down", 1)
+        .await
+        .unwrap();
+    host.put_issue(issue(2, IssueState::Closed));
+    refresh_rule(&f.env(), &host, COMMUNITY, rule.id, now)
+        .await
+        .unwrap();
+
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let card = tx
+        .issues()
+        .get(&repo, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .card_id
+        .unwrap();
+    drop(tx);
+    start_run(&f.env(), &person(), card).await.unwrap();
+    host.put_comment(
+        &repo,
+        1,
+        "octo",
+        "Please look at this.",
+        now + chrono::Duration::seconds(5),
+    );
+    poll_comments(
+        &f.env(),
+        &host,
+        COMMUNITY,
+        now + chrono::Duration::minutes(1),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let (f, clock) = Fixture::timed();
@@ -268,6 +361,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     retry_scenarios(&f, &clock).await;
     approval_scenarios(&f).await;
     access_scenarios(&f).await;
+    intake_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

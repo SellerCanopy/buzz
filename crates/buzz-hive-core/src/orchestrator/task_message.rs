@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::domain::workflow::Stage;
+use crate::domain::card::card_branch;
+use crate::domain::workflow::{Stage, Workspace, KIND_PROMPT};
 use crate::tool_names::{READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN};
 use crate::workflow::load::Package;
 use crate::workflow::routes::reportable_results;
@@ -20,6 +21,15 @@ pub struct CardText<'a> {
     pub id: uuid::Uuid,
     pub title: &'a str,
     pub description: &'a str,
+}
+
+/// The card's issue, for the variables that name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueText {
+    /// The repo as `owner/name`.
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
 }
 
 /// A text input under this many bytes is written into the task. A larger one is named, and
@@ -81,6 +91,9 @@ pub struct Handoff {
     /// The comments a person sent the card back with from an approval stage, empty when the
     /// card did not come back to this stage.
     pub sendback: String,
+    /// The card's issue, when it has one. The card's work is on its branch in that repo, so a
+    /// stage that edits code is told to push it.
+    pub issue: Option<IssueText>,
 }
 
 /// The id buzz-app registers Beehive under (`PLUGIN_ID` in `src/features/beehive/routes.ts`).
@@ -165,18 +178,9 @@ fn render_with(
 ) -> Result<String, String> {
     let text = package.prompt_text(stage)?;
     let results = reportable_results(stage);
-    let mut values: BTreeMap<String, String> = variables()
-        .into_iter()
-        .filter(|v| !v.pattern)
-        .map(|v| (v.name, String::new()))
-        .collect();
-    values.insert("issue.title".into(), card.title.to_owned());
-    values.insert("issue.body".into(), description.to_owned());
+    let mut values = base_values(card, description, params, handoff.issue.as_ref());
     values.insert("stage.results".into(), results.join(", "));
     values.insert("sendback.comments".into(), handoff.sendback.clone());
-    for (name, value) in params {
-        values.insert(format!("params.{name}"), value.clone());
-    }
     let card_block = match (card.title.is_empty(), description.is_empty()) {
         (_, true) => card.title.to_owned(),
         (true, false) => description.to_owned(),
@@ -217,12 +221,56 @@ fn render_with(
     parts.push(handoff.brief.clone());
     parts.push(inputs_section(&handoff.inputs));
     parts.push(outputs_section(stage, card.id, handoff.channel));
+    if handoff.issue.is_some() && edits_code(stage) {
+        parts.push(push_line(&card_branch(card.id, card.title)));
+    }
     parts.push(done_line(card.id, &stage.id, handoff.visit, &results));
     Ok(parts
         .into_iter()
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+/// The variables every text of a card renders: the issue and the card branch, empty where the
+/// card has no issue, and the run's parameters.
+pub fn base_values(
+    card: &CardText<'_>,
+    description: &str,
+    params: &BTreeMap<String, String>,
+    issue: Option<&IssueText>,
+) -> BTreeMap<String, String> {
+    let mut values: BTreeMap<String, String> = variables()
+        .into_iter()
+        .filter(|v| !v.pattern)
+        .map(|v| (v.name, String::new()))
+        .collect();
+    values.insert("issue.title".into(), card.title.to_owned());
+    values.insert("issue.body".into(), description.to_owned());
+    values.insert("branch".into(), card_branch(card.id, card.title));
+    if let Some(issue) = issue {
+        values.insert("issue.repo".into(), issue.repo.clone());
+        values.insert("issue.number".into(), issue.number.to_string());
+        values.insert("issue.url".into(), issue.url.clone());
+    }
+    for (name, value) in params {
+        values.insert(format!("params.{name}"), value.clone());
+    }
+    values
+}
+
+/// Whether the stage's agent works in the card's checkout: a prompt stage whose workspace is
+/// not `none` (the check refuses that for a prompt stage, so it is the default).
+fn edits_code(stage: &Stage) -> bool {
+    stage.kind == KIND_PROMPT && stage.workspace != Some(Workspace::None)
+}
+
+/// What the agent is told about handing its changes on. The next stage may be another agent on
+/// another machine, and gets the work from git alone.
+fn push_line(branch: &str) -> String {
+    format!(
+        "If you changed files in the repository, commit them with a clear message and push the branch `{branch}` before you call `{STAGE_DONE}`. The next stage may be a different agent, and gets your work only from git."
+    )
 }
 
 /// The instruction to report a result: which tool, and the card, stage and visit it takes.

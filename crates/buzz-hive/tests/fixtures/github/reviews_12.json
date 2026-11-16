@@ -1,0 +1,32 @@
+[
+  {
+    "user": {
+      "login": "octo"
+    },
+    "state": "CHANGES_REQUESTED"
+  },
+  {
+    "user": {
+      "login": "hubot"
+    },
+    "state": "COMMENTED"
+  },
+  {
+    "user": {
+      "login": "octo"
+    },
+    "state": "APPROVED"
+  },
+  {
+    "user": {
+      "login": "mona"
+    },
+    "state": "APPROVED"
+  },
+  {
+    "user": {
+      "login": "mona"
+    },
+    "state": "DISMISSED"
+  }
+]

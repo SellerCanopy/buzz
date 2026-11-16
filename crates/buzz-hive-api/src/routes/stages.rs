@@ -12,7 +12,7 @@ use crate::proto::{
     Card, MoveCardRequest, PauseAllRequest, PauseAllResponse, PauseCardRequest, ResetCardRequest,
     ResumeCardRequest, Run, SkipStageRequest, StageDoneRequest,
 };
-use crate::routes::cards::{card_of, to_proto as card_to_proto};
+use crate::routes::cards::{card_of, reply as card_reply};
 use crate::routes::runs::{parse_id, to_proto};
 use crate::unary::Ctx;
 
@@ -75,7 +75,7 @@ pub async fn skip_stage(app: App, ctx: Ctx, req: SkipStageRequest) -> Result<Car
     let op = app.op(true)?;
     let (_, events) = skip(&op.env(), &ctx.op(), id).await?;
     op.settle(&events);
-    Ok(card_to_proto(card_of(&app, &ctx, id).await?, false))
+    card_reply(&app, &ctx, card_of(&app, &ctx, id).await?).await
 }
 
 /// A person holds a running card.
@@ -84,7 +84,7 @@ pub async fn pause_card(app: App, ctx: Ctx, req: PauseCardRequest) -> Result<Car
     let op = app.op(true)?;
     let (_, events) = hold(&op.env(), &ctx.op(), id).await?;
     op.settle(&events);
-    Ok(card_to_proto(card_of(&app, &ctx, id).await?, false))
+    card_reply(&app, &ctx, card_of(&app, &ctx, id).await?).await
 }
 
 /// A person lets a held stage start, or a paused one carry on.
@@ -120,5 +120,5 @@ pub async fn reset_card(app: App, ctx: Ctx, req: ResetCardRequest) -> Result<Car
     let op = app.op(true)?;
     let (card, events) = reset(&op.env(), &ctx.op(), id).await?;
     op.settle(&events);
-    Ok(card_to_proto(card, false))
+    card_reply(&app, &ctx, card).await
 }

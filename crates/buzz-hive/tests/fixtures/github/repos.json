@@ -1,0 +1,6 @@
+[
+  {"full_name": "example-org/api", "private": true},
+  {"full_name": "hive-bot/notes", "private": false},
+  {"full_name": "example-org/web", "private": false},
+  {"full_name": "example-labs/tools", "private": false}
+]

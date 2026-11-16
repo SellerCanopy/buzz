@@ -114,7 +114,7 @@ const VARIABLES: &[(&str, &str, bool, bool)] = &[
     ),
     var(
         "branch",
-        "The issue's branch, kiln/<number> until it has one.",
+        "The card's git branch, buzz/<short id>-<title>.",
         true,
         false,
     ),

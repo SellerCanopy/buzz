@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod claim_echo_mcp;
+pub mod github_replay;
 pub mod script_agent;
 
 use axum::body::Body;

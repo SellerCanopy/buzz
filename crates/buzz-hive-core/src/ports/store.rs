@@ -2,9 +2,10 @@
 
 use crate::access::{ActorKind, Level, RelayRole};
 use crate::domain::artifact::{ArtifactContent, ArtifactInfo, ArtifactVersion};
-use crate::domain::card::Card;
+use crate::domain::card::{Card, PullRequest};
 use crate::domain::events::Event;
 use crate::domain::inbox::InboxItem;
+use crate::domain::intake::{IntakeRule, Issue, RepoRef, StoredIssue};
 use crate::domain::run::Run;
 use crate::domain::timer::{Timer, TimerKind};
 use crate::workflow::options::WorkflowOptions;
@@ -59,6 +60,9 @@ pub trait Tx: Send {
     fn timers(&mut self) -> &mut dyn TimersRepo;
     fn inbox(&mut self) -> &mut dyn InboxRepo;
     fn usage(&mut self) -> &mut dyn UsageRepo;
+    fn intake(&mut self) -> &mut dyn IntakeRepo;
+    fn issues(&mut self) -> &mut dyn IssuesRepo;
+    fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -248,6 +252,8 @@ pub trait RunsRepo: Send {
     async fn update(&mut self, run: &Run) -> Result<(), StoreError>;
     /// A card's runs, or every run, newest first.
     async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError>;
+    /// Every run that has not ended.
+    async fn active(&mut self) -> Result<Vec<Run>, StoreError>;
     /// The card's run that has not ended, if any.
     async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError>;
     /// The highest visit the card's runs have made to each stage that any has entered. A stage
@@ -388,6 +394,46 @@ pub enum Posting {
         agent: Pubkey,
         text: String,
     },
+    /// A call to the code host that opens a pull request, for an `open_pull_request` stage.
+    /// The branch, the title and the body are fixed when the post is queued, like the text of
+    /// the others. The drain makes the call and reports the stage's result.
+    PullRequest {
+        stage: String,
+        visit: u32,
+        /// The repo as `owner/name`.
+        repo: String,
+        head: String,
+        /// Empty means the repo's default branch.
+        base: String,
+        title: String,
+        body: String,
+        draft: bool,
+    },
+    /// A call to the code host on the card's pull request, for a `mark_ready` or `merge` stage.
+    /// The drain makes it and reports the stage's result.
+    PullCall {
+        stage: String,
+        visit: u32,
+        /// The repo as `owner/name`.
+        repo: String,
+        number: u64,
+        call: PullCall,
+    },
+}
+
+/// What a [`Posting::PullCall`] asks of the code host.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "call", rename_all = "snake_case")]
+pub enum PullCall {
+    MarkReady,
+    Merge {
+        method: crate::ports::code_host::MergeMethod,
+        /// The head commit whose checks were last read. The host merges only if the pull
+        /// request still has it. Rows queued before this field existed, and cards whose checks
+        /// were never read, have none and merge unpinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -445,6 +491,88 @@ pub trait OutboxRepo: Send {
     async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError>;
     /// The post queued under `key`, done or not.
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError>;
+}
+
+/// The rules that bring issues onto the board.
+#[async_trait::async_trait]
+pub trait IntakeRepo: Send {
+    /// Every rule, oldest first.
+    async fn list(&mut self) -> Result<Vec<IntakeRule>, StoreError>;
+    async fn get(&mut self, id: uuid::Uuid) -> Result<Option<IntakeRule>, StoreError>;
+    /// Adds the rule, or replaces the one with its id.
+    async fn save(&mut self, rule: &IntakeRule) -> Result<(), StoreError>;
+    /// Deletes a rule. The cards it brought stay, and no longer name it. `false` when there
+    /// was no such rule.
+    async fn delete(&mut self, id: uuid::Uuid) -> Result<bool, StoreError>;
+}
+
+/// The issues Beehive has read, and the card each became.
+#[async_trait::async_trait]
+pub trait IssuesRepo: Send {
+    /// Writes what the host reports of an issue and keeps what Beehive made of it, then
+    /// returns the row. The row stays locked until the transaction ends, so two passes
+    /// that meet one issue do not both make a card for it. A new issue starts reading
+    /// comments from `seen_at`. A read older than the one the row holds (`seen_at` before the
+    /// time it was last read) is not written: the row is returned as it is.
+    async fn upsert(
+        &mut self,
+        issue: &Issue,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<StoredIssue, StoreError>;
+    async fn get(&mut self, repo: &RepoRef, number: u64)
+        -> Result<Option<StoredIssue>, StoreError>;
+    /// Like `get`, and the row stays locked until the transaction ends, so what is read under
+    /// it is not changed by another transaction before this one commits.
+    async fn get_for_update(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError>;
+    /// The issue a card was made from.
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<StoredIssue>, StoreError>;
+    /// Every issue that has a card, for the board to show which issue each card came from.
+    async fn attached(&mut self) -> Result<Vec<StoredIssue>, StoreError>;
+    /// The issues that have a card and are still in the rule's search or have left it.
+    async fn of_rule(&mut self, rule: uuid::Uuid) -> Result<Vec<StoredIssue>, StoreError>;
+    /// The open issues that have a card and are in their rule's search, which is where
+    /// comments are read.
+    async fn watched(&mut self) -> Result<Vec<StoredIssue>, StoreError>;
+    /// Records the card made from an issue, and the rule that brought it.
+    async fn attach(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        card: uuid::Uuid,
+        rule: Option<uuid::Uuid>,
+    ) -> Result<(), StoreError>;
+    /// Records why an issue left its rule's search, or clears it with an empty `left`. `seen_at`
+    /// is when the read that decided it was made: a row read since then is left as it is, and
+    /// `false` says so.
+    async fn set_left(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        left: &str,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StoreError>;
+    /// Moves the time comments have been read up to `at`. It never moves back: an `at` before
+    /// the one held leaves it as it is.
+    async fn set_last_comment(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError>;
+}
+
+/// The pull request each card opened.
+#[async_trait::async_trait]
+pub trait PullRequestsRepo: Send {
+    /// Records the card's pull request, replacing the one before it.
+    async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError>;
+    async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError>;
+    /// The pull requests that are still open, with the card each belongs to.
+    async fn open(&mut self) -> Result<Vec<(uuid::Uuid, PullRequest)>, StoreError>;
 }
 
 /// A package the store holds versions of.
