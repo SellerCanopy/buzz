@@ -681,7 +681,7 @@ Not ported, each with its decision:
 - Duplicate search is a normalized title match (lowercase, whitespace collapsed) over the open
   cards and the first 100 open issues of each named repo, not the host's search syntax.
 - The plan's "listener lag" in `get_hive_health` is the age of the oldest unsent outbox post,
-  since the relay listener was dropped in Phase 12. `allowlist_applied` is `"unknown"` until
+  since the relay listener was dropped in Phase 12. `allowlist_applied` was `"unknown"` until
   Phase 22.
 - `AcceptTicketProposal` reads the open proposals, so a proposal that was accepted is not
   found again.
@@ -689,3 +689,185 @@ Not ported, each with its decision:
   could never satisfy. It now compares against all the card's repos.
 - `OpenProposal` gained a `ticket` field so `ListProposals` shows the tickets waiting.
 
+## Phase 22: the host supervisor and each agent's tool servers
+
+- Migration `0020_agent_tool_servers.sql` (the plan said 0014, which was taken) makes
+  `hive.agent_tool_agents` and `hive.agent_tool_servers`. An agent row means its folder under
+  `deploy/aws/agents` was read once; that read seeds its servers once, so a server a person
+  removed does not come back at the next start and a second seed changes nothing.
+- Served: `ListAgentToolServers` (Read), `SetAgentToolServer` and `RemoveAgentToolServer`
+  (Admin; an agent is refused whatever its level). None is a tool: a tool server runs code with
+  the agent's keys, so only a person sets one. A change is saved first and applied second: a
+  supervisor that is down leaves it saved and the reply says `applied: false` with the reason.
+  Event kind `agent_tools.changed`.
+- `crates/buzz-hive-supervisor` is a host service, not a container, and the only code that
+  holds Docker access for the agents. It takes three signed calls on a Unix socket
+  (`ApplyAgentConfig`, `RestartAgent`, `AgentSettings`), signed with an Ed25519 key derived from
+  the engine's token secret (the supervisor holds the public half only), within 60 seconds of
+  its clock, once. It names an agent only by the folders it lists and never takes a path.
+  A secret never travels in a call: a spec holds `${NAME}` references, and the deploy's env file
+  holds the values.
+- It renders each agent's `mcp.json` and, for every stage agent, `BUZZ_ACP_SESSION_POLICY=thread`
+  and the Beehive account in the respond-to allowlist. `get_hive_health` reads both back through
+  the supervisor and names an agent that is on `channel` or lacks the entry (`agentIssues`).
+- An agent restarts only when what it would run changed, judged by a hash of the rendered files
+  and kept in `applied.sha256` after a restart finished. The default restart recreates the
+  container (`up -d --force-recreate`), because `docker compose restart` does not read the env
+  file again.
+
+### Turn attestation is not in Phase 22
+
+Finding 1.3 of the checkpoint 3 review asked whether the supervisor should hold a credential
+that binds each claim to the agent's current turn. It does not, and an agent can still claim
+from any recent message that mentions it.
+
+- Why: the supervisor never sees a turn start, and `deploy/aws/Dockerfile.agents` runs the
+  harness and the agent as one user in one container. Any path that carries a per-turn
+  credential from the harness to the engine is open to the agent too, so the binding would hold
+  only until an agent reads it.
+- What real binding needs: the harness and the agent running as separate users (or separate
+  containers), the credential readable by the harness user only, and the engine checking the
+  turn against it. That is an agents-image change, not a supervisor change.
+- Left as it is, and recorded here as a residual risk. One cheap tightening stays open: the
+  claim takes its thread root from author-written tags (`crates/buzz-hive-api/src/claims.rs`),
+  and reading it from the relay's `thread_metadata` would narrow that without the supervisor.
+
+### Spike 7: an HTTP entry in `mcp.json`
+
+The golden `crates/buzz-hive-supervisor/tests/golden/apply/mcp.json` holds an HTTP server as
+`{"type": "http", "url": ..., "headers": {...}}` and a stdio one with no `type`, which is Claude
+Code's `.mcp.json` shape. `buzz-acp` never reads that file (the Claude adapter in the agent
+container does), so there is no Rust loader to run it through. The test
+`the_golden_mcp_json_holds_an_http_entry_in_claude_codes_shape` checks the shape and that the
+engine's own parser reads the file back. Not run: the file against the live adapter. That needs
+the agents image and a reachable HTTP tool server, so the first deploy of an HTTP server should
+be watched in the agent's log.
+
+### Deviations
+
+- Plan question 8 (copy a workflow's skills into the agent home) is not built. `ListSkills`
+  stays pending.
+- The wire types (`Call`, `Signer`, `Verifier`) live in `buzz-hive-core`, so the engine's client
+  and the supervisor share one definition and one test.
+- The apply call carries the agent's whole server list, so the supervisor needs no database.
+- With a forced `respond_to: allowlist`, an agent that answered `anyone` now answers its
+  allowlist plus the Beehive account. That narrows `anyone`; the alternative is to leave
+  `anyone` alone and flag it in the health read.
+- `buzz-hive keys` and `buzz-hive apply-agents` are one-shot commands for the deploy: the first
+  prints the two public keys the supervisor is configured with, the second sends every known
+  agent's list to it.
+
+## Phase 23: agent secrets and team secrets (the backend)
+
+- Migration `0021_secrets.sql` (the plan said 0015, which was taken) makes `hive.team_secrets`,
+  `hive.agent_secrets` and `hive.agent_secret_grants`. They hold names, who set each and when.
+  No column can hold a value, and a test lists the columns to keep it so.
+- A secret is write-only. `ports::secrets::SecretSink` has `put` and no read. `SecretString`
+  prints `[redacted]`. The request type's `Debug` is skipped in `buzz-hive-api/build.rs`, and a
+  route whose body holds a value (`WRITE_ONLY` in `routes/secrets.rs`) refuses an undecodable
+  body without serde's words, which repeat the value they met.
+- The engine puts a value in the store (`BUZZ_HIVE_SECRETS_DIR` files, mode 0600, for local
+  development; SSM under `/buzz/` when `BUZZ_HIVE_SECRETS_BACKEND=ssm`) and records the name.
+  The host supervisor reads it. `ApplyAgentConfig` carries `secrets: {own, team}` names only, so
+  the apply call never carries a value either.
+- A team secret reaches an agent only by a grant, by name. An agent with no grant gets no team
+  secret. An own secret wins over a team secret of the same name. Rotating a team secret applies
+  every agent holding it, and the supervisor restarts the agent, because the rendered file's hash
+  includes the values.
+- The supervisor lists what it filled in on the first line of the agent's env file
+  (`# buzz-hive-injected: A,B`, names only). The next apply takes those variables out first, so a
+  revoked secret leaves the file. An apply that cannot read a granted secret fails naming the
+  variable and writes nothing, so no agent starts half filled.
+- Served (all Admin, a person only; an agent is refused whatever its level): `ListSecretNames`,
+  `SetTeamSecret`, `SetAgentSecret`, `GrantTeamSecret`, `RevokeTeamSecret`. None is a tool.
+  Event kind `secret.changed`, with the name and no value.
+- Names: capital letters, digits and `_`, at most 64, and not one the deploy sets itself
+  (`BUZZ_`, `CLAUDE`, `ANTHROPIC_`, `OPENAI_`, `CODEX_`, `HOME`, `PATH`...). Values: the character
+  set `make agents-env` accepts, at most 4096 bytes, because the value lands unquoted in an env
+  file. An agent holds at most 64 secrets.
+- `deploy/aws/iam/` holds the policy text: the engine may put and not get, the supervisor may get
+  and not put, both on `/buzz/agents/*/env/*` and `/buzz/team/env/*`.
+  `tests/aws/test-hive-secrets-iam.sh` checks it.
+
+### Deviations
+
+- `aws-sdk-ssm` cannot be resolved offline, and the plan's own rule is no new dependency that
+  widens `Cargo.lock`. The engine's `SsmSecretSink` and the supervisor's `SsmSecretSource` run the
+  `aws` program instead, as `scripts/aws/agents-env.sh` already does, and are tested with stub
+  programs. The value goes to `aws` in a 0600 file, never on the command line. Swapping in the
+  SDK later changes one file on each side.
+- The engine's `GH_TOKEN` stays on its own environment. The supervisor renders agents only, and
+  the plan has `buzz-hive` read its token from its own env.
+- A third table, `hive.agent_secrets`, holds an agent's own secret names. The plan named two.
+- The read side (`SecretSource`) is in `buzz-hive-supervisor` only. No type the engine holds can
+  name it.
+- IAM: `infra/iam.tf` gained a `WriteTeamSecrets` statement, since `/buzz/agents/*` did not
+  cover `/buzz/team/`.
+
+### Not verified
+
+- Nothing ran against AWS. The `aws` program is a stub in every test.
+- The engine and the supervisor share one instance role today, so the engine/supervisor IAM
+  separation is policy text until the engine container is denied the instance metadata service
+  or has its own role.
+- `deploy/aws/Dockerfile.hive` does not install the `aws` program, so `BUZZ_HIVE_SECRETS_BACKEND=ssm`
+  needs it added to the hive image before production use.
+
+## Phase 24: signing an agent in to an OAuth tool server (the backend)
+
+- Three supervisor calls, signed and refused like the others (`LoginStart`, `LoginPaste`,
+  `LoginStatus`), and three engine rpcs (`StartAgentLogin`, `PasteAgentLogin`,
+  `GetAgentLoginStatus`), all Admin, a person only. None is a tool.
+- `LoginStart` runs `claude mcp login <server> --no-browser` in the agent's container through
+  `BUZZ_HIVE_SUPERVISOR_EXEC_CMD` (a program run as `<program> <agent> claude ...`, standing in
+  for `docker compose exec -T agent ...` the way `BUZZ_HIVE_SUPERVISOR_RESTART_CMD` stands in for
+  the restart). It keeps the process on pipes in a table keyed by `(agent, server)` for ten
+  minutes, reads until an `https://` link appears (up to 30 s) and returns it. A second start for
+  the same key ends the first process. The server must be an HTTP server in the agent's rendered
+  `mcp.json`.
+- `LoginPaste` checks the address again (`CallbackUrl`: `http://localhost:PORT/...?code=...`,
+  also `127.0.0.1`, no user, fragment, space or control character, at most 2048 bytes), writes it
+  as one line to the waiting process, closes its stdin and waits up to 30 s for exit 0. A wrong
+  shape is refused before anything is written and the session stays. An address the CLI does not
+  accept, or a timeout, uses the session up (the provider's code works once), so the admin starts
+  again.
+- `LoginStatus` runs `claude mcp list` and reads the server's line: `needs-sign-in` or
+  `connected`. A line that says anything else (`Failed to connect`) is a failure, not either state.
+- The link is the sign-in and the pasted address can carry the authorization code. Both are held
+  in types that print `[redacted]` (`SecretString`), no `Debug` is generated for the two
+  messages that carry them, `PasteAgentLogin` is in `WRITE_ONLY` (an undecodable body is refused
+  without serde's words), the supervisor never copies the CLI's output into an error or a log
+  (the stub echoes the pasted line on both streams to prove it), and TRACE log captures in the
+  supervisor and API tests assert neither the link nor the code appears.
+- Supervisor `tests/support/exec-stub.sh` and `claude-stub.sh` are the stand-ins. Nothing in the
+  tests calls Docker, AWS or a provider.
+
+### Deviations
+
+- The exec setting is `BUZZ_HIVE_SUPERVISOR_EXEC_CMD`, run as `<program> <agent> claude ...`. The
+  plan said `docker exec -i`; the default is `docker compose exec -T agent` on the same Compose
+  project the restart uses, because that is how the supervisor already reaches an agent.
+- A new reply code `rejected` (the CLI did not take the address). The engine client maps it to
+  `Refused` and the core to `InvalidArgument`.
+- `Supervisor` gained three required methods. Both implementers (`UnixSupervisor`,
+  `FakeSupervisor`) and the test double in `tests/agent_tools.rs` have them.
+- No event is written for a sign-in (logs name the actor, agent and server only). Say so if the
+  event log should have a `agent.signed_in` kind.
+- `PasteAgentLogin` is in `WRITE_ONLY`, and `StartAgentLoginResponse` and `PasteAgentLoginRequest`
+  have `skip_debug` in `buzz-hive-api/build.rs`.
+- The Compose command builder moved out of `restart()` into `calls::compose`, shared with exec.
+
+### Not verified (needs a real container)
+
+- Spike 8, login without a terminal session: the real `claude mcp login <server> --no-browser`
+  and `claude mcp list` output formats are assumed (the link on stdout, a line per server ending
+  in `Connected` or `Needs authentication`). Not verified, needs a real container.
+- Spike 9, token survival across a container restart: not verified, needs a real container.
+  Open item, untested: `Dockerfile.agents` and `compose.agents.yml` mount a named volume at
+  `/home/agent`, so the CLI's credential directory (under that home) should persist if the CLI
+  keeps tokens there. If the CLI keeps them elsewhere (an OS keychain, `/tmp`), mount that
+  directory as a volume in `Dockerfile.agents` and re-test. No change was made to
+  `Dockerfile.agents`.
+- Whether stopping the local `docker compose exec` client ends the `claude` process inside the
+  container (the supervisor kills the client on expiry).
+- Real Docker exec, a real OAuth provider, and the 24.2 buzz-app screen.

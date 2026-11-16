@@ -5,6 +5,8 @@
 
 pub mod access;
 pub mod activity;
+pub mod agent_login;
+pub mod agent_tools;
 pub mod artifacts;
 pub mod assistant;
 pub mod auto;
@@ -20,6 +22,7 @@ pub mod repos;
 mod routes;
 pub mod run;
 pub mod save;
+pub mod secrets;
 pub mod settings;
 pub mod task_message;
 pub mod timers;

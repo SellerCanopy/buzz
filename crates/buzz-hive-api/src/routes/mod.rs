@@ -6,6 +6,7 @@
 
 mod access;
 mod activity;
+mod agent_tools;
 mod agents;
 mod artifacts;
 mod assistant;
@@ -17,6 +18,7 @@ mod merge;
 pub mod poll;
 mod repos;
 mod runs;
+mod secrets;
 mod settings;
 mod stages;
 mod status;
@@ -27,7 +29,6 @@ use buzz_hive_core::access::Level;
 
 use crate::app::App;
 use crate::tools::TOOLS;
-use crate::unary::unary;
 
 /// Every procedure served now, with the level it needs.
 pub const ROUTES: &[(&str, Level)] = &[
@@ -127,6 +128,21 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("AddIssueRepo", Level::Run),
     ("RemoveIssueRepo", Level::Run),
     ("AcceptTicketProposal", Level::Run),
+    // Tool servers run code with an agent's keys, so changing them is an Admin's call; the
+    // core refuses an agent whatever its level.
+    ("ListAgentToolServers", Level::Read),
+    ("SetAgentToolServer", Level::Admin),
+    ("RemoveAgentToolServer", Level::Admin),
+    ("ListSecretNames", Level::Admin),
+    ("SetTeamSecret", Level::Admin),
+    ("SetAgentSecret", Level::Admin),
+    ("GrantTeamSecret", Level::Admin),
+    ("RevokeTeamSecret", Level::Admin),
+    // A sign-in gives an agent a credential for a tool server, so it is an Admin's call and
+    // the core refuses an agent whatever its level.
+    ("StartAgentLogin", Level::Admin),
+    ("PasteAgentLogin", Level::Admin),
+    ("GetAgentLoginStatus", Level::Admin),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -193,7 +209,11 @@ where
     F: Fn(App, crate::unary::Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Res, crate::error::HiveError>> + Send + 'static,
 {
-    r.route(&path(method), unary(needs(method), handler))
+    let sealed = secrets::WRITE_ONLY.contains(&method);
+    r.route(
+        &path(method),
+        crate::unary::unary_with(needs(method), sealed, handler),
+    )
 }
 
 /// A route for every entry in [`ROUTES`].
@@ -295,5 +315,28 @@ pub fn router() -> Router<App> {
     let r = route(r, "AcceptTicketProposal", diagnose::accept_ticket_proposal);
     let r = route(r, "AddIssueRepo", repos::add_issue_repo);
     let r = route(r, "RemoveIssueRepo", repos::remove_issue_repo);
+    let r = route(
+        r,
+        "ListAgentToolServers",
+        agent_tools::list_agent_tool_servers,
+    );
+    let r = route(r, "SetAgentToolServer", agent_tools::set_agent_tool_server);
+    let r = route(
+        r,
+        "RemoveAgentToolServer",
+        agent_tools::remove_agent_tool_server,
+    );
+    let r = route(r, "ListSecretNames", secrets::list_secret_names);
+    let r = route(r, "SetTeamSecret", secrets::set_team_secret);
+    let r = route(r, "SetAgentSecret", secrets::set_agent_secret);
+    let r = route(r, "GrantTeamSecret", secrets::grant_team_secret);
+    let r = route(r, "RevokeTeamSecret", secrets::revoke_team_secret);
+    let r = route(r, "StartAgentLogin", agent_tools::start_agent_login);
+    let r = route(r, "PasteAgentLogin", agent_tools::paste_agent_login);
+    let r = route(
+        r,
+        "GetAgentLoginStatus",
+        agent_tools::get_agent_login_status,
+    );
     route(r, "GetUsage", status::get_usage)
 }

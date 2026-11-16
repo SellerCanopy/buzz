@@ -8,16 +8,18 @@ use crate::domain::events::{check_new, Event};
 use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, StoredIssue};
 use crate::domain::run::{Run, RunState};
+use crate::domain::secret::SecretNames;
 use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::tool_server::ToolServer;
 use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardReposRepo,
-    CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job,
-    JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting,
-    Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo,
-    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
-    MESSAGE_KINDS,
+    AccessRepo, AccessRow, AgentInfo, AgentLink, AgentSecret, AgentToolsRepo, ArtifactSave,
+    ArtifactsRepo, CardReposRepo, CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo,
+    IntakeRepo, IssuesRepo, Job, JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo,
+    OutboxRow, PersonInfo, Posting, Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent,
+    RunsRepo, SecretsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TeamSecret,
+    TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -54,6 +56,18 @@ struct State {
     next_proposal_id: i64,
     /// In the order added.
     card_repos: Vec<(CommunityId, uuid::Uuid, String)>,
+    /// The agents seeded, and their tool servers by agent and name.
+    tool_agents: std::collections::BTreeSet<(CommunityId, String)>,
+    tool_servers: std::collections::BTreeMap<(CommunityId, String, String), ToolServer>,
+    /// Secret names, never values: team secrets by name, agents' own by agent and name, and
+    /// the grants as `(agent, var)`.
+    team_secrets:
+        std::collections::BTreeMap<(CommunityId, String), (String, chrono::DateTime<chrono::Utc>)>,
+    agent_secrets: std::collections::BTreeMap<
+        (CommunityId, String, String),
+        (String, chrono::DateTime<chrono::Utc>),
+    >,
+    secret_grants: std::collections::BTreeSet<(CommunityId, String, String)>,
     /// In creation order, each with when it ends as failed.
     jobs: Vec<(CommunityId, Job, Option<chrono::DateTime<chrono::Utc>>)>,
 }
@@ -99,6 +113,7 @@ pub struct MemStore {
 struct Failures {
     kept_versions: std::sync::atomic::AtomicUsize,
     commits: std::sync::atomic::AtomicUsize,
+    grants: std::sync::atomic::AtomicUsize,
 }
 
 impl Failures {
@@ -143,6 +158,13 @@ impl MemStore {
     pub fn fail_next_commits(&self, times: usize) {
         self.failures
             .commits
+            .store(times, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next `times` reads of the secret grants fail as unavailable.
+    pub fn fail_grant_reads(&self, times: usize) {
+        self.failures
+            .grants
             .store(times, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -235,6 +257,12 @@ impl Tx for MemTx {
         self
     }
     fn card_repos(&mut self) -> &mut dyn CardReposRepo {
+        self
+    }
+    fn agent_tools(&mut self) -> &mut dyn AgentToolsRepo {
+        self
+    }
+    fn secrets(&mut self) -> &mut dyn SecretsRepo {
         self
     }
     fn jobs(&mut self) -> &mut dyn JobsRepo {
@@ -1203,6 +1231,178 @@ impl CardReposRepo for MemTx {
             .card_repos
             .retain(|(c, id, have)| !(*c == community && *id == card && have == repo));
         Ok(self.work.card_repos.len() < before)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentToolsRepo for MemTx {
+    async fn agents(&mut self) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .work
+            .tool_agents
+            .iter()
+            .filter(|(c, _)| *c == self.community)
+            .map(|(_, agent)| agent.clone())
+            .collect())
+    }
+
+    async fn lock_agent(&mut self, agent: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .work
+            .tool_agents
+            .contains(&(self.community, agent.to_owned())))
+    }
+
+    async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .iter()
+            .filter(|((c, _, _), _)| *c == self.community)
+            .map(|((_, agent, _), server)| (agent.clone(), server.clone()))
+            .collect())
+    }
+
+    async fn of_agent(&mut self, agent: &str) -> Result<Vec<ToolServer>, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .iter()
+            .filter(|((c, a, _), _)| *c == self.community && a == agent)
+            .map(|(_, server)| server.clone())
+            .collect())
+    }
+
+    async fn set(&mut self, agent: &str, server: &ToolServer) -> Result<(), StoreError> {
+        self.work.tool_servers.insert(
+            (self.community, agent.to_owned(), server.name.clone()),
+            server.clone(),
+        );
+        Ok(())
+    }
+
+    async fn remove(&mut self, agent: &str, name: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .remove(&(self.community, agent.to_owned(), name.to_owned()))
+            .is_some())
+    }
+
+    async fn seed(&mut self, agent: &str, servers: &[ToolServer]) -> Result<bool, StoreError> {
+        if !self
+            .work
+            .tool_agents
+            .insert((self.community, agent.to_owned()))
+        {
+            return Ok(false);
+        }
+        for server in servers {
+            AgentToolsRepo::set(self, agent, server).await?;
+        }
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretsRepo for MemTx {
+    async fn set_team(&mut self, var: &str, by: &str) -> Result<(), StoreError> {
+        let at = self.clock.now();
+        self.work
+            .team_secrets
+            .insert((self.community, var.to_owned()), (by.to_owned(), at));
+        Ok(())
+    }
+
+    async fn set_agent(&mut self, agent: &str, var: &str, by: &str) -> Result<(), StoreError> {
+        let at = self.clock.now();
+        self.work.agent_secrets.insert(
+            (self.community, agent.to_owned(), var.to_owned()),
+            (by.to_owned(), at),
+        );
+        Ok(())
+    }
+
+    async fn team(&mut self) -> Result<Vec<TeamSecret>, StoreError> {
+        Ok(self
+            .work
+            .team_secrets
+            .iter()
+            .filter(|((c, _), _)| *c == self.community)
+            .map(|((_, var), (by, at))| TeamSecret {
+                var: var.clone(),
+                updated_by: by.clone(),
+                updated_at: *at,
+            })
+            .collect())
+    }
+
+    async fn agent_secrets(&mut self) -> Result<Vec<AgentSecret>, StoreError> {
+        Ok(self
+            .work
+            .agent_secrets
+            .iter()
+            .filter(|((c, _, _), _)| *c == self.community)
+            .map(|((_, agent, var), (by, at))| AgentSecret {
+                agent: agent.clone(),
+                var: var.clone(),
+                updated_by: by.clone(),
+                updated_at: *at,
+            })
+            .collect())
+    }
+
+    async fn grants(&mut self) -> Result<Vec<(String, String)>, StoreError> {
+        if Failures::take(&self.failures.grants) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
+        Ok(self
+            .work
+            .secret_grants
+            .iter()
+            .filter(|(c, _, _)| *c == self.community)
+            .map(|(_, agent, var)| (agent.clone(), var.clone()))
+            .collect())
+    }
+
+    async fn grant(&mut self, agent: &str, var: &str) -> Result<bool, StoreError> {
+        if !self
+            .work
+            .team_secrets
+            .contains_key(&(self.community, var.to_owned()))
+        {
+            return Err(StoreError::NotFound(format!("no team secret named {var}")));
+        }
+        Ok(self
+            .work
+            .secret_grants
+            .insert((self.community, agent.to_owned(), var.to_owned())))
+    }
+
+    async fn revoke(&mut self, agent: &str, var: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .work
+            .secret_grants
+            .remove(&(self.community, agent.to_owned(), var.to_owned())))
+    }
+
+    async fn names_of(&mut self, agent: &str) -> Result<SecretNames, StoreError> {
+        Ok(SecretNames {
+            own: self
+                .work
+                .agent_secrets
+                .keys()
+                .filter(|(c, a, _)| *c == self.community && a == agent)
+                .map(|(_, _, var)| var.clone())
+                .collect(),
+            team: self
+                .work
+                .secret_grants
+                .iter()
+                .filter(|(c, a, _)| *c == self.community && a == agent)
+                .map(|(_, _, var)| var.clone())
+                .collect(),
+        })
     }
 }
 

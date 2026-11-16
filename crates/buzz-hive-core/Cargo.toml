@@ -25,6 +25,8 @@ schemars = { workspace = true, features = ["derive", "std"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+# Signs and checks the calls to the host supervisor. Already in the build through the API crate.
+aws-lc-rs = "1"
 
 [dev-dependencies]
 # Lets this crate's own integration tests use the `testing` module.

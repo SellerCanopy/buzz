@@ -592,6 +592,64 @@ service EngineService {
   // proposal until a person accepts it, and then becomes an issue on the card's repo.
   // A fault an open card or issue already describes gets a note or comment instead.
   rpc FileTicket(FileTicketRequest) returns (FileTicketResponse);
+  // Beehive addition: every agent that has a folder in deploy/aws/agents, each with the
+  // tool servers it starts. Needs Read.
+  rpc ListAgentToolServers(ListAgentToolServersRequest) returns (ListAgentToolServersResponse);
+  // Beehive addition: adds a tool server to an agent, or replaces the one with its name,
+  // then asks the host supervisor to write the agent's mcp.json and restart it when that
+  // changed. Needs Admin; an agent is PermissionDenied. An agent with no folder is
+  // NotFound. A name or spec the checks refuse is InvalidArgument: a spec holds a command
+  // and args, or a url, and an env or headers value must name its secret as ${NAME}, since a
+  // secret value is never sent. An agent already holding 32 servers is FailedPrecondition.
+  // The change is saved even when the supervisor cannot be reached; the reply says so in
+  // applied and apply_error, and the next change applies the whole list again. Appends an
+  // agent_tools.changed event.
+  rpc SetAgentToolServer(SetAgentToolServerRequest) returns (AgentToolsChange);
+  // Beehive addition: takes a tool server off an agent and applies the agent as
+  // SetAgentToolServer does. Needs Admin. A server the agent does not have is NotFound.
+  rpc RemoveAgentToolServer(RemoveAgentToolServerRequest) returns (AgentToolsChange);
+  // Beehive addition: every secret's name, who set it and when, and which agents hold each
+  // team secret. Never a value: a secret is write-only. Needs Admin, since it shows what
+  // credentials exist. An agent is PermissionDenied.
+  rpc ListSecretNames(ListSecretNamesRequest) returns (ListSecretNamesResponse);
+  // Beehive addition: sets or replaces a team secret. The value goes to the secret store and
+  // is never stored, logged, returned or read back by the engine. The host supervisor fills it
+  // into the environment of each agent granted it, so a replaced value reaches them and they
+  // restart. Needs Admin; an agent is PermissionDenied. A name that is not capital letters,
+  // digits and '_', one the deploy sets itself (BUZZ_, CLAUDE, ANTHROPIC_, OPENAI_, CODEX_,
+  // HOME, PATH...), or a value with a space, quote, '$' or line break, or over 4096 bytes, is
+  // InvalidArgument and the error never repeats the value. No secret store configured is
+  // FailedPrecondition. Appends a secret.changed event with the name only.
+  rpc SetTeamSecret(SetTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: sets or replaces one agent's own secret, then applies that agent. As
+  // SetTeamSecret, and an agent with no folder is NotFound. An own secret wins over a team
+  // secret of the same name. An agent holds at most 64 secrets, own and granted together.
+  rpc SetAgentSecret(SetAgentSecretRequest) returns (SecretChange);
+  // Beehive addition: gives an agent a team secret by name, then applies the agent. An agent
+  // gets no team secret until it is granted one. A name no team secret has is NotFound.
+  // Needs Admin. Granting what the agent already has changes nothing.
+  rpc GrantTeamSecret(GrantTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: takes a team secret from an agent and applies the agent, which removes
+  // it from the agent's environment. Needs Admin. A secret the agent was not granted is
+  // NotFound. The value stays in the store for the agents that still hold it.
+  rpc RevokeTeamSecret(RevokeTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: starts the Claude CLI's OAuth sign-in for one of an agent's HTTP tool
+  // servers and returns the link to open. The host supervisor keeps the waiting process for ten
+  // minutes, one per agent and server; a second start replaces it. Needs Admin; an agent is
+  // PermissionDenied. An agent with no folder, or a server the agent does not have as an HTTP
+  // server, is NotFound. No supervisor configured, or one that cannot run the sign-in, is
+  // FailedPrecondition. The link is the sign-in itself: the engine keeps and logs none of it.
+  rpc StartAgentLogin(StartAgentLoginRequest) returns (StartAgentLoginResponse);
+  // Beehive addition: hands the address the browser ended on (http://localhost:PORT/...?code=...)
+  // to the waiting sign-in and returns once the CLI has taken it, up to 30 seconds. Needs
+  // Admin. An address that is not that shape is InvalidArgument, as is one the CLI does not
+  // accept (start again: the provider's code works once). Nothing waiting, or a sign-in older
+  // than ten minutes, is NotFound. The address can carry the authorization code, so no error,
+  // event or log line repeats it.
+  rpc PasteAgentLogin(PasteAgentLoginRequest) returns (PasteAgentLoginResponse);
+  // Beehive addition: whether the agent's CLI holds a sign-in for the server, from
+  // `claude mcp list`: state is "needs-sign-in" or "connected". Needs Admin. Changes nothing.
+  rpc GetAgentLoginStatus(GetAgentLoginStatusRequest) returns (AgentLoginStatus);
 }
 
 message GetStatusRequest {}
@@ -1983,9 +2041,23 @@ message GetHiveHealthResponse {
   // How long the oldest unsent post has waited, 0 when none waits. A post that waits long
   // means the relay is not taking what Beehive sends it.
   int64 oldest_pending_seconds = 6;
-  // Whether the relay's allowlist has been applied to this engine's account. Always
-  // "unknown" until Phase 22 reads it.
+  // Whether every agent answers this engine's account on a thread session, as the host
+  // supervisor reports it: "yes", "no" when agent_issues names some, or "unknown" when no
+  // supervisor answers.
   string allowlist_applied = 7;
+  // The agents that are not on session_policy thread or do not list this engine's account in
+  // their respond-to list. Empty when allowlist_applied is not "no".
+  repeated AgentSettingIssue agent_issues = 8;
+}
+
+message AgentSettingIssue {
+  string agent = 1;
+  // channel or thread.
+  string session_policy = 2;
+  // Whether the respond-to list holds this engine's account.
+  bool allowlisted = 3;
+  // What is wrong, in a sentence.
+  string problem = 4;
 }
 
 message ReportDiagnosisRequest {
@@ -3144,4 +3216,156 @@ message ActivityEntry {
   // The type's own fields as JSON.
   string fields_json = 14;
   int32 v = 15;
+}
+
+message ListAgentToolServersRequest {}
+
+message ListAgentToolServersResponse {
+  // By agent name. An agent with no server is listed with an empty list.
+  repeated AgentToolServers agents = 1;
+}
+
+// AgentToolServers is one agent and the tool servers it starts.
+message AgentToolServers {
+  string agent = 1;
+  // By name.
+  repeated AgentToolServer servers = 2;
+}
+
+// AgentToolServer is one entry of an agent's mcp.json. It never holds a secret value.
+message AgentToolServer {
+  string name = 1;
+  // stdio or http.
+  string transport = 2;
+  // JSON. A stdio server has command, and optionally args and env. An http server has url,
+  // and optionally headers. A value of env or headers is a ${NAME} reference.
+  string spec_json = 3;
+}
+
+message SetAgentToolServerRequest {
+  string agent = 1;
+  AgentToolServer server = 2;
+}
+
+message RemoveAgentToolServerRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+// AgentToolsChange is the agent's list after a change, and whether the agent has it yet.
+message AgentToolsChange {
+  AgentToolServers agent = 1;
+  // Whether the host supervisor wrote the agent's files. False means the change is saved and
+  // not applied yet.
+  bool applied = 2;
+  // Whether the agent restarted because its files changed.
+  bool restarted = 3;
+  // Why the change was not applied, empty when it was.
+  string apply_error = 4;
+}
+
+message ListSecretNamesRequest {}
+
+message ListSecretNamesResponse {
+  // Team secrets, by name.
+  repeated SecretName team = 1;
+  // Agent secrets, by agent then name.
+  repeated AgentSecretName agents = 2;
+  // Which agent holds which team secret, by agent then name.
+  repeated SecretGrant grants = 3;
+}
+
+// SecretName is a secret's name and who last set it. There is no value.
+message SecretName {
+  string name = 1;
+  // The pubkey of the person who last set it.
+  string updated_by = 2;
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+message AgentSecretName {
+  string agent = 1;
+  SecretName secret = 2;
+}
+
+message SecretGrant {
+  string agent = 1;
+  string name = 2;
+}
+
+// The value is write-only: the engine hands it to the secret store and keeps nothing.
+message SetTeamSecretRequest {
+  string name = 1;
+  string value = 2;
+}
+
+message SetAgentSecretRequest {
+  string agent = 1;
+  string name = 2;
+  string value = 3;
+}
+
+message GrantTeamSecretRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+message RevokeTeamSecretRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+// SecretChange says which agents the change reached. The change is saved even when the host
+// supervisor could not be reached; each agent says so.
+message SecretChange {
+  // Agents the change was applied to: the agents holding a replaced team secret, or the one
+  // agent of a grant, revoke or own secret. Empty when no agent holds the secret yet.
+  repeated SecretApplied applied = 1;
+}
+
+message SecretApplied {
+  string agent = 1;
+  // Whether the supervisor wrote the agent's environment.
+  bool applied = 2;
+  // Whether the agent restarted because its environment changed.
+  bool restarted = 3;
+  // Why it was not applied, empty when it was.
+  string apply_error = 4;
+}
+
+message StartAgentLoginRequest {
+  string agent = 1;
+  // The name of one of the agent's HTTP tool servers.
+  string server = 2;
+}
+
+// The link is the sign-in itself, so this message has no Debug output.
+message StartAgentLoginResponse {
+  // An https address to open in a browser.
+  string url = 1;
+}
+
+// The address can carry the authorization code, so this message has no Debug output.
+message PasteAgentLoginRequest {
+  string agent = 1;
+  string server = 2;
+  // The address the browser ended on, as pasted. Surrounding space is ignored.
+  string url = 3;
+}
+
+message PasteAgentLoginResponse {
+  // True once the CLI took the address and finished signing in.
+  bool signed_in = 1;
+}
+
+message GetAgentLoginStatusRequest {
+  string agent = 1;
+  string server = 2;
+}
+
+message AgentLoginStatus {
+  string agent = 1;
+  string server = 2;
+  // needs-sign-in or connected.
+  string state = 3;
 }

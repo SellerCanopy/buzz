@@ -3,4 +3,6 @@
 pub mod clock;
 pub mod code_host;
 pub mod relay;
+pub mod secrets;
 pub mod store;
+pub mod supervisor;

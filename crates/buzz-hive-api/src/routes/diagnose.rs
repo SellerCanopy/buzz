@@ -2,6 +2,7 @@
 //! ticket an agent proposed.
 
 use buzz_hive_core::access::ActorKind;
+use buzz_hive_core::orchestrator::agent_tools;
 use buzz_hive_core::orchestrator::diagnose::{
     self, Diagnosis, Filed, Ticket, TicketKind, STUCK_AFTER_SECS,
 };
@@ -10,10 +11,10 @@ use crate::app::App;
 use crate::error::HiveError;
 use crate::proto::assistant_proposal::Body;
 use crate::proto::{
-    AcceptTicketProposalRequest, AcceptTicketProposalResponse, AssistantProposal,
-    FileTicketRequest, FileTicketResponse, GetHiveHealthRequest, GetHiveHealthResponse,
-    GetRunEventsRequest, GetRunEventsResponse, ReportDiagnosisRequest, ReportDiagnosisResponse,
-    StuckRun, TicketProposal,
+    AcceptTicketProposalRequest, AcceptTicketProposalResponse, AgentSettingIssue,
+    AssistantProposal, FileTicketRequest, FileTicketResponse, GetHiveHealthRequest,
+    GetHiveHealthResponse, GetRunEventsRequest, GetRunEventsResponse, ReportDiagnosisRequest,
+    ReportDiagnosisResponse, StuckRun, TicketProposal,
 };
 use crate::routes::cards::reply;
 use crate::routes::intake::issue_ref;
@@ -48,6 +49,9 @@ pub async fn get_hive_health(
     _req: GetHiveHealthRequest,
 ) -> Result<GetHiveHealthResponse, HiveError> {
     let health = diagnose::health(app.store.as_ref(), &ctx.op(), chrono::Utc::now()).await?;
+    let (allowlist_applied, issues) =
+        agent_tools::settings_check(app.store.as_ref(), app.supervisor.as_deref(), &ctx.op())
+            .await?;
     Ok(GetHiveHealthResponse {
         head_seq: health.head_seq,
         stuck_runs: health
@@ -64,8 +68,16 @@ pub async fn get_hive_health(
         outbox_pending: health.outbox_pending,
         outbox_failed: health.outbox_failed,
         oldest_pending_seconds: health.oldest_pending_seconds,
-        // Phase 22 reads whether the relay's allowlist reaches this account.
-        allowlist_applied: "unknown".to_owned(),
+        allowlist_applied,
+        agent_issues: issues
+            .into_iter()
+            .map(|issue| AgentSettingIssue {
+                agent: issue.agent,
+                session_policy: issue.session_policy,
+                allowlisted: issue.allowlisted,
+                problem: issue.problem,
+            })
+            .collect(),
     })
 }
 

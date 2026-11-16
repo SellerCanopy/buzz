@@ -3,13 +3,16 @@
 # /opt/buzz. Logs in to ECR, renders deploy/compose/.env from SSM, and runs the
 # Compose upgrade with TLS. Then it renders and starts the agents and stops the
 # agent projects that left AGENTS.
+# With BUZZ_HIVE_IMAGE set and /opt/buzz/.env.hive present, it also installs the host
+# supervisor (deploy/aws/buzz-hive-supervisor.service) from that image, and asks the engine
+# to apply every agent's tool servers through it. That step warns and never fails the deploy.
 # Usage: remote-deploy.sh <tag>
 # Environment: BUZZ_DOMAIN, RELAY_OWNER_PUBKEY, ECR_REPO (the relay repository
 # URL). AGENTS (empty or unset: no agents), AGENTS_ECR_REPO (required when AGENTS
 # is set; the agents image is $AGENTS_ECR_REPO:<tag>), AGENT_RESPOND_TO and
 # AGENT_RESPOND_TO_ALLOWLIST (read by render-agents-env.sh), AGENT_SETTLE_SECONDS
-# (how long an agent must stay up, default 15). BUZZ_HOME overrides /opt/buzz for
-# tests.
+# (how long an agent must stay up, default 15). BUZZ_HOME overrides /opt/buzz and BUZZ_ETC_DIR
+# overrides /etc for tests.
 # The whole agent phase (render, start, stale cleanup) runs after `run.sh upgrade`
 # returns, which waits for the relay to be healthy. The first deploy has no agent
 # keys or credentials yet, because registering an agent needs a running relay. So
@@ -30,6 +33,7 @@ tag="$1"
 : "${RELAY_OWNER_PUBKEY:?RELAY_OWNER_PUBKEY must be set}"
 : "${ECR_REPO:?ECR_REPO must be set}"
 BUZZ_HOME="${BUZZ_HOME:-/opt/buzz}"
+BUZZ_ETC_DIR="${BUZZ_ETC_DIR:-/etc}"
 AGENTS="${AGENTS:-}"
 AGENT_SETTLE_SECONDS="${AGENT_SETTLE_SECONDS:-15}"
 export BUZZ_DOMAIN RELAY_OWNER_PUBKEY AGENTS
@@ -116,6 +120,52 @@ stop_stale_agents() {
   done <<< "$projects"
 }
 
+# supervise_agents: installs the Beehive host supervisor and has the engine apply every
+# agent's tool servers and settings. A deploy renders each agent's env file without those
+# settings and recreates the container, so the apply puts them back (and restarts an agent
+# only when its files differ). Nothing here fails the deploy: get_hive_health reports an agent
+# that is not set right.
+supervise_agents() {
+  local image="${BUZZ_HIVE_IMAGE:-}" env_file="$BUZZ_HOME/.env.hive" unit_src unit_env keys cid hive
+  unit_src="$BUZZ_HOME/deploy/aws/buzz-hive-supervisor.service"
+  unit_env="$BUZZ_ETC_DIR/buzz-hive-supervisor.env"
+  if [ -z "$image" ] || [ ! -f "$env_file" ] || [ ! -f "$unit_src" ]; then
+    echo "supervisor: skipped (no BUZZ_HIVE_IMAGE, $env_file or unit file)"
+    return 0
+  fi
+  [[ "$image" =~ ^[A-Za-z0-9._:/@-]+$ ]] || { echo "warning: BUZZ_HIVE_IMAGE is not an image name, supervisor skipped" >&2; return 0; }
+  # The binary comes out of the image the service runs, so the two always match.
+  cid="$(docker create "$image")" || { echo "warning: cannot create a container from $image" >&2; return 0; }
+  mkdir -p "$BUZZ_HOME/bin"
+  docker cp "$cid:/usr/local/bin/buzz-hive-supervisor" "$BUZZ_HOME/bin/buzz-hive-supervisor" || true
+  docker rm "$cid" > /dev/null || true
+  [ -x "$BUZZ_HOME/bin/buzz-hive-supervisor" ] || { echo "warning: the image has no buzz-hive-supervisor, supervisor skipped" >&2; return 0; }
+  # Public keys only: the engine's signing key and the Beehive account's, from its own secrets.
+  keys="$(docker run --rm --env-file "$env_file" "$image" keys)" || { echo "warning: cannot read the Beehive keys, supervisor skipped" >&2; return 0; }
+  {
+    echo "$keys"
+    echo "BUZZ_HIVE_SUPERVISOR_SOCKET=/run/buzz-hive/supervisor.sock"
+    # The user the hive container runs as, so it can open the socket and nobody else can.
+    echo "BUZZ_HIVE_SUPERVISOR_SOCKET_UID=1000"
+    echo "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC=$BUZZ_HOME/deploy/aws/agents"
+    echo "BUZZ_HIVE_SUPERVISOR_RENDER_DIR=$agents_dir"
+    # Agent and team secrets are read from SSM with the host's aws program and instance role.
+    echo "BUZZ_HIVE_SUPERVISOR_SECRETS=ssm"
+  } > "$unit_env"
+  chmod 600 "$unit_env"
+  mkdir -p "$agents_dir"
+  mkdir -p "$BUZZ_ETC_DIR/systemd/system"
+  cp "$unit_src" "$BUZZ_ETC_DIR/systemd/system/buzz-hive-supervisor.service"
+  systemctl daemon-reload
+  systemctl enable buzz-hive-supervisor.service > /dev/null 2>&1 || true
+  # A restart, so a new binary or new keys take effect.
+  systemctl restart buzz-hive-supervisor.service || { echo "warning: the supervisor did not start" >&2; return 0; }
+  hive="$(docker ps -q --filter label=com.docker.compose.service=hive --filter status=running | head -n 1)"
+  [ -n "$hive" ] || { echo "supervisor: installed; the hive service is not running, nothing applied"; return 0; }
+  docker exec "$hive" /usr/local/bin/buzz-hive apply-agents \
+    || echo "warning: not every agent was given its tool servers; see get_hive_health" >&2
+}
+
 aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPO%%/*}"
 
 # Render to a temp file in the same directory, then rename, so a failed render
@@ -135,4 +185,5 @@ if ! render_agents; then
 fi
 start_agents
 stop_stale_agents
+supervise_agents
 [ "$failed" -eq 0 ] || exit 1

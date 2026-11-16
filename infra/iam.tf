@@ -45,6 +45,14 @@ data "aws_iam_policy_document" "server" {
     resources = ["arn:aws:ssm:*:*:parameter/buzz/agents/*"]
   }
 
+  # Beehive's team secrets (deploy/aws/iam/README.md). An agent's own secrets are under
+  # /buzz/agents/ above.
+  statement {
+    sid       = "WriteTeamSecrets"
+    actions   = ["ssm:PutParameter"]
+    resources = ["arn:aws:ssm:*:*:parameter/buzz/team/env/*"]
+  }
+
   statement {
     sid = "ListBackupBucket"
     actions = [

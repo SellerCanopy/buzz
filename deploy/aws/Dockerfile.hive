@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # Beehive service image. Build from the repo root:
 #   docker build -f deploy/aws/Dockerfile.hive -t buzz-hive:local .
-# The image also carries buzz-hive-mcp, the stdio tool server an agent runs.
+# The image also carries buzz-hive-mcp, the stdio tool server an agent runs, and
+# buzz-hive-supervisor, which the host copies out and runs as a systemd service
+# (deploy/aws/buzz-hive-supervisor.service). The service never runs it in a container.
 ARG RUST_VERSION=1.98
 ARG DEBIAN_VERSION=bookworm
 
@@ -18,9 +20,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p buzz-hive --bin buzz-hive \
     && cargo build --release --locked -p buzz-hive-mcp --bin buzz-hive-mcp \
+    && cargo build --release --locked -p buzz-hive-supervisor --bin buzz-hive-supervisor \
     && install -D -m 0755 target/release/buzz-hive /out/buzz-hive \
     && install -D -m 0755 target/release/buzz-hive-mcp /out/buzz-hive-mcp \
-    && strip /out/buzz-hive /out/buzz-hive-mcp
+    && install -D -m 0755 target/release/buzz-hive-supervisor /out/buzz-hive-supervisor \
+    && strip /out/buzz-hive /out/buzz-hive-mcp /out/buzz-hive-supervisor
 
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 LABEL org.opencontainers.image.title="Buzz Hive" \
@@ -34,6 +38,7 @@ RUN apt-get update \
     && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz --create-home --shell /usr/sbin/nologin buzz
 COPY --from=builder /out/buzz-hive /usr/local/bin/buzz-hive
 COPY --from=builder /out/buzz-hive-mcp /usr/local/bin/buzz-hive-mcp
+COPY --from=builder /out/buzz-hive-supervisor /usr/local/bin/buzz-hive-supervisor
 EXPOSE 3100
 USER buzz:buzz
 WORKDIR /var/lib/buzz

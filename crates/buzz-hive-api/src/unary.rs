@@ -54,10 +54,23 @@ where
     F: Fn(App, Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<Res, HiveError>> + Send + 'static,
 {
+    unary_with(needs, false, f)
+}
+
+/// [`unary`], and with `sealed` a body that does not decode is refused without the decoder's
+/// words. serde repeats the value it met (`invalid type: integer `123``), and the body of a
+/// route that carries a secret must not reach a response or a log line that way.
+pub fn unary_with<Req, Res, F, Fut>(needs: Level, sealed: bool, f: F) -> MethodRouter<App>
+where
+    Req: serde::de::DeserializeOwned + Send + 'static,
+    Res: serde::Serialize + Send + 'static,
+    F: Fn(App, Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<Res, HiveError>> + Send + 'static,
+{
     post(
         move |State(app): State<App>, headers: HeaderMap, body: Bytes| {
             let f = f.clone();
-            async move { handle(app, needs, f, headers, body).await }
+            async move { handle(app, needs, sealed, f, headers, body).await }
         },
     )
 }
@@ -65,6 +78,7 @@ where
 async fn handle<Req, Res, F, Fut>(
     app: App,
     needs: Level,
+    sealed: bool,
     f: F,
     headers: HeaderMap,
     body: Bytes,
@@ -86,8 +100,21 @@ where
         HiveError::PermissionDenied(format!("needs {:?}, you have {:?}", d.needed, d.effective))
     })?;
     let bytes: &[u8] = if body.is_empty() { b"{}" } else { &body };
-    let request: Req = serde_json::from_slice(bytes)
-        .map_err(|e| HiveError::InvalidArgument(format!("invalid request body: {e}")))?;
+    let request: Req = serde_json::from_slice(bytes).map_err(|e| {
+        let said = e.to_string();
+        // A missing field names the field and holds no value. Anything else may repeat one.
+        if sealed && e.is_data() && !said.starts_with("missing field") {
+            return HiveError::InvalidArgument(
+                "invalid request body: a field has the wrong type (the body is not shown)".into(),
+            );
+        }
+        if sealed && !e.is_data() {
+            return HiveError::InvalidArgument(
+                "invalid request body: it is not JSON (the body is not shown)".into(),
+            );
+        }
+        HiveError::InvalidArgument(format!("invalid request body: {said}"))
+    })?;
     f(app, ctx, request).await.map(Json)
 }
 

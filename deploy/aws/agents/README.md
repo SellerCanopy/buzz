@@ -167,5 +167,13 @@ Other install locations were not needed.
   dirty git tree, so commit a file change first. A secret change alone needs no
   commit: run `make agents-env`, then `make deploy`.
 
+- **Beehive reads `mcp.json` once.** When Beehive is deployed, `mcp.json` only seeds an
+  agent's tool servers the first time Beehive sees the agent's folder. After that an admin
+  sets them in Beehive (`SetAgentToolServer`), and the host supervisor writes the agent's
+  `mcp.json` and recreates the container when it changed, so a later edit of the file in git
+  does not change a seeded agent. The supervisor also sets `BUZZ_ACP_SESSION_POLICY=thread` and
+  adds the Beehive account to the respond-to allowlist, which `get_hive_health` checks.
+  A secret still goes in AWS as `${NAME}`: a tool server's spec never holds a value.
+
 To pick settings and MCP servers for a job, use the `buzz-agent-config` skill
 (`.claude/skills/buzz-agent-config/SKILL.md`).

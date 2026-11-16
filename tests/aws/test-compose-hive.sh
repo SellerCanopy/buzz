@@ -97,6 +97,14 @@ check_render() {
   [ "$(jq -r '.services.hive.build.context' <<< "$r")" = "$dir" ] || return 1
   [ -f "$dir/deploy/aws/Dockerfile.hive" ] || return 1
 
+  # hive reads the agent folders read-only and talks to the host supervisor over its socket.
+  jq -e --arg src "$dir/deploy/aws/agents" \
+    '.services.hive.volumes[] | select(.target == "/etc/buzz-hive/agents" and .source == $src and .read_only == true)' \
+    <<< "$r" >/dev/null || return 1
+  jq -e '.services.hive.volumes[] | select(.target == "/run/buzz-hive" and .source == "/run/buzz-hive")' <<< "$r" >/dev/null || return 1
+  [ "$(jq -r '.services.hive.environment.BUZZ_HIVE_SUPERVISOR_SOCKET' <<< "$r")" = "/run/buzz-hive/supervisor.sock" ] || return 1
+  [ "$(jq -r '.services.hive.environment.BUZZ_HIVE_AGENTS_DIR' <<< "$r")" = "/etc/buzz-hive/agents" ] || return 1
+
   # The Caddyfile sends the Beehive paths to hive and everything else to the relay.
   grep -qE '^[[:space:]]*@hive path .*/auth/token' "$caddyfile" || return 1
   grep -qE '^[[:space:]]*reverse_proxy @hive hive:3100$' "$caddyfile" || return 1
@@ -129,6 +137,7 @@ mutant hive-before-roles compose.hive.yml 's/condition: service_completed_succes
 mutant hive-port-published compose.hive.yml 's#^(      BUZZ_HIVE_LISTEN: .*)$#\1\n    ports: ["3100:3100"]#'
 mutant hive-off-network compose.hive.yml '/^  hive:/,/^  caddy:|^  # Caddy/ s/^      - buzz-net$/      - default/'
 mutant caddy-waits-for-hive compose.hive.yml 's#^  caddy:$#  caddy:\n    depends_on:\n      hive:\n        condition: service_started#'
+mutant agents-mount-writable compose.hive.yml 's#^(      - \.\./aws/agents:/etc/buzz-hive/agents):ro$#\1#'
 mutant hive-paths-not-routed Caddyfile.hive 's#/auth/token ##'
 mutant fallback-removed Caddyfile.hive 's#reverse_proxy relay:3000#reverse_proxy hive:3100#'
 

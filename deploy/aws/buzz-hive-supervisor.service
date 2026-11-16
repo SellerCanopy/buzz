@@ -1,0 +1,37 @@
+# The host supervisor for Beehive's agents: writes each agent's mcp.json and the settings
+# every stage agent needs, then recreates the agent. It is the only code that holds Docker
+# access for this, so it runs here and not in the hive container, and it takes only the three
+# signed calls of crates/buzz-hive-core/src/supervisor_wire.rs from the socket.
+#
+# Installed by scripts/aws/remote-deploy.sh to /etc/systemd/system. The binary is
+# /opt/buzz/bin/buzz-hive-supervisor, copied out of the hive image. The environment file
+# /etc/buzz-hive-supervisor.env holds public keys and paths only, no secret.
+[Unit]
+Description=Beehive host supervisor
+After=docker.service network.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/buzz-hive-supervisor.env
+ExecStart=/opt/buzz/bin/buzz-hive-supervisor
+# /run/buzz-hive is the folder the hive container mounts for the socket.
+RuntimeDirectory=buzz-hive
+RuntimeDirectoryMode=0755
+# Kept when the unit stops, so the hive container's mount of the folder stays valid.
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=5
+# The agents' env files hold keys, so nothing but the supervisor reads what it writes.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# It writes the rendered agent files and the socket, and reads the folders it lists.
+ReadWritePaths=/opt/buzz/agents /run/buzz-hive
+
+[Install]
+WantedBy=multi-user.target

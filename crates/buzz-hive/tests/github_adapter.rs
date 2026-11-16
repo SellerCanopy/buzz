@@ -94,6 +94,46 @@ async fn a_second_read_asks_if_the_answer_changed_and_a_304_returns_the_first_an
 }
 
 #[tokio::test]
+async fn a_few_hundred_other_reads_do_not_make_the_adapter_forget_an_answer() {
+    // More than the 256 entries a cache that empties itself when full could hold.
+    const OTHERS: usize = 300;
+    let url = "/repos/example-org/api/issues";
+    let mut exchanges = vec![Exchange::get(url).header("etag", "\"v1\"").body("[]")];
+    for i in 0..OTHERS {
+        exchanges.push(
+            Exchange::get(&format!("/repos/example-org/other{i}/issues"))
+                .header("etag", "\"o\"")
+                .body("[]"),
+        );
+    }
+    exchanges.push(Exchange::get(url).status(304));
+    let replay = Replay::start(exchanges).await;
+    let github = github(&replay).await;
+    let filter = IssueFilter::default();
+    github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap();
+    for i in 0..OTHERS {
+        let other = RepoRef::parse(&format!("example-org/other{i}")).unwrap();
+        github
+            .list_issues(&other, &filter, Page::first(100))
+            .await
+            .unwrap();
+    }
+    github
+        .list_issues(&repo(), &filter, Page::first(100))
+        .await
+        .unwrap();
+    let requests = replay.requests();
+    assert_eq!(
+        requests.last().unwrap().header("if-none-match"),
+        Some("\"v1\"")
+    );
+    replay.finish();
+}
+
+#[tokio::test]
 async fn an_answer_with_a_new_etag_replaces_the_one_kept() {
     let url = "/repos/example-org/api/issues";
     let replay = Replay::start(vec![

@@ -280,7 +280,7 @@ pub const TOOLS: &[Tool] = &[
         name: "get_hive_health",
         route: "GetHiveHealth",
         needs: Level::Read,
-        description: "Read whether Beehive itself looks well: runs that have sat in one stage too long, how many posts to the relay are waiting or have failed, and how long the oldest has waited. allowlistApplied is always \"unknown\" for now: do not treat it as a fault.",
+        description: "Read whether Beehive itself looks well: runs that have sat in one stage too long, how many posts to the relay are waiting or have failed, and how long the oldest has waited. allowlistApplied says whether every agent is on a thread session and answers Beehive's account: \"yes\", \"no\" with agentIssues naming each agent and what is wrong, or \"unknown\" when the host supervisor does not answer, which is not a fault of the agents.",
         schema: no_arguments,
     },
     Tool {
@@ -308,6 +308,50 @@ pub const TOOLS: &[Tool] = &[
 
 /// Routes that are deliberately not tools, each with the reason.
 pub const NOT_TOOLS: &[(&str, &str)] = &[
+    (
+        "ListAgentToolServers",
+        "a person sets an agent's tool servers on the agents page; an agent's own tools are not its to widen",
+    ),
+    (
+        "SetAgentToolServer",
+        "a tool server runs code with the agent's keys, so only a person sets one and the engine refuses an agent",
+    ),
+    (
+        "RemoveAgentToolServer",
+        "a person's call from the agents page; the engine refuses an agent",
+    ),
+    (
+        "ListSecretNames",
+        "a person reviews which secrets exist on the agents page; an agent has no business listing credentials",
+    ),
+    (
+        "SetTeamSecret",
+        "a secret is a credential, so only a person sets one and the engine refuses an agent; the value is write-only",
+    ),
+    (
+        "SetAgentSecret",
+        "a secret is a credential, so only a person sets one and the engine refuses an agent; the value is write-only",
+    ),
+    (
+        "GrantTeamSecret",
+        "an agent that could grant itself a team secret could take another agent's keys, so only a person grants one",
+    ),
+    (
+        "RevokeTeamSecret",
+        "a person's call from the agents page; the engine refuses an agent",
+    ),
+    (
+        "StartAgentLogin",
+        "a sign-in gives an agent a credential for a tool server, so only a person starts one and the engine refuses an agent; the link is the sign-in itself",
+    ),
+    (
+        "PasteAgentLogin",
+        "a person pastes back the address their own browser ended on; it can carry an authorization code, which an agent must never handle",
+    ),
+    (
+        "GetAgentLoginStatus",
+        "a person reads whether a tool server is signed in on the agents page; an agent has no business reading it",
+    ),
     (
         "GetStatus",
         "the page's header counts; get_hive_health reports what an agent needs",

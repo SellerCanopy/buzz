@@ -374,6 +374,16 @@ scenario_agents_settings_reach_server() {
     && grep -qF "export AGENT_RESPOND_TO_ALLOWLIST='$allow'" "$OUT"
 }
 
+scenario_hive_image_reaches_the_server() {
+  new_repo; stubs_ok; mk_backups
+  local image="123456789012.dkr.ecr.us-east-1.amazonaws.com/buzz/hive:abc1234"
+  run_deploy "$1" DRY_RUN=1 AGENTS= BUZZ_HIVE_IMAGE="$image"
+  [ "$RC" -eq 0 ] && grep -qF "export BUZZ_HIVE_IMAGE='$image'" "$OUT" || return 1
+  # Without one set, nothing is exported, so the server skips the supervisor.
+  run_deploy "$1" DRY_RUN=1 AGENTS=
+  [ "$RC" -eq 0 ] && ! grep -qF "BUZZ_HIVE_IMAGE" "$OUT"
+}
+
 scenario_missing_agents_output_stops() {
   new_repo; stubs_ok; mk_backups
   rm "$STUB_DIR/tf-agents_ecr_repository_url.out"
@@ -584,6 +594,7 @@ expect_ok "build.sh stops when the ECR login fails" scenario_build_login_failure
 expect_ok "dry run with agents: the SSM command carries the agent list, the agents repository, and the tag" scenario_dry_run_agents_command "$R"
 expect_ok "dry run with AGENTS empty: no agents repository, and no output lookup" scenario_dry_run_no_agents_command "$R"
 expect_ok "AGENT_RESPOND_TO and its allowlist reach the server" scenario_agents_settings_reach_server "$R"
+expect_ok "BUZZ_HIVE_IMAGE reaches the server only when set" scenario_hive_image_reaches_the_server "$R"
 expect_ok "a missing agents repository output stops before anything ships" scenario_missing_agents_output_stops "$R"
 expect_ok "full deploy with agents: relay, sprig, then agents image, then send, then one record" scenario_full_deploy_with_agents "$R"
 expect_ok "full deploy with AGENTS empty builds no agents image" scenario_full_deploy_without_agents "$R"
@@ -652,6 +663,8 @@ expect_caught "rollback skips the agents image check" scenario_rollback_without_
   's/^  if \[ -n "\$agents_repo" \]; then$/  if false; then/'
 expect_caught "rollback checks another tag for the agents image" scenario_rollback_restores_both_tags deploy.sh \
   's/imageTag=\$tag/imageTag=latest/'
+expect_caught "BUZZ_HIVE_IMAGE not sent to the server" scenario_hive_image_reaches_the_server deploy.sh \
+  's/^  \[ -z "\$\{BUZZ_HIVE_IMAGE:-\}" \] \|\| echo .*$/  true/'
 expect_caught "agents lookup runs with AGENTS empty" scenario_dry_run_no_agents_command deploy.sh \
   's/^if \[ -n "\$AGENTS" \]; then$/if true; then/'
 expect_caught "agents-logs accepts an unknown agent" scenario_make_agents_logs_unknown ops.sh \

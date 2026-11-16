@@ -7,7 +7,9 @@ use crate::domain::events::Event;
 use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, RepoRef, StoredIssue};
 use crate::domain::run::Run;
+use crate::domain::secret::SecretNames;
 use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::tool_server::ToolServer;
 use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
@@ -65,6 +67,8 @@ pub trait Tx: Send {
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     fn proposals(&mut self) -> &mut dyn ProposalsRepo;
     fn card_repos(&mut self) -> &mut dyn CardReposRepo;
+    fn agent_tools(&mut self) -> &mut dyn AgentToolsRepo;
+    fn secrets(&mut self) -> &mut dyn SecretsRepo;
     fn jobs(&mut self) -> &mut dyn JobsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
@@ -318,6 +322,68 @@ pub trait CardReposRepo: Send {
     async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError>;
     /// Drops `repo`. `false` when the card did not have it.
     async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError>;
+}
+
+/// The tool servers each agent starts. An agent is known once its folder was read at a start.
+#[async_trait::async_trait]
+pub trait AgentToolsRepo: Send {
+    /// The agents whose folder was read, by name.
+    async fn agents(&mut self) -> Result<Vec<String>, StoreError>;
+    /// Whether the agent is known, and holds its lock until the transaction ends: another
+    /// transaction that locks the same agent waits, so a count taken after the lock is still
+    /// true at commit.
+    async fn lock_agent(&mut self, agent: &str) -> Result<bool, StoreError>;
+    /// Every server with its agent, by agent then name.
+    async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError>;
+    /// One agent's servers, by name.
+    async fn of_agent(&mut self, agent: &str) -> Result<Vec<ToolServer>, StoreError>;
+    /// Adds the server or replaces the one with its name.
+    async fn set(&mut self, agent: &str, server: &ToolServer) -> Result<(), StoreError>;
+    /// Drops the server. `false` when the agent did not have it.
+    async fn remove(&mut self, agent: &str, name: &str) -> Result<bool, StoreError>;
+    /// Makes the agent known and gives it `servers`, once. `false` and no change when the agent
+    /// was seeded before, so a server a person removed does not come back at the next start.
+    async fn seed(&mut self, agent: &str, servers: &[ToolServer]) -> Result<bool, StoreError>;
+}
+
+/// A team secret's name and who last set it. The value is not here: it lives only in the secret
+/// store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamSecret {
+    pub var: String,
+    pub updated_by: Pubkey,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// An agent's own secret's name and who last set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSecret {
+    pub agent: String,
+    pub var: String,
+    pub updated_by: Pubkey,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The names of the secrets, and which agent is granted which team secret. Never a value.
+#[async_trait::async_trait]
+pub trait SecretsRepo: Send {
+    /// Records that the team secret `var` is set, by `by`, now. A name that exists is updated.
+    async fn set_team(&mut self, var: &str, by: &str) -> Result<(), StoreError>;
+    /// Records that the agent's own secret `var` is set, by `by`, now.
+    async fn set_agent(&mut self, agent: &str, var: &str, by: &str) -> Result<(), StoreError>;
+    /// Every team secret, by name.
+    async fn team(&mut self) -> Result<Vec<TeamSecret>, StoreError>;
+    /// Every agent's own secrets, by agent then name.
+    async fn agent_secrets(&mut self) -> Result<Vec<AgentSecret>, StoreError>;
+    /// Every grant as `(agent, var)`, by agent then name.
+    async fn grants(&mut self) -> Result<Vec<(String, String)>, StoreError>;
+    /// Grants the team secret to the agent. `false` when it already had it. `NotFound` when no
+    /// such team secret is set.
+    async fn grant(&mut self, agent: &str, var: &str) -> Result<bool, StoreError>;
+    /// Takes the grant back. `false` when the agent did not have it.
+    async fn revoke(&mut self, agent: &str, var: &str) -> Result<bool, StoreError>;
+    /// What the agent is given: its own secrets and the team secrets granted to it, by name.
+    async fn names_of(&mut self, agent: &str) -> Result<SecretNames, StoreError>;
 }
 
 /// Where a job stands. A job leaves `Running` once and never returns.

@@ -12,6 +12,8 @@
 # relay image, the release carries deploy/aws, and the server starts the agents
 # after the relay is healthy. One tag names both images, so /buzz/last_good_image
 # and a rollback cover both.
+# With BUZZ_HIVE_IMAGE set (the Beehive image on the server), the server also installs the
+# host supervisor from that image and asks it to apply every agent's tool servers.
 # Other environment: BACKUP_CMD (default scripts/aws/backup.sh next to this
 # file), POLL_INTERVAL and POLL_ATTEMPTS (seconds, count; SSM command wait),
 # HEALTH_INTERVAL and HEALTH_ATTEMPTS (seconds, count; health check wait).
@@ -53,6 +55,8 @@ remote_script() {
   echo "export AGENT_RESPOND_TO='$AGENT_RESPOND_TO'"
   echo "export AGENT_RESPOND_TO_ALLOWLIST='$AGENT_RESPOND_TO_ALLOWLIST'"
   [ -z "$agents_repo" ] || echo "export AGENTS_ECR_REPO='$agents_repo'"
+  # The hive image whose supervisor the server installs; see remote-deploy.sh.
+  [ -z "${BUZZ_HIVE_IMAGE:-}" ] || echo "export BUZZ_HIVE_IMAGE='$BUZZ_HIVE_IMAGE'"
   echo "mkdir -p /opt/buzz"
   echo "aws s3 cp 's3://$bucket/releases/$t.tgz' /opt/buzz/release.tgz"
   # tar adds and overwrites but deletes nothing, so drop the old agent files first.
