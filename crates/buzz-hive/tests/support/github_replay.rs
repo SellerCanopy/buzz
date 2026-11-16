@@ -39,6 +39,10 @@ impl Exchange {
         Self::new(Method::POST, path)
     }
 
+    pub fn put(path: &str) -> Self {
+        Self::new(Method::PUT, path)
+    }
+
     fn new(method: Method, path: &str) -> Self {
         Self {
             method,

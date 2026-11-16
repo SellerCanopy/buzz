@@ -31,7 +31,7 @@ never edited. Phase numbers refer to the Beehive plan.
 | Engine lease and heartbeat | dropped (one `buzz-hive` per community) | 1 |
 | Permission prompts | dropped | 1 |
 | The `interrupted` inbox item | dropped | 1 |
-| `core/openspec` | kept, not dropped: the built-in `openspec` package calls `check_openspec`. Phase 5 ports the action's argument checks (`workflow/actions.rs`) and ships the package with its `NOTICE` and `LICENSE-OpenSpec`. The document validator runs inside the action, so it ports with the action runner in Phase 18 | 18 |
+| `core/openspec` | kept, not dropped: the built-in `openspec` package calls `check_openspec`. Phase 5 ports the action's argument checks (`workflow/actions.rs`) and ships the package with its `NOTICE` and `LICENSE-OpenSpec`. Phase 18 does not run the action: the plan lists only `wait_for_ci`, `mark_ready` and `merge`, so a `check_openspec` stage still stops with "does not run yet; skip it". The document validator still has no owner | unassigned |
 | `core/issuefiles` | dropped (the Go package copies an issue's attached images into the card's folder; a card has no folder here and the Issue tab shows the issue's own text. Phase 16 does not fetch or store issue attachments) | 16 |
 | `core/config` | ported | 6 |
 | `worktrees` table and the `worktree.prepared` event | dropped (Phase 17: a card has no folder on the engine's disk. The card branch is `buzz/<8 hex of the card id>-<title slug>`, built by `card_branch`, and each stage agent clones or fetches it itself. The `worktree` stage template does that as a first stage) | 17 |
@@ -45,10 +45,10 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | item (`engine/...`) | test files | decision | phase |
 |---|---|---|---|
 | `adapters/acp` | 9 | dropped | 1 |
-| `adapters/actions` | 1 | pending | 18 |
+| `adapters/actions` | 1 | changed (Phase 18: `wait_for_ci`, `wait`, `mark_ready` and `merge` run, in `rules/wait.rs`, `orchestrator/{wait,merge}.rs` and the `Posting::PullCall` outbox row. `check_openspec`, `run_command`, `sync_base` and the review actions still do not run) | 18 |
 | `adapters/artifacts/local` | 2 | changed (documents live in the `hive.artifacts` tables of the relay's Postgres and a file is a pointer to a media-store blob, so there is no folder adapter; `postgres_artifacts.rs` and `tests/artifacts.rs` carry the contract) | 9 |
 | `adapters/downloadmark` | 3 | pending | unassigned |
-| `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. Phase 17 adds `open_pull_request` (finds an open pull request for the head first, then `POST /repos/{o}/{r}/pulls` with `draft`). `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
+| `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. Phase 17 adds `open_pull_request` (finds an open pull request for the head first, then `POST /repos/{o}/{r}/pulls` with `draft`). Phase 18 adds `get_pull_request` (with the latest review verdict per reviewer), `list_checks` (check runs and commit statuses), `mark_ready` (GraphQL `markPullRequestReadyForReview`) and `merge` (`PUT /pulls/N/merge`). `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
 | `adapters/gitwork` | 5 | dropped | 1 |
 | `adapters/keyring` | 1 | dropped | 23 |
 | `adapters/localrepo` | 2 | dropped (scratch folders) | 1 |
@@ -69,7 +69,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `cmd/carrier-runner` | 1 | dropped (local runner) | 1 |
 | `cmd/kiln-engine` | 88 | pending | unassigned |
 | `core/assistant` | 15 | pending | 20 |
-| `core/background` | 9 | pending | unassigned |
+| `core/background` | 9 | changed (Phase 18: `background/pull_requests.rs` decides which cards are read and when, and `buzz-hive/src/intake.rs` runs it beside the comment loop. The rest of the Go background jobs are not ported) | 18 |
 | `core/config` | 1 | ported | 6 |
 | `core/domain` | 12 | pending | unassigned |
 | `core/events` | 1 | changed (Phase 4: `domain/events.rs`, `bus.rs` and the `hive.events` log; one Postgres transaction per change and a long poll replace the Go subscription) | 4 |
@@ -79,7 +79,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `core/openspec` | 1 | kept, not dropped (see Features): the validator ports with the action runner | 18 |
 | `core/orchestrator` | 56 | pending | unassigned |
 | `core/pricing` | 1 | dropped | 1 |
-| `core/pullrequests` | 2 | changed (Phase 17: the `open_pull_request` action stage in `orchestrator/pull_request.rs`, `hive.pull_requests` and `GetCard.pull_request`; tests `pull_request_action.rs` and `postgres_pull_requests.rs`. The Go merge and close tracking is not ported) | 17 |
+| `core/pullrequests` | 2 | changed (Phase 17: the `open_pull_request` action stage in `orchestrator/pull_request.rs`, `hive.pull_requests` and `GetCard.pull_request`; tests `pull_request_action.rs` and `postgres_pull_requests.rs`. Phase 18 adds `approved` and `checks` to the stored pull request (migration `0015`) and a sync that keeps it current while the card is open. The Go close tracking is not ported) | 17 |
 | `core/redact` | 1 | pending | unassigned |
 | `core/rules` | 21 | pending | unassigned |
 | `core/session` | 18 | pending | unassigned |
@@ -126,7 +126,7 @@ spec's title and are confirmed when that phase starts.
 | `kilntask` | dropped (Carrier task kind, no Buzz stage) | 1 |
 | `list` | pending (the Go spec drives a List layout of the board; no phase in the plan builds one, so it needs an owner) | unassigned |
 | `login` | dropped (team login and cookie session) | 1 |
-| `merge` | pending | 18 |
+| `merge` | changed (Phase 18: `MergeCard` merges after a fresh read of the pull request and its checks, in `buzz-hive-api/tests/merge.rs` and `buzz-hive-core/tests/wait_stages.rs`, over `FakeCodeHost`. A person merges; an agent is refused. The spec's merge order across several repos is not ported: a card has one repo) | 18 |
 | `needs-you` | changed (Phase 12: the Needs you view lists open items with the card, the stage and a button per answer, and its tab counts them live; buzz-app `NeedsYou.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. A gate an agent opens is answered end to end in `buzz-hive/tests/e2e_approval.rs`, which needs a relay. Resolved items are not listed) | 12 |
 | `newtask` | changed (Phase 16: a card is made from an issue with `CreateCard` and `issue {repo, number}`, in `buzz-hive-api/tests/intake.rs`; making the same issue twice returns the first card) | 16 |
 | `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is not ported: a card made from an issue starts with no parameters) | 16 |
@@ -559,3 +559,48 @@ spec's title and are confirmed when that phase starts.
 - Tests: core `tests/pull_request_action.rs` and the `card_branch` unit tests in `domain/card.rs`;
   store `tests/postgres_pull_requests.rs`; binary `tests/github_adapter.rs` (draft body shape,
   default base, existing pull request, a race, a 422) and `tests/branch_handoff.rs`.
+
+## Phase 18 deliverables
+
+- Wait stages. `kind: action` stages `wait_for_ci` and `wait` (and the `wait` action's labels
+  and pull request states) pass or fail on what the host says. The pull request sync loop in
+  `buzz-hive/src/intake.rs` is also the poller: it ticks about every 10 seconds, reads each open
+  card at its stage's `poll` (60 seconds unless the stage sets it, never under 10) with jitter,
+  delays the first read, doubles the wait after a failed read, and stops the pass when the host
+  limits the token. There is no poll timer and no timers migration. The stage's timeout reuses
+  the existing `timeout` timer. `rules/wait.rs::poll_decision` is the pure decision.
+- Rules of a wait: a merged pull request passes any wait and a closed one fails it; labels and a
+  pull request state in one wait must both hold (the plan snippet reads like either); label waits
+  use the issue's labels and the pull request's, and work with no pull request. `wait_for_ci`
+  counts the checks named in `with.required` (comma separated; every check when empty), waits a
+  grace period of 2 minutes (`with.grace`) before it believes "no checks yet", and times out
+  after 1 hour (`with.timeout`). A timeout records `failed` and follows `on.failed`, with no
+  retries and no inbox item. The step summary says what the stage waits for.
+- `mark_ready` and `merge` go through the outbox as `Posting::PullCall`, settled in
+  `orchestrator/pull_request.rs`. Default merge method is squash. The GitHub adapter reads the
+  pull request first, so a repeated `mark_ready` or `merge` does nothing the second time. A 405 or
+  409 from the host is `Rejected`.
+- Routes. `MergeCard` and `SetMergeOrder` need Run and a person (`people_only`), and have no
+  agent tool (`NOT_TOOLS`). Default: only a person may merge by hand. A workflow's own `merge`
+  stage merges without a person, which its author chose. `MergeCard` reads the pull request and
+  checks again, refuses an archived card, `card.dont_merge`, a stage that works on the branch, no
+  pull request, a closed or draft pull request, and failing or unfinished checks, and after the
+  host merges it passes a stage waiting for the merge and starts a held stage. It is safe to call
+  twice. It does not mark a card done when no run waits, unlike the Go proto comment.
+  `SetMergeOrder` only checks the repos name the card's one repo and stores nothing.
+- `GetCard.pull_request.checks` is the stored summary (`passing`, `failing`, `pending`, or empty).
+  The proto `PullRequest` has no `approved` field. The Details tab shows the checks and the card
+  page has a Merge button for a person who can run; there is no merge order control.
+- Bugs fixed on the way: `orchestrator/run.rs` refused to skip a running wait stage although the
+  reducer allows it; the rpi `validate` stage showed nothing about what it waited for.
+- Untested against real GitHub (the replay server and `FakeCodeHost` stand in): the GraphQL
+  `markPullRequestReadyForReview` call, `PUT /pulls/N/merge`, the real shapes of check runs and
+  commit statuses, review verdict semantics, the GHE `/api/graphql` mapping, the rate limit
+  headers on these endpoints, branch protection and required reviews on merge, and the full `rpi`
+  run on a real issue (PRD done gate 1). Also not built: the `ci-failure` artifact that the rpi
+  `fix_ci` stage reads, and `check_openspec`.
+- Tests: core `tests/wait_stages.rs` (CI pass, fail, grace and timeout on a manual clock, poll
+  values, closed and hand-merged pull requests, labels, approval, event logging, the merge specs,
+  pause and skip of a wait, the rpi workflow resolving), `rules/wait.rs` units; api
+  `tests/merge.rs`; store `tests/postgres_pull_requests.rs` and `postgres_runs.rs`; binary
+  `tests/github_adapter.rs` and `tests/intake_loop.rs` (paused time).

@@ -442,6 +442,14 @@ pub fn check_action(stage: &Stage) -> Vec<Finding> {
 pub const OPEN_PULL_REQUEST: &str = "open_pull_request";
 /// The action that removes the card's worktree.
 pub const CLEANUP_WORKTREE: &str = "cleanup_worktree";
+/// The action that waits for labels or a pull request state, like a wait stage.
+pub const WAIT: &str = "wait";
+/// The action that waits for the pull request's checks.
+pub const WAIT_FOR_CI: &str = "wait_for_ci";
+/// The action that takes the pull request out of draft.
+pub const MARK_READY: &str = "mark_ready";
+/// The action that merges the pull request.
+pub const MERGE: &str = "merge";
 
 type With = BTreeMap<String, ActionArg>;
 

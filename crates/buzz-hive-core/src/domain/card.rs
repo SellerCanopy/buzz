@@ -84,7 +84,7 @@ pub fn card_branch(id: Uuid, title: &str) -> String {
 
 /// The pull request a card's `open_pull_request` stage opened. One row per card: a second
 /// visit to the stage finds the open pull request for the same branch and keeps it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PullRequest {
     /// The repo as `owner/name`.
     pub repo: String,
@@ -96,6 +96,11 @@ pub struct PullRequest {
     /// `open`, `closed` or `merged`.
     pub state: String,
     pub draft: bool,
+    /// A reviewer approved it and none has asked for changes since.
+    pub approved: bool,
+    /// How its checks stand as last read: empty when none were read, else `pending`, `passed`
+    /// or `failed`.
+    pub checks: String,
 }
 
 #[cfg(test)]

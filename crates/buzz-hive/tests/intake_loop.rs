@@ -10,7 +10,7 @@ use buzz_hive_core::background::intake::Gate;
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, RuleFilter};
-use buzz_hive_core::ports::code_host::HostError;
+use buzz_hive_core::ports::code_host::{CodeHost, HostError, NewPullRequest};
 use buzz_hive_core::ports::store::{CommunityId, Store};
 use buzz_hive_core::testing::{FakeCodeHost, FakeDirectory, MemStore};
 use buzz_hive_core::workflow::source::Sources;
@@ -369,6 +369,156 @@ async fn the_comments_of_a_working_card_are_read_on_a_timer() {
     // The wait after the first read was drawn at one half: 120 plus 24 seconds.
     h.pass(u64::from(COMMENT_INTERVAL_S) + 30).await;
     assert_eq!(reads(&h), 2);
+    h.finish().await;
+}
+
+/// A card that has an open pull request, on the host and in the store.
+async fn with_open_pull_request(h: &Harness) -> (Uuid, u64) {
+    let repo = repo("api");
+    let card = Card {
+        id: Uuid::new_v4(),
+        title: "Fix login".into(),
+        description: String::new(),
+        state: CardState::Running,
+        workflow: "rpi".into(),
+        archived: false,
+        created_by: "aa".into(),
+    };
+    h.mem.seed_card(COMMUNITY, card.clone());
+    let pull = h
+        .host
+        .open_pull_request(
+            &NewPullRequest {
+                repo: repo.clone(),
+                head: "buzz/fix".into(),
+                base: "main".into(),
+                title: "Fix login".into(),
+                body: String::new(),
+                draft: false,
+            },
+            "key",
+        )
+        .await
+        .unwrap();
+    let mut tx = h.mem.begin(COMMUNITY).await.unwrap();
+    tx.pull_requests().put(card.id, &pull).await.unwrap();
+    tx.commit().await.unwrap();
+    h.host.set_checks(
+        &repo,
+        pull.number,
+        vec![buzz_hive_core::ports::code_host::Check {
+            name: "build".into(),
+            state: buzz_hive_core::ports::code_host::CheckState::Passed,
+        }],
+    );
+    (card.id, pull.number)
+}
+
+fn pull_reads(h: &Harness) -> usize {
+    h.host
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("get_pull_request"))
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_pull_request_is_read_after_a_short_random_wait_and_then_every_minute() {
+    let h = start(&[], 0.5).await;
+    let (card, number) = with_open_pull_request(&h).await;
+    let repo = repo("api");
+    h.pass(5).await;
+    assert_eq!(
+        pull_reads(&h),
+        0,
+        "the first read waits a part of a fifth of a minute"
+    );
+    // Random 0.5: the card is due after 6 seconds and the loop looks every 11.
+    h.pass(7).await;
+    assert_eq!(pull_reads(&h), 1);
+    assert_eq!(
+        h.host
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("list_checks"))
+            .count(),
+        1,
+        "the checks of an open pull request are read with it"
+    );
+    let stored = |h: &Harness| {
+        let mem = h.mem.clone();
+        async move {
+            let mut tx = mem.begin(COMMUNITY).await.unwrap();
+            tx.pull_requests().by_card(card).await.unwrap().unwrap()
+        }
+    };
+    assert_eq!(stored(&h).await.checks, "passing");
+
+    // The next read is a minute and a tenth later, not every tick.
+    h.pass(60).await;
+    assert_eq!(pull_reads(&h), 1);
+    h.host.edit_pull(&repo, number, |pull| pull.approved = true);
+    h.pass(20).await;
+    assert_eq!(pull_reads(&h), 2);
+    assert!(stored(&h).await.approved);
+    let mut tx = h.mem.begin(COMMUNITY).await.unwrap();
+    let changed = tx
+        .events()
+        .after(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "pull_request.changed")
+        .count();
+    assert_eq!(changed, 2, "once for the checks, once for the approval");
+    drop(tx);
+
+    // A merged pull request is not read again: nothing waits on it.
+    h.host
+        .edit_pull(&repo, number, |pull| pull.state = "merged".into());
+    h.pass(80).await;
+    let reads = pull_reads(&h);
+    h.pass(300).await;
+    assert_eq!(pull_reads(&h), reads);
+    h.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_read_holds_the_loop_for_what_the_host_asked() {
+    let h = start(&[], 0.0).await;
+    with_open_pull_request(&h).await;
+    h.host.fail_next(HostError::RateLimited {
+        retry_after: Duration::from_secs(300),
+    });
+    h.pass(15).await;
+    assert_eq!(pull_reads(&h), 1, "the read that was refused");
+    h.pass(250).await;
+    assert_eq!(pull_reads(&h), 1, "nothing is read while the limit holds");
+    h.pass(80).await;
+    assert_eq!(pull_reads(&h), 2);
+    h.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_read_is_tried_again_after_a_doubling_wait() {
+    let h = start(&[], 0.0).await;
+    with_open_pull_request(&h).await;
+    h.host
+        .fail_next(HostError::Other("the host is down".into()));
+    h.host
+        .fail_next(HostError::Other("the host is down".into()));
+    h.pass(15).await;
+    assert_eq!(pull_reads(&h), 1);
+    // One failure: a wait of two minutes.
+    h.pass(100).await;
+    assert_eq!(pull_reads(&h), 1);
+    h.pass(40).await;
+    assert_eq!(pull_reads(&h), 2);
+    // Two failures: four minutes.
+    h.pass(200).await;
+    assert_eq!(pull_reads(&h), 2);
+    h.pass(60).await;
+    assert_eq!(pull_reads(&h), 3);
     h.finish().await;
 }
 

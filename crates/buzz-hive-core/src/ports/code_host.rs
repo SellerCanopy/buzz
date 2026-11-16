@@ -1,7 +1,8 @@
 //! The code host: where issues live. GitHub is the first adapter.
 //!
 //! A call may be repeated after a failure, so the calls that write take a key, and an adapter
-//! makes a repeat harmless. Later phases add the calls for checks and merging.
+//! makes a repeat harmless. Marking a pull request ready and merging it are harmless to repeat
+//! by their nature, so they take no key.
 
 use std::time::Duration;
 
@@ -74,6 +75,27 @@ pub trait CodeHost: Send + Sync {
         key: &str,
     ) -> Result<PullRequest, HostError>;
 
+    /// The pull request as the host has it now, with its labels. A pull request the token
+    /// cannot see is `NotFound`.
+    async fn get_pull_request(&self, repo: &RepoRef, number: u64) -> Result<PullStatus, HostError>;
+
+    /// The checks of the pull request's head commit, one per name. A head with none gives an
+    /// empty list.
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError>;
+
+    /// Takes a draft pull request out of draft. One that is ready already is left as it is.
+    async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError>;
+
+    /// Merges the pull request. One that is merged already is left as it is. `Rejected` means
+    /// the host refused: a conflict, a failing required check, a branch rule, or a closed pull
+    /// request.
+    async fn merge(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+    ) -> Result<(), HostError>;
+
     /// The repos the token reaches under `owner`, or every repo it reaches when empty.
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError>;
 
@@ -92,6 +114,63 @@ pub struct NewPullRequest {
     pub title: String,
     pub body: String,
     pub draft: bool,
+}
+
+/// A pull request as the host reports it now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullStatus {
+    /// Its state, whether a reviewer approved it, and the rest of what Beehive keeps. `checks`
+    /// is empty: the checks are read by `list_checks`.
+    pub pull: PullRequest,
+    pub labels: Vec<String>,
+}
+
+/// One check of a pull request's head commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub state: CheckState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    /// Queued or running.
+    Pending,
+    /// Succeeded, was skipped, or finished neutral.
+    Passed,
+    /// Failed, timed out, was cancelled, or needs action.
+    Failed,
+}
+
+/// How the host merges a pull request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMethod {
+    Merge,
+    #[default]
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The method a `merge` action's `method` argument names. An empty one is the default.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "" => Some(Self::default()),
+            "merge" => Some(Self::Merge),
+            "squash" => Some(Self::Squash),
+            "rebase" => Some(Self::Rebase),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
 }
 
 /// The most repos `list_repos` returns. A caller that gets this many knows the list may be cut.

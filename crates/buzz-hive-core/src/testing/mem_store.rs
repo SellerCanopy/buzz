@@ -576,6 +576,16 @@ impl RunsRepo for MemTx {
             .collect())
     }
 
+    async fn active(&mut self) -> Result<Vec<Run>, StoreError> {
+        Ok(self
+            .work
+            .runs
+            .iter()
+            .filter(|(c, r)| *c == self.community && r.state != RunState::Ended)
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+
     async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError> {
         Ok(self
             .work
@@ -1451,6 +1461,16 @@ impl PullRequestsRepo for MemTx {
 
     async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError> {
         Ok(self.work.pulls.get(&(self.community, card)).cloned())
+    }
+
+    async fn open(&mut self) -> Result<Vec<(uuid::Uuid, PullRequest)>, StoreError> {
+        Ok(self
+            .work
+            .pulls
+            .iter()
+            .filter(|((c, _), pull)| *c == self.community && pull.state == "open")
+            .map(|((_, card), pull)| (*card, pull.clone()))
+            .collect())
     }
 }
 

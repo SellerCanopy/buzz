@@ -68,6 +68,7 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
             url: pull.url,
             state: pull.state,
             draft: pull.draft,
+            checks: pull.checks,
             ..PullRequest::default()
         });
     proto.stages = tx

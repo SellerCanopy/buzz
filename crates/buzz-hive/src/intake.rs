@@ -1,5 +1,5 @@
-//! The loops that read the code host: one per enabled intake rule, and one for the comments
-//! on the issues of cards that are working.
+//! The loops that read the code host: one per enabled intake rule, one for the comments on the
+//! issues of cards that are working, and one for the pull requests of cards.
 //!
 //! What a pass does, and the schedule arithmetic, are in `buzz_hive_core::background`. This
 //! file only runs them on time. The rules a restart finds in the store start again, each after
@@ -9,8 +9,10 @@
 //! [`Gate`] holds the loops, and each starts again a little apart.
 //!
 //! Host calls: one list request per rule per interval (a `304` costs no quota), one read per
-//! issue that left a search, and one comment read per card that is running or waiting every
-//! [`COMMENT_INTERVAL_S`] seconds. Nothing reads the relay.
+//! issue that left a search, one comment read per card that is running or waiting every
+//! [`COMMENT_INTERVAL_S`] seconds, and, per card with an open pull request, a pull request read,
+//! a checks read and a reviews read (all conditional) every 60 seconds, or at the poll of the
+//! stage the card waits at. Nothing reads the relay.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use buzz_hive_core::background::comments::poll_comments;
 use buzz_hive_core::background::intake::{
     backoff, next_wake, rate_wait, record_failure, refresh_rule, start_delay, Gate, JITTER,
 };
+use buzz_hive_core::background::pull_requests::{sync_card, watched};
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::domain::intake::IntakeRule;
@@ -27,6 +30,7 @@ use buzz_hive_core::orchestrator::intake::{list_rules, IntakeError};
 use buzz_hive_core::orchestrator::{Env, OpError};
 use buzz_hive_core::ports::code_host::{CodeHost, HostError};
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
+use buzz_hive_core::rules::wait::DEFAULT_POLL;
 use buzz_hive_core::workflow::load::Catalog;
 use buzz_hive_core::workflow::source::CatalogSource;
 use chrono::Utc;
@@ -39,6 +43,9 @@ use crate::timers::sleep_or_stop;
 
 /// How often the comments of working cards are read, in seconds.
 pub const COMMENT_INTERVAL_S: u32 = 120;
+/// How often the pull request loop looks for a card that is due, in seconds. A card is read at
+/// its own poll, so this is the shortest poll a stage can have.
+pub const PULL_TICK_S: u64 = 10;
 /// How long the supervisor waits for a wake that was lost before it reads the rules again.
 const BACKSTOP: Duration = Duration::from_secs(15 * 60);
 /// How long shutdown waits for a pass in flight.
@@ -109,6 +116,7 @@ impl IntakeSupervisor {
     /// Runs until `stop` changes.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let comments = tokio::spawn(comment_loop(self.shared.clone(), stop.clone()));
+        let pulls = tokio::spawn(pull_request_loop(self.shared.clone(), stop.clone()));
         let mut running: HashMap<Uuid, Running> = HashMap::new();
         let mut failures = 0u32;
         loop {
@@ -141,7 +149,7 @@ impl IntakeSupervisor {
                 let _ = r.stop.send(true);
                 r.task
             })
-            .chain(std::iter::once(comments))
+            .chain([comments, pulls])
             .collect();
         for mut task in tasks {
             if tokio::time::timeout(STOP_GRACE, &mut task).await.is_err() {
@@ -322,6 +330,81 @@ async fn comment_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
             }
         };
         if sleep_or_stop(wait, &mut stop).await {
+            return;
+        }
+    }
+}
+
+/// Reads the pull request of every card that has one open, and of every card whose run waits on
+/// outside state, each at its own pace: the poll of the stage it waits at, or a minute. A card
+/// seen for the first time is read after a short random delay, so a restart does not read every
+/// card together, and a card that fails is read again after a doubling wait.
+async fn pull_request_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    use tokio::time::Instant;
+    let default_poll = DEFAULT_POLL.as_secs() as u32;
+    // When each card is next read, and how many reads of it have failed in a row.
+    let mut due: HashMap<Uuid, (Instant, u32)> = HashMap::new();
+    let mut limits = 0u32;
+    loop {
+        if gate_open(&shared.gate, &mut stop).await {
+            return;
+        }
+        let catalog = shared.catalog.load();
+        let env = shared.env(&catalog);
+        match watched(&env, shared.community).await {
+            Ok(cards) => {
+                due.retain(|id, _| cards.contains(id));
+                for card in cards {
+                    let first = Instant::now() + start_delay(default_poll, shared.unit());
+                    let (at, failures) = *due.entry(card).or_insert((first, 0));
+                    if at > Instant::now() {
+                        continue;
+                    }
+                    if *stop.borrow() {
+                        return;
+                    }
+                    let read = sync_card(
+                        &env,
+                        shared.host.as_ref(),
+                        shared.community,
+                        card,
+                        Utc::now(),
+                    )
+                    .await;
+                    let (wait, failures) = match read {
+                        Ok(synced) => {
+                            limits = 0;
+                            shared.publish(&synced.events);
+                            if synced.moved {
+                                shared.outbox.notify_one();
+                            }
+                            (shared.jittered(synced.poll), 0)
+                        }
+                        Err(IntakeError::Host(HostError::RateLimited { retry_after })) => {
+                            limits = limits.saturating_add(1);
+                            let hold = rate_wait(retry_after, default_poll, limits);
+                            shared.gate.hold(hold).await;
+                            tracing::warn!(
+                                wait_s = hold.as_secs(),
+                                "GitHub rate limit; pull request reads wait"
+                            );
+                            // Nothing else is read until the limit lifts: the pass ends here.
+                            due.insert(card, (Instant::now() + shared.jittered(hold), failures));
+                            break;
+                        }
+                        Err(error) => {
+                            let failures = failures.saturating_add(1);
+                            tracing::warn!(%card, %error, failures, "pull request read failed");
+                            (shared.jittered(backoff(default_poll, failures)), failures)
+                        }
+                    };
+                    due.insert(card, (Instant::now() + wait, failures));
+                }
+            }
+            Err(error) => tracing::warn!(%error, "cannot read the cards to watch"),
+        }
+        let tick = shared.jittered(Duration::from_secs(PULL_TICK_S));
+        if sleep_or_stop(tick, &mut stop).await {
             return;
         }
     }

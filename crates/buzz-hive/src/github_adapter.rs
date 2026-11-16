@@ -16,7 +16,9 @@ use buzz_hive_core::domain::card::PullRequest;
 use buzz_hive_core::domain::intake::{
     Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef,
 };
-use buzz_hive_core::ports::code_host::{CodeHost, HostError, NewPullRequest, MAX_REPOS};
+use buzz_hive_core::ports::code_host::{
+    Check, CheckState, CodeHost, HostError, MergeMethod, NewPullRequest, PullStatus, MAX_REPOS,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ETAG, IF_NONE_MATCH, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
@@ -144,9 +146,18 @@ impl GitHub {
     }
 
     async fn post(&self, url: Url, body: &Value) -> Result<Value, HostError> {
+        self.send(reqwest::Method::POST, url, body).await
+    }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: Url,
+        body: &Value,
+    ) -> Result<Value, HostError> {
         let response = self
             .client
-            .post(url)
+            .request(method, url)
             .json(body)
             .send()
             .await
@@ -159,6 +170,62 @@ impl GitHub {
         }
         serde_json::from_slice(&bytes)
             .map_err(|e| HostError::Other(format!("GitHub sent a reply that is not JSON ({e})")))
+    }
+
+    /// One pull request, as the host's own JSON.
+    async fn pull_item(&self, repo: &RepoRef, number: u64) -> Result<Arc<Value>, HostError> {
+        let number = number.to_string();
+        let url = self.url(&["repos", &repo.owner, &repo.name, "pulls", &number], &[]);
+        Ok(self.get(url).await?.0)
+    }
+
+    /// Whether a reviewer approved the pull request and none still asks for changes. Only a
+    /// reviewer's latest verdict counts, and a dismissed review counts for nothing.
+    async fn approved(&self, repo: &RepoRef, number: u64) -> Result<bool, HostError> {
+        let number = number.to_string();
+        let url = self.url(
+            &[
+                "repos",
+                &repo.owner,
+                &repo.name,
+                "pulls",
+                &number,
+                "reviews",
+            ],
+            &[("per_page", "100".to_owned())],
+        );
+        let (body, _) = self.get(url).await?;
+        let mut verdicts: HashMap<String, String> = HashMap::new();
+        for review in items(&body) {
+            let who = review
+                .get("user")
+                .map(|u| text(u, "login"))
+                .unwrap_or_default();
+            match text(&review, "state").as_str() {
+                state @ ("APPROVED" | "CHANGES_REQUESTED") => {
+                    verdicts.insert(who, state.to_owned());
+                }
+                "DISMISSED" => {
+                    verdicts.remove(&who);
+                }
+                _ => {}
+            }
+        }
+        Ok(verdicts.values().any(|v| v == "APPROVED")
+            && !verdicts.values().any(|v| v == "CHANGES_REQUESTED"))
+    }
+
+    /// The address of the GraphQL API that goes with the REST API at the base address.
+    fn graphql_url(&self) -> Url {
+        let mut url = self.base.clone();
+        let path = url.path().trim_end_matches('/').to_owned();
+        // GitHub Enterprise serves REST under `/api/v3` and GraphQL under `/api/graphql`.
+        let path = match path.strip_suffix("/v3") {
+            Some(root) => format!("{root}/graphql"),
+            None => format!("{path}/graphql"),
+        };
+        url.set_path(&path);
+        url
     }
 
     /// The open pull request whose head is the branch `head` of `repo`, if there is one.
@@ -368,6 +435,152 @@ impl CodeHost for GitHub {
         }
     }
 
+    async fn get_pull_request(&self, repo: &RepoRef, number: u64) -> Result<PullStatus, HostError> {
+        let item = self.pull_item(repo, number).await?;
+        let mut pull = pull_from(&item, repo)
+            .ok_or_else(|| HostError::NotFound(format!("{repo}#{number} is not a pull request")))?;
+        if pull.state == "open" {
+            pull.approved = self.approved(repo, number).await?;
+        }
+        let labels = item
+            .get("labels")
+            .map(items)
+            .unwrap_or_default()
+            .iter()
+            .map(|label| text(label, "name"))
+            .collect();
+        Ok(PullStatus { pull, labels })
+    }
+
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError> {
+        let item = self.pull_item(repo, number).await?;
+        let sha = item
+            .get("head")
+            .map(|head| text(head, "sha"))
+            .filter(|sha| !sha.is_empty())
+            .ok_or_else(|| {
+                HostError::Other("GitHub's reply for the pull request has no head".into())
+            })?;
+        let runs = self.url(
+            &[
+                "repos",
+                &repo.owner,
+                &repo.name,
+                "commits",
+                &sha,
+                "check-runs",
+            ],
+            &[("per_page", "100".to_owned())],
+        );
+        let statuses = self.url(
+            &["repos", &repo.owner, &repo.name, "commits", &sha, "status"],
+            &[("per_page", "100".to_owned())],
+        );
+        let (runs, _) = self.get(runs).await?;
+        let (statuses, _) = self.get(statuses).await?;
+        let mut checks: Vec<Check> = Vec::new();
+        let run_items = runs.get("check_runs").map(items).unwrap_or_default();
+        let status_items = statuses.get("statuses").map(items).unwrap_or_default();
+        let found = run_items
+            .iter()
+            .map(|run| {
+                let state = match (
+                    text(run, "status").as_str(),
+                    text(run, "conclusion").as_str(),
+                ) {
+                    ("completed", "success" | "neutral" | "skipped") => CheckState::Passed,
+                    ("completed", _) => CheckState::Failed,
+                    _ => CheckState::Pending,
+                };
+                (text(run, "name"), state)
+            })
+            .chain(status_items.iter().map(|status| {
+                let state = match text(status, "state").as_str() {
+                    "success" => CheckState::Passed,
+                    "failure" | "error" => CheckState::Failed,
+                    _ => CheckState::Pending,
+                };
+                (text(status, "context"), state)
+            }));
+        // A check that ran again is listed again: the last one stands.
+        for (name, state) in found {
+            checks.retain(|have| have.name != name);
+            checks.push(Check { name, state });
+        }
+        Ok(checks)
+    }
+
+    async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError> {
+        let item = self.pull_item(repo, number).await?;
+        match pull_from(&item, repo).map(|pull| pull.state) {
+            Some(state) if state != "open" => {
+                return Err(HostError::Rejected(format!("{repo}#{number} is {state}")))
+            }
+            None => {
+                return Err(HostError::NotFound(format!(
+                    "{repo}#{number} is not a pull request"
+                )))
+            }
+            _ => {}
+        }
+        // Ready already: a repeat after a failure has nothing to do.
+        if !item.get("draft").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(());
+        }
+        let id = text(&item, "node_id");
+        if id.is_empty() {
+            return Err(HostError::Other(
+                "GitHub's reply for the pull request has no node id".into(),
+            ));
+        }
+        // The REST API cannot take a pull request out of draft; GraphQL can.
+        let answer = self
+            .post(
+                self.graphql_url(),
+                &json!({
+                    "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { isDraft } } }",
+                    "variables": { "id": id },
+                }),
+            )
+            .await?;
+        // GraphQL answers 200 even when it refuses.
+        match answer
+            .get("errors")
+            .and_then(Value::as_array)
+            .and_then(|e| e.first())
+        {
+            Some(error) => Err(HostError::Rejected(
+                text(error, "message").chars().take(200).collect(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    async fn merge(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+    ) -> Result<(), HostError> {
+        // Merged already: a repeat after a failure has nothing to do.
+        let item = self.pull_item(repo, number).await?;
+        if pull_from(&item, repo).is_some_and(|pull| pull.state == "merged") {
+            return Ok(());
+        }
+        let number = number.to_string();
+        let url = self.url(
+            &["repos", &repo.owner, &repo.name, "pulls", &number, "merge"],
+            &[],
+        );
+        self.send(
+            reqwest::Method::PUT,
+            url,
+            &json!({ "merge_method": method.as_str() }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {
         let mut repos = Vec::new();
         let pages = MAX_REPOS.div_ceil(100) as u32;
@@ -466,6 +679,8 @@ fn classify_at(
     match status {
         StatusCode::UNAUTHORIZED => HostError::Unauthorized(message),
         StatusCode::NOT_FOUND | StatusCode::GONE => HostError::NotFound(message),
+        // A merge the host refuses: not mergeable, or the head moved since it was read.
+        StatusCode::METHOD_NOT_ALLOWED | StatusCode::CONFLICT => HostError::Rejected(message),
         StatusCode::UNPROCESSABLE_ENTITY => HostError::Rejected(
             // The reason that names the field, such as a head branch that is not on the host, is
             // in `errors`, not in the message.
@@ -608,6 +823,7 @@ fn pull_from(item: &Value, repo: &RepoRef) -> Option<PullRequest> {
         base: branch("base"),
         state: state.to_owned(),
         draft: item.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        ..PullRequest::default()
     })
 }
 

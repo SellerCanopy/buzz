@@ -11,6 +11,7 @@ mod artifacts;
 mod cards;
 mod inbox;
 pub mod intake;
+mod merge;
 pub mod poll;
 mod runs;
 mod settings;
@@ -94,6 +95,8 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListOwners", Level::Read),
     ("SearchIssues", Level::Read),
     ("ListIssueComments", Level::Read),
+    ("MergeCard", Level::Run),
+    ("SetMergeOrder", Level::Run),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -223,5 +226,7 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListOwners", intake::list_owners);
     let r = route(r, "SearchIssues", intake::search_issues);
     let r = route(r, "ListIssueComments", intake::list_issue_comments);
+    let r = route(r, "MergeCard", merge::merge_card);
+    let r = route(r, "SetMergeOrder", merge::set_merge_order);
     route(r, "GetUsage", status::get_usage)
 }

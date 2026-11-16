@@ -104,6 +104,10 @@ pub struct RunStep {
     /// Answers a person has given the stage's agent while the run waited at the stage.
     #[serde(default)]
     pub answers: u32,
+    /// When the stage was entered, as the store saw it. A wait for CI gives checks that have not
+    /// appeared yet a grace period from here. `None` for a step made before it was kept.
+    #[serde(default)]
+    pub entered_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

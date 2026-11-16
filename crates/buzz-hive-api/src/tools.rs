@@ -392,6 +392,14 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "the Issue tab reads the comments live; an agent gets the ones a rule trusts in its stage thread",
     ),
     (
+        "MergeCard",
+        "a person's call from the card page; the engine refuses an agent, so the shim offers no tool. A workflow merges by its own merge stage",
+    ),
+    (
+        "SetMergeOrder",
+        "a person's call from the card page; the engine refuses an agent, so the shim offers no tool",
+    ),
+    (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
     ),

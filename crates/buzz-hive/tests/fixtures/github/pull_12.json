@@ -1,0 +1,23 @@
+{
+  "number": 12,
+  "state": "open",
+  "draft": false,
+  "merged": false,
+  "node_id": "PR_example12",
+  "html_url": "https://github.example.org/example-org/api/pull/12",
+  "head": {
+    "ref": "buzz/8b93fa58-fix-login",
+    "sha": "abc123"
+  },
+  "base": {
+    "ref": "main"
+  },
+  "labels": [
+    {
+      "name": "ready"
+    },
+    {
+      "name": "kiln"
+    }
+  ]
+}

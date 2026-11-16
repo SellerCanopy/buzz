@@ -1093,6 +1093,17 @@ impl RunsRepo for PgTx {
         rows.into_iter().map(decode_run).collect()
     }
 
+    async fn active(&mut self) -> Result<Vec<Run>, StoreError> {
+        let rows: Vec<RunRow> = sqlx::query_as(select_run!(
+            "WHERE community_id = $1 AND state <> 'ended' ORDER BY started_at, id"
+        ))
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_run).collect()
+    }
+
     async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError> {
         let row: Option<RunRow> = sqlx::query_as(select_run!(
             "WHERE community_id = $1 AND card_id = $2 AND state <> 'ended'"
@@ -1883,11 +1894,12 @@ impl PullRequestsRepo for PgTx {
     async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO hive.pull_requests (community_id, card_id, repo, number, url, head, \
-             base, state, draft) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             base, state, draft, approved, checks) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (community_id, card_id) DO UPDATE SET repo = EXCLUDED.repo, \
              number = EXCLUDED.number, url = EXCLUDED.url, head = EXCLUDED.head, \
              base = EXCLUDED.base, state = EXCLUDED.state, draft = EXCLUDED.draft, \
-             updated_at = now()",
+             approved = EXCLUDED.approved, checks = EXCLUDED.checks, updated_at = now()",
         )
         .bind(self.community)
         .bind(card)
@@ -1898,6 +1910,8 @@ impl PullRequestsRepo for PgTx {
         .bind(&pull.base)
         .bind(&pull.state)
         .bind(pull.draft)
+        .bind(pull.approved)
+        .bind(&pull.checks)
         .execute(&mut *self.tx)
         .await
         .map_err(store_error)?;
@@ -1905,26 +1919,62 @@ impl PullRequestsRepo for PgTx {
     }
 
     async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError> {
-        let row: Option<(String, i64, String, String, String, String, bool)> = sqlx::query_as(
-            "SELECT repo, number, url, head, base, state, draft FROM hive.pull_requests \
-             WHERE community_id = $1 AND card_id = $2",
+        let row: Option<PullRow> = sqlx::query_as(
+            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks \
+             FROM hive.pull_requests WHERE community_id = $1 AND card_id = $2",
         )
         .bind(self.community)
         .bind(card)
         .fetch_optional(&mut *self.tx)
         .await
         .map_err(store_error)?;
-        Ok(row.map(
-            |(repo, number, url, head, base, state, draft)| PullRequest {
-                repo,
-                number: number as u64,
-                url,
-                head,
-                base,
-                state,
-                draft,
+        Ok(row.map(|row| row.into_pull().1))
+    }
+
+    async fn open(&mut self) -> Result<Vec<(uuid::Uuid, PullRequest)>, StoreError> {
+        let rows: Vec<PullRow> = sqlx::query_as(
+            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks \
+             FROM hive.pull_requests WHERE community_id = $1 AND state = 'open' \
+             ORDER BY updated_at, card_id",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(rows.into_iter().map(PullRow::into_pull).collect())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PullRow {
+    card_id: uuid::Uuid,
+    repo: String,
+    number: i64,
+    url: String,
+    head: String,
+    base: String,
+    state: String,
+    draft: bool,
+    approved: bool,
+    checks: String,
+}
+
+impl PullRow {
+    fn into_pull(self) -> (uuid::Uuid, PullRequest) {
+        (
+            self.card_id,
+            PullRequest {
+                repo: self.repo,
+                number: self.number as u64,
+                url: self.url,
+                head: self.head,
+                base: self.base,
+                state: self.state,
+                draft: self.draft,
+                approved: self.approved,
+                checks: self.checks,
             },
-        ))
+        )
     }
 }
 

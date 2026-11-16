@@ -17,7 +17,7 @@ use crate::domain::events::{Actor, Event};
 use crate::domain::intake::RepoRef;
 use crate::ports::code_host::{CodeHost, HostError, NewPullRequest};
 use crate::ports::relay::{Delivery, Relay, RelayError};
-use crate::ports::store::{OutboxRow, Posting, StageThread, StoreError};
+use crate::ports::store::{OutboxRow, Posting, PullCall, StageThread, StoreError};
 use crate::workflow::source::CatalogSource;
 
 /// How long a drainer owns a post it claimed. It is longer than the relay adapter's
@@ -101,8 +101,11 @@ pub async fn drain_outbox_with(
         };
         tx.commit().await?;
 
-        let sent = if matches!(row.posting, Posting::PullRequest { .. }) {
-            open_pull_request(env, community, actions, &row)
+        let sent = if matches!(
+            row.posting,
+            Posting::PullRequest { .. } | Posting::PullCall { .. }
+        ) {
+            host_call(env, community, actions, &row)
                 .await
                 .map(|events| {
                     drained.events.extend(events);
@@ -134,10 +137,11 @@ pub async fn drain_outbox_with(
     }
 }
 
-/// Makes the call of `row`, a pull request, and reports its stage's result. `Err` is the cause
-/// of a failure to try again: the host is busy or down, or the stage could not be told. A host
-/// that refuses the call, or none at all, is the stage's failure, not the drain's.
-async fn open_pull_request(
+/// Makes the call of `row`, a pull request or a call on one, and reports its stage's result.
+/// `Err` is the cause of a failure to try again: the host is busy or down, or the stage could
+/// not be told. A host that refuses the call, or none at all, is the stage's failure, not the
+/// drain's.
+async fn host_call(
     env: &Env<'_>,
     community: Uuid,
     actions: Option<&Actions<'_>>,
@@ -151,47 +155,71 @@ async fn open_pull_request(
         catalog: &catalog,
         ..*env
     };
-    let Posting::PullRequest {
-        repo,
-        head,
-        base,
-        title,
-        body,
-        draft,
-        ..
-    } = &row.posting
-    else {
-        return Err("the post is not a pull request".into());
-    };
     let wanted = pull_request::wanted(env, community, row)
         .await
         .map_err(|error| error.to_string())?;
-    let outcome = match (host, RepoRef::parse(repo)) {
-        _ if !wanted => Err("the run no longer waits for the pull request".to_owned()),
-        (_, Err(reason)) => Err(reason),
-        (None, _) => Err("no code host is set up; set GH_TOKEN for buzz-hive".to_owned()),
-        (Some(host), Ok(repo)) => {
-            let request = NewPullRequest {
-                repo,
-                head: head.clone(),
-                base: base.clone(),
-                title: title.clone(),
-                body: body.clone(),
-                draft: *draft,
-            };
-            match host.open_pull_request(&request, &row.key).await {
-                Ok(pull) => Ok(pull),
-                Err(error @ (HostError::RateLimited { .. } | HostError::Other(_))) => {
-                    return Err(error.to_string())
+    // A busy or broken host is not the stage's failure: the call is made again.
+    let retry =
+        |error: &HostError| matches!(error, HostError::RateLimited { .. } | HostError::Other(_));
+    let finished = match &row.posting {
+        Posting::PullRequest {
+            repo,
+            head,
+            base,
+            title,
+            body,
+            draft,
+            ..
+        } => {
+            let outcome = match (host, RepoRef::parse(repo)) {
+                _ if !wanted => Err("the run no longer waits for the pull request".to_owned()),
+                (_, Err(reason)) => Err(reason),
+                (None, _) => Err(NO_HOST.to_owned()),
+                (Some(host), Ok(repo)) => {
+                    let request = NewPullRequest {
+                        repo,
+                        head: head.clone(),
+                        base: base.clone(),
+                        title: title.clone(),
+                        body: body.clone(),
+                        draft: *draft,
+                    };
+                    match host.open_pull_request(&request, &row.key).await {
+                        Ok(pull) => Ok(pull),
+                        Err(error) if retry(&error) => return Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
-                Err(error) => Err(error.to_string()),
-            }
+            };
+            pull_request::finish(env, community, row, outcome).await
         }
+        Posting::PullCall {
+            repo, number, call, ..
+        } => {
+            let outcome = match (host, RepoRef::parse(repo)) {
+                _ if !wanted => Err("the run no longer waits for the pull request".to_owned()),
+                (_, Err(reason)) => Err(reason),
+                (None, _) => Err(NO_HOST.to_owned()),
+                (Some(host), Ok(repo)) => {
+                    let made = match call {
+                        PullCall::MarkReady => host.mark_ready(&repo, *number).await,
+                        PullCall::Merge { method } => host.merge(&repo, *number, *method).await,
+                    };
+                    match made {
+                        Ok(()) => Ok(()),
+                        Err(error) if retry(&error) => return Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+            };
+            pull_request::finish_call(env, community, row, outcome).await
+        }
+        _ => return Err("the post is not a call to the code host".into()),
     };
-    pull_request::finish(env, community, row, outcome)
-        .await
-        .map_err(|error| error.to_string())
+    finished.map_err(|error| error.to_string())
 }
+
+const NO_HOST: &str = "no code host is set up; set GH_TOKEN for buzz-hive";
 
 /// Records a post the relay accepted: marks it done and, for a stage task, keeps the thread
 /// it opened. Returns false when the card was deleted while the post was in flight, because
@@ -275,8 +303,8 @@ async fn send(
                 .post_stage_task(*channel, agent, text, &delivery)
                 .await
         }
-        Posting::PullRequest { .. } => Err(RelayError::Unavailable(
-            "a pull request is not a post for the relay".into(),
+        Posting::PullRequest { .. } | Posting::PullCall { .. } => Err(RelayError::Unavailable(
+            "a call to the code host is not a post for the relay".into(),
         )),
         Posting::StageReply {
             channel,

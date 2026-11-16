@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use buzz_hive::github_adapter::GitHub;
 use buzz_hive_core::domain::intake::{IssueFilter, IssueState, Page, RepoRef};
-use buzz_hive_core::ports::code_host::{CodeHost, HostError, NewPullRequest};
+use buzz_hive_core::ports::code_host::{
+    CheckState, CodeHost, HostError, MergeMethod, NewPullRequest,
+};
 use chrono::{TimeZone, Utc};
 use support::github_replay::{Exchange, Replay};
 
@@ -520,6 +522,190 @@ async fn an_enterprise_address_with_a_path_keeps_it() {
     let github = GitHub::new(&format!("{}/api/v3/", replay.url()), TOKEN).unwrap();
     assert_eq!(github.get_issue(&repo(), 42).await.unwrap().number, 42);
     replay.finish();
+}
+
+const PULL_12: &str = "/repos/example-org/api/pulls/12";
+
+fn merged_pull() -> &'static str {
+    r#"{"number":12,"state":"closed","merged_at":"2026-03-01T10:00:00Z","head":{"ref":"b"},"base":{"ref":"main"}}"#
+}
+
+#[tokio::test]
+async fn a_pull_request_is_read_with_its_labels_and_the_latest_verdict_of_each_reviewer() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::get("/repos/example-org/api/pulls/12/reviews").fixture("reviews_12.json"),
+    ])
+    .await;
+    let status = github(&replay)
+        .await
+        .get_pull_request(&repo(), 12)
+        .await
+        .unwrap();
+    assert_eq!(status.pull.state, "open");
+    assert!(!status.pull.draft);
+    assert_eq!(status.labels, ["ready", "kiln"]);
+    // octo asked for changes and then approved; mona's approval was dismissed.
+    assert!(status.pull.approved);
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_reviewer_who_still_asks_for_changes_blocks_approval_and_a_merged_pull_is_not_asked() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::get("/repos/example-org/api/pulls/12/reviews").body(
+            r#"[{"user":{"login":"octo"},"state":"APPROVED"},{"user":{"login":"mona"},"state":"CHANGES_REQUESTED"}]"#,
+        ),
+        // A merged pull request's reviews are not read: nothing waits on them.
+        Exchange::get(PULL_12).body(merged_pull()),
+    ])
+    .await;
+    let github = github(&replay).await;
+    assert!(
+        !github
+            .get_pull_request(&repo(), 12)
+            .await
+            .unwrap()
+            .pull
+            .approved
+    );
+    let merged = github.get_pull_request(&repo(), 12).await.unwrap();
+    assert_eq!(merged.pull.state, "merged");
+    assert!(!merged.pull.approved);
+    replay.finish();
+}
+
+#[tokio::test]
+async fn checks_come_from_check_runs_and_statuses_and_the_last_run_of_a_name_stands() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::get("/repos/example-org/api/commits/abc123/check-runs")
+            .fixture("check_runs_abc123.json"),
+        Exchange::get("/repos/example-org/api/commits/abc123/status").fixture("status_abc123.json"),
+    ])
+    .await;
+    let checks = github(&replay)
+        .await
+        .list_checks(&repo(), 12)
+        .await
+        .unwrap();
+    let seen: Vec<(&str, CheckState)> = checks.iter().map(|c| (c.name.as_str(), c.state)).collect();
+    assert_eq!(
+        seen,
+        [
+            ("lint", CheckState::Passed),
+            ("docs", CheckState::Passed),
+            ("e2e", CheckState::Pending),
+            ("build", CheckState::Passed),
+            ("ci/legacy", CheckState::Passed),
+            ("ci/deploy", CheckState::Pending),
+        ]
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_draft_is_marked_ready_through_graphql_and_a_ready_one_is_left_alone() {
+    let draft = r#"{"number":12,"state":"open","draft":true,"node_id":"PR_example12","head":{"ref":"b"},"base":{"ref":"main"}}"#;
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).body(draft),
+        Exchange::post("/graphql").body(
+            r#"{"data":{"markPullRequestReadyForReview":{"pullRequest":{"isDraft":false}}}}"#,
+        ),
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+    ])
+    .await;
+    let github = github(&replay).await;
+    github.mark_ready(&repo(), 12).await.unwrap();
+    github.mark_ready(&repo(), 12).await.unwrap();
+    let posts: Vec<_> = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1, "the ready pull request was not sent again");
+    let sent: serde_json::Value = serde_json::from_str(&posts[0].body).unwrap();
+    assert_eq!(sent["variables"]["id"], "PR_example12");
+    assert!(sent["query"]
+        .as_str()
+        .unwrap()
+        .contains("markPullRequestReadyForReview"));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn graphql_refusing_a_ready_mark_is_a_rejection_and_an_enterprise_path_keeps_its_root() {
+    let draft = r#"{"number":12,"state":"open","draft":true,"node_id":"PR_example12","head":{"ref":"b"},"base":{"ref":"main"}}"#;
+    let replay = Replay::start(vec![
+        Exchange::get("/api/v3/repos/example-org/api/pulls/12").body(draft),
+        // GraphQL answers 200 even when it refuses.
+        Exchange::post("/api/graphql").body(
+            r#"{"errors":[{"message":"Pull request is in a state that cannot be marked ready"}]}"#,
+        ),
+    ])
+    .await;
+    let github = GitHub::new(&format!("{}/api/v3/", replay.url()), TOKEN).unwrap();
+    match github.mark_ready(&repo(), 12).await.unwrap_err() {
+        HostError::Rejected(message) => {
+            assert!(message.contains("cannot be marked ready"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_merge_names_its_method_and_a_merged_pull_request_is_not_merged_again() {
+    let merge = "/repos/example-org/api/pulls/12/merge";
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::put(merge).body(r#"{"merged":true}"#),
+        Exchange::get(PULL_12).body(merged_pull()),
+    ])
+    .await;
+    let github = github(&replay).await;
+    github
+        .merge(&repo(), 12, MergeMethod::Rebase)
+        .await
+        .unwrap();
+    github
+        .merge(&repo(), 12, MergeMethod::Rebase)
+        .await
+        .unwrap();
+    let puts: Vec<_> = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT")
+        .collect();
+    assert_eq!(puts.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&puts[0].body).unwrap();
+    assert_eq!(sent, serde_json::json!({ "merge_method": "rebase" }));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_merge_github_refuses_is_a_rejection_with_its_reason() {
+    let merge = "/repos/example-org/api/pulls/12/merge";
+    for status in [405, 409] {
+        let replay = Replay::start(vec![
+            Exchange::get(PULL_12).fixture("pull_12.json"),
+            Exchange::put(merge)
+                .status(status)
+                .body(r#"{"message":"Pull Request is not mergeable"}"#),
+        ])
+        .await;
+        match github(&replay)
+            .await
+            .merge(&repo(), 12, MergeMethod::Squash)
+            .await
+            .unwrap_err()
+        {
+            HostError::Rejected(message) => assert!(message.contains("not mergeable"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        replay.finish();
+    }
 }
 
 #[tokio::test]

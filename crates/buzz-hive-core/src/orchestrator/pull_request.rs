@@ -1,5 +1,5 @@
-//! The `open_pull_request` action: what is asked of the code host, and what the stage reports
-//! when the host has answered.
+//! The actions that call the code host through the outbox (`open_pull_request`, `mark_ready` and
+//! `merge`): what is asked of the host, and what the stage reports when the host has answered.
 //!
 //! The call is queued in the transaction that enters the stage (see `routes::apply`), like a
 //! post, and the drain makes it. A call that is repeated after a failure finds the pull request
@@ -14,7 +14,7 @@ use crate::domain::card::{card_branch, Card, PullRequest};
 use crate::domain::events::{Actor, Event};
 use crate::domain::run::{Run, RunState};
 use crate::domain::workflow::{ActionArg, RESULT_FAILED, RESULT_PASSED};
-use crate::ports::store::{CommunityId, OutboxRow, Posting, Tx};
+use crate::ports::store::{CommunityId, OutboxRow, Posting, PullCall, Tx};
 use crate::rules::run::{step, Input};
 use crate::workflow::load::Package;
 use crate::workflow::names::valid_branch_name;
@@ -122,9 +122,78 @@ pub async fn finish(
     row: &OutboxRow,
     outcome: Result<PullRequest, String>,
 ) -> Result<Vec<Event>, OpError> {
-    let Posting::PullRequest { stage, visit, .. } = &row.posting else {
+    let (put, result, summary) = match outcome {
+        Ok(pull) => {
+            let summary = format!(
+                "opened {}pull request #{} in {}: {}",
+                if pull.draft { "draft " } else { "" },
+                pull.number,
+                pull.repo,
+                pull.url
+            );
+            (Put::Pull(pull), RESULT_PASSED, summary)
+        }
+        Err(reason) => (Put::Nothing, RESULT_FAILED, reason),
+    };
+    settle(env, community, row, put, result, summary).await
+}
+
+/// What the stage reports once the call of `row`, a [`Posting::PullCall`], is answered. A call
+/// that worked updates the stored pull request (ready, or merged) and passes the stage; one the
+/// host refused fails it with the host's reason.
+pub async fn finish_call(
+    env: &Env<'_>,
+    community: CommunityId,
+    row: &OutboxRow,
+    outcome: Result<(), String>,
+) -> Result<Vec<Event>, OpError> {
+    let Posting::PullCall {
+        repo, number, call, ..
+    } = &row.posting
+    else {
         return Err(OpError::InvalidArgument(
-            "the post is not a pull request".into(),
+            "the post is not a pull request call".into(),
+        ));
+    };
+    let (put, result, summary) = match (outcome, call) {
+        (Ok(()), PullCall::MarkReady) => (
+            Put::Ready,
+            RESULT_PASSED,
+            format!("marked pull request #{number} in {repo} ready for review"),
+        ),
+        (Ok(()), PullCall::Merge { method }) => (
+            Put::Merged,
+            RESULT_PASSED,
+            format!(
+                "merged pull request #{number} in {repo} ({})",
+                method.as_str()
+            ),
+        ),
+        (Err(reason), _) => (Put::Nothing, RESULT_FAILED, reason),
+    };
+    settle(env, community, row, put, result, summary).await
+}
+
+/// What a finished call changes in the card's stored pull request.
+enum Put {
+    Nothing,
+    /// The pull request the host opened or found.
+    Pull(PullRequest),
+    Ready,
+    Merged,
+}
+
+async fn settle(
+    env: &Env<'_>,
+    community: CommunityId,
+    row: &OutboxRow,
+    put: Put,
+    result: &str,
+    summary: String,
+) -> Result<Vec<Event>, OpError> {
+    let Some((stage, visit)) = awaited(&row.posting) else {
+        return Err(OpError::InvalidArgument(
+            "the post is not a pull request call".into(),
         ));
     };
     let ctx = Ctx {
@@ -140,7 +209,19 @@ pub async fn finish(
     let Some(mut card) = tx.cards().get_for_update(row.card_id).await? else {
         return done(tx, row.id).await;
     };
-    if let Ok(pull) = &outcome {
+    let stored = match put {
+        Put::Nothing => None,
+        Put::Pull(pull) => Some(pull),
+        Put::Ready => tx.pull_requests().by_card(card.id).await?.map(|mut pull| {
+            pull.draft = false;
+            pull
+        }),
+        Put::Merged => tx.pull_requests().by_card(card.id).await?.map(|mut pull| {
+            pull.state = "merged".into();
+            pull
+        }),
+    };
+    if let Some(pull) = &stored {
         tx.pull_requests().put(card.id, pull).await?;
     }
     let Some(active) = tx.runs().active_for_card(card.id).await? else {
@@ -149,33 +230,20 @@ pub async fn finish(
     let Some(run) = tx.runs().get_for_update(active.id).await? else {
         return done(tx, row.id).await;
     };
-    if !is_waiting(&run, stage, *visit) {
+    if !is_waiting(&run, stage, visit) {
         return done(tx, row.id).await;
     }
     let package = env
         .catalog
         .get(&run.workflow)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
-    let (result, summary) = match outcome {
-        Ok(pull) => (
-            RESULT_PASSED,
-            format!(
-                "opened {}pull request #{} in {}: {}",
-                if pull.draft { "draft " } else { "" },
-                pull.number,
-                pull.repo,
-                pull.url
-            ),
-        ),
-        Err(reason) => (RESULT_FAILED, reason),
-    };
     let facts = facts(&mut *tx, &card, package, Some(stage)).await?;
     let stepped = step(
         &run,
         package,
         &facts,
         Input::StageDone {
-            stage: stage.clone(),
+            stage: stage.to_owned(),
             result: result.to_owned(),
             summary,
         },
@@ -193,6 +261,16 @@ pub async fn finish(
     done(tx, row.id).await
 }
 
+/// The stage and visit that wait for the call of a post, when it is a call to the code host.
+fn awaited(posting: &Posting) -> Option<(&str, u32)> {
+    match posting {
+        Posting::PullRequest { stage, visit, .. } | Posting::PullCall { stage, visit, .. } => {
+            Some((stage, *visit))
+        }
+        _ => None,
+    }
+}
+
 fn is_waiting(run: &Run, stage: &str, visit: u32) -> bool {
     run.state == RunState::Running
         && run.current_stage.as_deref() == Some(stage)
@@ -206,12 +284,12 @@ pub async fn wanted(
     community: CommunityId,
     row: &OutboxRow,
 ) -> Result<bool, OpError> {
-    let Posting::PullRequest { stage, visit, .. } = &row.posting else {
+    let Some((stage, visit)) = awaited(&row.posting) else {
         return Ok(false);
     };
     let mut tx = env.store.begin(community).await?;
     let run = tx.runs().active_for_card(row.card_id).await?;
-    Ok(run.is_some_and(|run| is_waiting(&run, stage, *visit)))
+    Ok(run.is_some_and(|run| is_waiting(&run, stage, visit)))
 }
 
 /// Marks the call done and commits.

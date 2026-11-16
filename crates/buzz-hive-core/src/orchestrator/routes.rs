@@ -63,8 +63,14 @@ pub(super) async fn facts(
     let issue = tx.issues().by_card(card.id).await?;
     let repo = issue.as_ref().map(|row| row.issue.repo.to_string());
     let labels = issue.map(|row| row.issue.labels).unwrap_or_default();
+    let pull_request = tx
+        .pull_requests()
+        .by_card(card.id)
+        .await?
+        .map(|pull| (pull.repo, pull.number));
     Ok(Facts {
         repo,
+        pull_request,
         labels,
         paused: resolved.paused,
         visits: tx.runs().visit_counts(card.id).await?,
@@ -280,6 +286,9 @@ pub(super) async fn apply(
     if ended.is_some() {
         run.ended_at = Some(Utc::now().trunc_subsecs(6));
     }
+    if let Some(last) = run.steps.last_mut().filter(|s| s.entered_at.is_none()) {
+        last.entered_at = Some(Utc::now().trunc_subsecs(6));
+    }
     match mode {
         Mode::Insert => tx.runs().insert(&run).await?,
         Mode::Update => tx.runs().update(&run).await?,
@@ -440,6 +449,24 @@ pub(super) async fn apply(
                     &repo,
                 )
                 .await?;
+                tx.outbox().enqueue(&key, id, &posting).await?;
+            }
+            Effect::PullCall {
+                card: id,
+                stage,
+                visit,
+                repo,
+                number,
+                call,
+                key,
+            } => {
+                let posting = Posting::PullCall {
+                    stage,
+                    visit,
+                    repo,
+                    number,
+                    call,
+                };
                 tx.outbox().enqueue(&key, id, &posting).await?;
             }
             Effect::ArmTimeout { stage, after } => {

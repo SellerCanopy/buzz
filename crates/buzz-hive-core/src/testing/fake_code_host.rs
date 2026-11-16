@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::card::PullRequest;
 use crate::domain::intake::{Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef};
-use crate::ports::code_host::{CodeHost, HostError, NewPullRequest};
+use crate::ports::code_host::{
+    Check, CodeHost, HostError, MergeMethod, NewPullRequest, PullStatus,
+};
 
 #[derive(Default)]
 struct Inner {
@@ -19,6 +21,9 @@ struct Inner {
     next_comment: CommentId,
     /// The pull requests opened, with the key each was opened under.
     pulls: Vec<(NewPullRequest, String, PullRequest)>,
+    /// The checks and labels of the pull requests, by repo and number.
+    checks: std::collections::BTreeMap<(String, u64), Vec<Check>>,
+    labels: std::collections::BTreeMap<(String, u64), Vec<String>>,
     /// Every call made, as a line such as `list_issues example-org/api page 1`.
     calls: Vec<String>,
 }
@@ -103,6 +108,35 @@ impl FakeCodeHost {
             .iter()
             .map(|(request, _, pull)| (request.clone(), pull.clone()))
             .collect()
+    }
+
+    /// Changes the pull request `number` of `repo`, as a person on the host would: approve it,
+    /// close it, merge it.
+    pub fn edit_pull(&self, repo: &RepoRef, number: u64, edit: impl FnOnce(&mut PullRequest)) {
+        let mut inner = self.inner.lock().unwrap();
+        let (_, _, pull) = inner
+            .pulls
+            .iter_mut()
+            .find(|(_, _, pull)| pull.repo == repo.to_string() && pull.number == number)
+            .expect("the fake host has no such pull request");
+        edit(pull);
+    }
+
+    /// Sets the checks the host reports for a pull request.
+    pub fn set_checks(&self, repo: &RepoRef, number: u64, checks: Vec<Check>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .checks
+            .insert((repo.to_string(), number), checks);
+    }
+
+    /// Sets the labels the host reports on a pull request.
+    pub fn set_pull_labels(&self, repo: &RepoRef, number: u64, labels: &[&str]) {
+        self.inner.lock().unwrap().labels.insert(
+            (repo.to_string(), number),
+            labels.iter().map(|l| (*l).to_owned()).collect(),
+        );
     }
 
     /// The comments Beehive wrote, as `(repo, number, body)`.
@@ -283,11 +317,81 @@ impl CodeHost for FakeCodeHost {
             },
             state: "open".into(),
             draft: request.draft,
+            ..PullRequest::default()
         };
         inner
             .pulls
             .push((request.clone(), key.to_owned(), pull.clone()));
         Ok(pull)
+    }
+
+    async fn get_pull_request(&self, repo: &RepoRef, number: u64) -> Result<PullStatus, HostError> {
+        let inner = self.enter(format!("get_pull_request {repo}#{number}"))?;
+        let pull = inner
+            .pulls
+            .iter()
+            .map(|(_, _, pull)| pull)
+            .find(|pull| pull.repo == repo.to_string() && pull.number == number)
+            .ok_or_else(|| HostError::NotFound(format!("{repo}#{number} does not exist")))?;
+        Ok(PullStatus {
+            pull: pull.clone(),
+            labels: inner
+                .labels
+                .get(&(repo.to_string(), number))
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError> {
+        let inner = self.enter(format!("list_checks {repo}#{number}"))?;
+        Ok(inner
+            .checks
+            .get(&(repo.to_string(), number))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError> {
+        let mut inner = self.enter(format!("mark_ready {repo}#{number}"))?;
+        let pull = inner
+            .pulls
+            .iter_mut()
+            .map(|(_, _, pull)| pull)
+            .find(|pull| pull.repo == repo.to_string() && pull.number == number)
+            .ok_or_else(|| HostError::NotFound(format!("{repo}#{number} does not exist")))?;
+        if pull.state != "open" {
+            return Err(HostError::Rejected(format!(
+                "{repo}#{number} is {}",
+                pull.state
+            )));
+        }
+        pull.draft = false;
+        Ok(())
+    }
+
+    async fn merge(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+    ) -> Result<(), HostError> {
+        let mut inner = self.enter(format!("merge {repo}#{number} {}", method.as_str()))?;
+        let pull = inner
+            .pulls
+            .iter_mut()
+            .map(|(_, _, pull)| pull)
+            .find(|pull| pull.repo == repo.to_string() && pull.number == number)
+            .ok_or_else(|| HostError::NotFound(format!("{repo}#{number} does not exist")))?;
+        match pull.state.as_str() {
+            "merged" => Ok(()),
+            "closed" => Err(HostError::Rejected(format!("{repo}#{number} is closed"))),
+            _ if pull.draft => Err(HostError::Rejected(format!("{repo}#{number} is a draft"))),
+            _ => {
+                pull.state = "merged".into();
+                Ok(())
+            }
+        }
     }
 
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {

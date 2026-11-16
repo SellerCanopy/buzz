@@ -73,6 +73,7 @@ async fn a_run_round_trips_and_a_card_has_one_active_run() {
     run.visit = 1;
     run.requester = Some("bb".into());
     tx.runs().update(&run).await.unwrap();
+    assert_eq!(tx.runs().active().await.unwrap(), vec![run.clone()]);
     let counts = tx.runs().visit_counts(run.card_id).await.unwrap();
     assert_eq!(
         counts,
@@ -101,6 +102,7 @@ async fn a_run_round_trips_and_a_card_has_one_active_run() {
             visit: 1,
             round: 1,
             held: true,
+            entered_at: Some(chrono::Utc::now()),
             ..RunStep::default()
         },
     ];
@@ -120,6 +122,7 @@ async fn a_run_round_trips_and_a_card_has_one_active_run() {
     run.ended_at = Some(chrono::Utc::now());
     tx.runs().update(&run).await.unwrap();
     assert_eq!(tx.runs().active_for_card(run.card_id).await.unwrap(), None);
+    assert!(tx.runs().active().await.unwrap().is_empty());
     tx.runs().insert(&second).await.unwrap();
     assert_eq!(tx.runs().list(Some(run.card_id)).await.unwrap().len(), 2);
     assert_eq!(tx.runs().list(None).await.unwrap().len(), 2);

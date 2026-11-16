@@ -23,14 +23,16 @@ use super::repeat::{
     agent_done_decision, is_agent_done, or_default, repeat_decision, RepeatState, RepeatStep,
     DEFAULT_MAX_ROUNDS, DEFAULT_STALL_AFTER,
 };
+use super::wait::waiting_of;
 use crate::domain::inbox::InboxKind;
 use crate::domain::run::{Run, RunState, RunStep};
 use crate::domain::workflow::{
-    Stage, KIND_ACTION, KIND_APPROVAL, KIND_PROMPT, RESULT_NEEDS_INPUT, RESULT_NEEDS_WORK,
-    RESULT_PASSED,
+    ActionArg, Stage, KIND_ACTION, KIND_APPROVAL, KIND_PROMPT, KIND_WAIT, RESULT_FAILED,
+    RESULT_NEEDS_INPUT, RESULT_NEEDS_WORK, RESULT_PASSED,
 };
-use crate::ports::store::Pubkey;
-use crate::workflow::actions::{CLEANUP_WORKTREE, OPEN_PULL_REQUEST};
+use crate::ports::code_host::MergeMethod;
+use crate::ports::store::{Pubkey, PullCall};
+use crate::workflow::actions::{CLEANUP_WORKTREE, MARK_READY, MERGE, OPEN_PULL_REQUEST};
 use crate::workflow::load::Package;
 use crate::workflow::routes::ROUTE_ASK;
 
@@ -119,6 +121,9 @@ pub struct Facts {
     /// The repo of the card's issue as `owner/name`, or `None` for a card with no issue. An
     /// action that needs the code host has no repo to act on without it.
     pub repo: Option<String>,
+    /// The repo as `owner/name` and the number of the card's pull request, or `None` before one
+    /// was opened. The actions that act on it have nothing to act on without it.
+    pub pull_request: Option<(String, u64)>,
 }
 
 impl Facts {
@@ -222,6 +227,18 @@ pub enum Effect {
         stage: String,
         visit: u32,
         repo: String,
+        key: String,
+    },
+    /// Asks the code host to do `call` on the card's pull request, as the action stage `stage`
+    /// says. Queued and made like [`Effect::OpenPullRequest`], and the stage has no agent and
+    /// no timeout for the same reasons.
+    PullCall {
+        card: Uuid,
+        stage: String,
+        visit: u32,
+        repo: String,
+        number: u64,
+        call: PullCall,
         key: String,
     },
     /// An event for the log.
@@ -722,9 +739,13 @@ impl<'a> Walk<'a> {
             self.launch_action(idx);
             return;
         }
+        if stage.kind == KIND_WAIT {
+            self.launch_wait(idx);
+            return;
+        }
         if stage.kind != KIND_PROMPT {
             self.wait(format!(
-                "{} is a {} stage, and only prompt, approval and action stages run so far; skip it to carry on",
+                "{} is a {} stage, which is not a kind a workflow has; skip it to carry on",
                 title(stage),
                 stage.kind
             ));
@@ -786,10 +807,78 @@ impl<'a> Walk<'a> {
                 );
                 self.follow_result(idx, RESULT_PASSED);
             }
+            MARK_READY | MERGE => {
+                let Some((repo, number)) = self.facts.pull_request.clone() else {
+                    self.wait(format!(
+                        "{} acts on the pull request, and the card has none; skip it to carry on",
+                        title(stage)
+                    ));
+                    return;
+                };
+                let call = if stage.action == MARK_READY {
+                    PullCall::MarkReady
+                } else {
+                    let method = stage
+                        .with
+                        .as_ref()
+                        .and_then(|with| with.get("method"))
+                        .map_or("", ActionArg::text);
+                    PullCall::Merge {
+                        method: MergeMethod::parse(method).unwrap_or_default(),
+                    }
+                };
+                self.run.state = RunState::Running;
+                self.reason = None;
+                let card = self.run.card_id;
+                let visit = self.run.visit;
+                self.effects.push(Effect::PullCall {
+                    card,
+                    stage: stage.id.clone(),
+                    visit,
+                    repo,
+                    number,
+                    call,
+                    key: task_key(card, &stage.id, visit),
+                });
+            }
+            _ if waiting_of(stage).is_some() => self.launch_wait(idx),
             other => self.wait(format!(
                 "{} runs the action {other}, which does not run yet; skip it to carry on",
                 title(stage)
             )),
+        }
+    }
+
+    /// Starts a stage that waits on outside state. The pull request sync reads the host at the
+    /// stage's poll and reports the stage's result, and the timeout, when it has one, fails
+    /// the stage.
+    fn launch_wait(&mut self, idx: usize) {
+        let stage = &self.stages()[idx];
+        let Some(waiting) = waiting_of(stage) else {
+            self.wait(format!(
+                "{} waits for nothing; skip it to carry on",
+                title(stage)
+            ));
+            return;
+        };
+        if waiting.needs_pull_request() && self.facts.pull_request.is_none() {
+            self.wait(format!(
+                "{} waits on the pull request, and the card has none; skip it to carry on",
+                title(stage)
+            ));
+            return;
+        }
+        self.run.state = RunState::Running;
+        self.reason = None;
+        // The orchestrator stamps the step again: a stage that waits again starts its grace over.
+        // The summary says what it waits for, until the result replaces it.
+        self.current().entered_at = None;
+        self.current().summary = waiting.describe();
+        if !waiting.timeout.is_zero() {
+            self.effects.push(Effect::ArmTimeout {
+                stage: stage.id.clone(),
+                after: waiting.timeout,
+            });
         }
     }
 
@@ -1102,10 +1191,13 @@ fn skip(run: &Run, wf: &Package, facts: &Facts) -> Step {
 
 /// The stage a skip leaves, when the run is waiting or held.
 fn skippable<'a>(run: &Run, wf: &'a Package) -> Option<(&'a Stage, usize)> {
-    if !matches!(run.state, RunState::Waiting | RunState::Paused) {
+    let found = wf.stage(run.current_stage.as_deref()?)?;
+    // A stage that waits on outside state is running with nobody to ask, so a person may skip it.
+    let waiting = run.state == RunState::Running && waiting_of(found.0).is_some();
+    if !matches!(run.state, RunState::Waiting | RunState::Paused) && !waiting {
         return None;
     }
-    wf.stage(run.current_stage.as_deref()?)
+    Some(found)
 }
 
 fn pause(run: &Run) -> Step {
@@ -1146,7 +1238,8 @@ fn resume(run: &Run, wf: &Package, facts: &Facts) -> Step {
         "run.resumed",
         json!({ "stage": stage.id, "visit": run.visit }),
     );
-    if walk.current().held {
+    // A stage that waits on outside state has no agent to tell: it waits again from now.
+    if walk.current().held || waiting_of(stage).is_some() {
         walk.current().held = false;
         walk.launch(idx);
         return walk.finish();
@@ -1229,9 +1322,22 @@ fn stage_failed(run: &Run, wf: &Package, facts: &Facts, stage: &str, reason: &st
 /// said the work failed, and the person may ask the agent to carry on, skip the stage or stop
 /// the run.
 fn timed_out(run: &Run, wf: &Package, facts: &Facts, stage: &str) -> Step {
-    let Some((def, _)) = running_at(run, wf, stage) else {
+    let Some((def, idx)) = running_at(run, wf, stage) else {
         return Step::unchanged(run);
     };
+    if let Some(waiting) = waiting_of(def) {
+        // Nobody works the stage, so there is no one to ask: it failed, and its failed route says
+        // where the card goes.
+        let reason = format!(
+            "{} timed out after {}",
+            title(def),
+            say_duration(waiting.timeout)
+        );
+        let mut walk = Walk::new(run, wf, facts);
+        walk.record(RESULT_FAILED, &reason);
+        walk.follow_result(idx, RESULT_FAILED);
+        return walk.finish();
+    }
     let exec = facts.execution(stage);
     let reason = format!(
         "{} timed out after {}",

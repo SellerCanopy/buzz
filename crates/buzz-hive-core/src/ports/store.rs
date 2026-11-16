@@ -252,6 +252,8 @@ pub trait RunsRepo: Send {
     async fn update(&mut self, run: &Run) -> Result<(), StoreError>;
     /// A card's runs, or every run, newest first.
     async fn list(&mut self, card: Option<uuid::Uuid>) -> Result<Vec<Run>, StoreError>;
+    /// Every run that has not ended.
+    async fn active(&mut self) -> Result<Vec<Run>, StoreError>;
     /// The card's run that has not ended, if any.
     async fn active_for_card(&mut self, card: uuid::Uuid) -> Result<Option<Run>, StoreError>;
     /// The highest visit the card's runs have made to each stage that any has entered. A stage
@@ -407,6 +409,26 @@ pub enum Posting {
         body: String,
         draft: bool,
     },
+    /// A call to the code host on the card's pull request, for a `mark_ready` or `merge` stage.
+    /// The drain makes it and reports the stage's result.
+    PullCall {
+        stage: String,
+        visit: u32,
+        /// The repo as `owner/name`.
+        repo: String,
+        number: u64,
+        call: PullCall,
+    },
+}
+
+/// What a [`Posting::PullCall`] asks of the code host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "call", rename_all = "snake_case")]
+pub enum PullCall {
+    MarkReady,
+    Merge {
+        method: crate::ports::code_host::MergeMethod,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -527,6 +549,8 @@ pub trait PullRequestsRepo: Send {
     /// Records the card's pull request, replacing the one before it.
     async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError>;
     async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError>;
+    /// The pull requests that are still open, with the card each belongs to.
+    async fn open(&mut self) -> Result<Vec<(uuid::Uuid, PullRequest)>, StoreError>;
 }
 
 /// A package the store holds versions of.

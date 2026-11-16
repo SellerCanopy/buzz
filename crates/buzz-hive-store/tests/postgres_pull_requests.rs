@@ -38,6 +38,8 @@ fn pull(number: u64, state: &str) -> PullRequest {
         base: "main".into(),
         state: state.into(),
         draft: true,
+        approved: false,
+        checks: String::new(),
     }
 }
 
@@ -98,4 +100,35 @@ async fn another_communitys_card_has_its_own_pull_request() {
             .number,
         2
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn what_a_sync_read_is_kept_and_only_open_pull_requests_are_watched() {
+    let (store, _guard, _relay) = store().await;
+    let mut tx = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    for (card_id, number, state) in [(5, 12, "open"), (6, 13, "merged"), (7, 14, "closed")] {
+        tx.cards().insert(&card(card_id)).await.unwrap();
+        tx.pull_requests()
+            .put(Uuid::from_u128(card_id), &pull(number, state))
+            .await
+            .unwrap();
+    }
+    let mut read = pull(12, "open");
+    read.draft = false;
+    read.approved = true;
+    read.checks = "passing".into();
+    tx.pull_requests()
+        .put(Uuid::from_u128(5), &read)
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.pull_requests()
+            .by_card(Uuid::from_u128(5))
+            .await
+            .unwrap(),
+        Some(read.clone())
+    );
+    let open = tx.pull_requests().open().await.unwrap();
+    assert_eq!(open, vec![(Uuid::from_u128(5), read)]);
 }

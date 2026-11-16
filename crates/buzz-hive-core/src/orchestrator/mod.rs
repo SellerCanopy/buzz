@@ -11,6 +11,7 @@ pub mod cards;
 pub mod inbox;
 pub mod intake;
 mod lookup;
+pub mod merge;
 pub mod outbox;
 pub mod pull_request;
 mod routes;
@@ -19,6 +20,7 @@ pub mod settings;
 pub mod task_message;
 pub mod timers;
 pub mod usage;
+pub mod wait;
 pub mod workflows;
 
 use crate::domain::events::Actor;

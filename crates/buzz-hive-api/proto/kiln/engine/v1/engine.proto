@@ -389,6 +389,10 @@ service EngineService {
   // and not merged, and the card stays where it was), or the card is in
   // Backlog. A pull request already merged is skipped, so trying again after
   // a failure merges nothing twice.
+  //
+  // Beehive: a card has one pull request, so this merges that one, and only a
+  // person may call it (an agent is refused with PermissionDenied). It marks
+  // nothing done when the card has no run waiting for the merge.
   rpc MergeCard(MergeCardRequest) returns (Card);
   // SkipStage moves the card on as if its current stage had reported
   // passed, with no run, and records card.skipped. A card with an
@@ -520,6 +524,9 @@ service EngineService {
   // InvalidArgument for any other list and FailedPrecondition while a run
   // is active. Kiln follows the order when it merges and does not enforce
   // it on a merge made by hand.
+  //
+  // Beehive: a card has one repo, so the only list that passes is that repo,
+  // and nothing is stored. A run being active does not refuse it.
   rpc SetMergeOrder(SetMergeOrderRequest) returns (Card);
 
   // Chat sends one message to the assistant and streams its turn: progress
@@ -765,7 +772,8 @@ message CardRepo {
 }
 
 message MergeCardRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
 }
 
 // A pull request Kiln opened for an issue.
@@ -1146,7 +1154,8 @@ message RemoveIssueRepoRequest {
 }
 
 message SetMergeOrderRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
   // owner/name, first to merge first.
   repeated string repos = 2;
 }

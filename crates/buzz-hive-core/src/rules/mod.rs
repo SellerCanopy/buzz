@@ -7,3 +7,4 @@ pub mod conditions;
 pub mod decide;
 pub mod repeat;
 pub mod run;
+pub mod wait;
