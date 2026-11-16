@@ -15,9 +15,9 @@ use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
-    PullRequestsRepo, RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage,
-    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    InboxRepo, IntakeRepo, IssuesRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
+    Proposal, ProposalsRepo, PullRequestsRepo, RunsRepo, SettingsRepo, StageThread, Store,
+    StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -104,6 +104,9 @@ impl Tx for PgTx {
         self
     }
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo {
+        self
+    }
+    fn proposals(&mut self) -> &mut dyn ProposalsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -919,6 +922,158 @@ impl WorkflowsRepo for PgTx {
         .await
         .map_err(store_error)?;
         Ok(())
+    }
+
+    async fn save_version(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        hash: &str,
+        body: serde_json::Value,
+        created_by: &str,
+    ) -> Result<(), StoreError> {
+        let stale = || {
+            StoreError::Conflict(
+                "the workflow changed since you opened it; reload and try again".into(),
+            )
+        };
+        // The package row is the compare-and-swap: of two saves from one base, one finds the
+        // base gone and writes nothing. The version row goes in first and rolls back with it.
+        sqlx::query(
+            "INSERT INTO hive.workflow_versions (community_id, name, hash, body, created_by) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (community_id, name, hash) DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(name)
+        .bind(hash)
+        .bind(body)
+        .bind(created_by)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        let swapped = match base {
+            None => sqlx::query(
+                "INSERT INTO hive.workflow_packages (community_id, name, builtin, current_hash) \
+                 VALUES ($1, $2, false, $3) ON CONFLICT (community_id, name) DO NOTHING",
+            )
+            .bind(self.community)
+            .bind(name)
+            .bind(hash)
+            .execute(&mut *self.tx)
+            .await,
+            Some(base) => {
+                sqlx::query(
+                    "UPDATE hive.workflow_packages SET current_hash = $3, updated_at = now() \
+                 WHERE community_id = $1 AND name = $2 AND current_hash = $4 AND NOT builtin",
+                )
+                .bind(self.community)
+                .bind(name)
+                .bind(hash)
+                .bind(base)
+                .execute(&mut *self.tx)
+                .await
+            }
+        }
+        .map_err(store_error)?;
+        if swapped.rows_affected() == 0 {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
+    async fn delete_package(&mut self, name: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM hive.workflow_options WHERE community_id = $1 AND name = $2")
+            .bind(self.community)
+            .bind(name)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        let deleted =
+            sqlx::query("DELETE FROM hive.workflow_packages WHERE community_id = $1 AND name = $2")
+                .bind(self.community)
+                .bind(name)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(store_error)?;
+        if deleted.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!(
+                "workflow {name} is not stored"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError> {
+        let rows: Vec<(String, String, serde_json::Value, bool, bool)> = sqlx::query_as(
+            "SELECT v.name, v.hash, v.body, \
+                    COALESCE(p.current_hash = v.hash, false), COALESCE(p.builtin, false) \
+             FROM hive.workflow_versions v \
+             LEFT JOIN hive.workflow_packages p \
+               ON p.community_id = v.community_id AND p.name = v.name \
+             WHERE v.community_id = $1 \
+               AND ((p.current_hash = v.hash AND NOT p.builtin) \
+                    OR EXISTS (SELECT 1 FROM hive.runs r \
+                               WHERE r.community_id = v.community_id AND r.workflow = v.name \
+                                 AND r.workflow_hash = v.hash AND r.state <> 'ended')) \
+             ORDER BY v.name, v.hash",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, hash, body, current, builtin)| KeptVersion {
+                name,
+                hash,
+                body,
+                current,
+                builtin,
+            })
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl ProposalsRepo for PgTx {
+    async fn insert(
+        &mut self,
+        kind: &str,
+        body: serde_json::Value,
+        requester: &str,
+    ) -> Result<i64, StoreError> {
+        sqlx::query_scalar(
+            "INSERT INTO hive.proposals (community_id, kind, body, requester) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(self.community)
+        .bind(kind)
+        .bind(body)
+        .bind(requester)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)
+    }
+
+    async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError> {
+        let rows: Vec<(i64, String, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT id, kind, body, requester FROM hive.proposals \
+             WHERE community_id = $1 AND kind = $2 AND resolved_at IS NULL ORDER BY id",
+        )
+        .bind(self.community)
+        .bind(kind)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, body, requester)| Proposal {
+                id,
+                kind,
+                body,
+                requester,
+            })
+            .collect())
     }
 }
 

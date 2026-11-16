@@ -63,6 +63,7 @@ pub trait Tx: Send {
     fn intake(&mut self) -> &mut dyn IntakeRepo;
     fn issues(&mut self) -> &mut dyn IssuesRepo;
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
+    fn proposals(&mut self) -> &mut dyn ProposalsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -237,6 +238,61 @@ pub trait WorkflowsRepo: Send {
         name: &str,
         options: &WorkflowOptions,
     ) -> Result<(), StoreError>;
+    /// Stores a person's version of a package and makes it current, when the package is
+    /// still at `base`. `None` makes a new package, which fails when the name has one.
+    /// `Conflict` when the package is not at `base`, or is a built-in.
+    async fn save_version(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        hash: &str,
+        body: serde_json::Value,
+        created_by: &str,
+    ) -> Result<(), StoreError>;
+    /// Removes a package and its options. Its versions stay, so a run that started on one
+    /// keeps it. `NotFound` when there is no such package.
+    async fn delete_package(&mut self, name: &str) -> Result<(), StoreError>;
+    /// The versions the engine must be able to load without reading the store again: each
+    /// person's current package, and every version a run that has not ended started on.
+    async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError>;
+}
+
+/// One stored package version the catalog keeps loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptVersion {
+    pub name: String,
+    pub hash: String,
+    /// The package's files by path.
+    pub body: serde_json::Value,
+    /// This is the package's current version.
+    pub current: bool,
+    /// The package ships with the build.
+    pub builtin: bool,
+}
+
+/// What an agent offered that a person has not decided yet, such as a workflow edit the
+/// agent's requester was not allowed to save.
+#[async_trait::async_trait]
+pub trait ProposalsRepo: Send {
+    /// Stores an open proposal and returns its id.
+    async fn insert(
+        &mut self,
+        kind: &str,
+        body: serde_json::Value,
+        requester: &str,
+    ) -> Result<i64, StoreError>;
+    /// Every proposal of `kind` that is still open, oldest first.
+    async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError>;
+}
+
+/// A stored proposal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proposal {
+    pub id: i64,
+    pub kind: String,
+    pub body: serde_json::Value,
+    /// The pubkey the proposal was made for, who may decide it.
+    pub requester: String,
 }
 
 /// Runs and the stage threads they open.

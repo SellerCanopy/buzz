@@ -47,7 +47,11 @@ pub async fn watched(env: &Env<'_>, community: CommunityId) -> Result<Vec<Uuid>,
             && run
                 .current_stage
                 .as_deref()
-                .and_then(|id| env.catalog.get(&run.workflow)?.stage(id))
+                .and_then(|id| {
+                    env.catalog
+                        .pinned(&run.workflow, &run.workflow_hash)?
+                        .stage(id)
+                })
                 .is_some_and(|(stage, _)| waiting_of(stage).is_some());
         if waits && !cards.contains(&run.card_id) {
             cards.push(run.card_id);
@@ -72,7 +76,11 @@ pub async fn sync_card(
             Some(run) if run.state == RunState::Running => run
                 .current_stage
                 .as_deref()
-                .and_then(|id| env.catalog.get(&run.workflow)?.stage(id))
+                .and_then(|id| {
+                    env.catalog
+                        .pinned(&run.workflow, &run.workflow_hash)?
+                        .stage(id)
+                })
                 .and_then(|(stage, _)| waiting_of(stage)),
             _ => None,
         };

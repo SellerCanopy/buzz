@@ -85,6 +85,8 @@ impl From<OpError> for HiveError {
             OpError::NotFound(message) => Self::NotFound(message),
             OpError::FailedPrecondition(message) => Self::FailedPrecondition(message),
             OpError::PermissionDenied(message) => Self::PermissionDenied(message),
+            OpError::AlreadyExists(message) => Self::AlreadyExists(message),
+            error @ OpError::InvalidWorkflow(_) => Self::InvalidArgument(error.to_string()),
             OpError::Store(error) => error.into(),
         }
     }

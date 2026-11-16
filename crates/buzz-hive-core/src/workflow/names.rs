@@ -18,6 +18,16 @@ pub fn artifact_name(name: &str) -> bool {
 /// The text a check message gives for the artifact name rule.
 pub const ARTIFACT_NAME_RULE: &str = "^[a-z0-9][a-z0-9_-]{0,63}$";
 
+/// `^[a-z0-9][a-z0-9_-]{0,31}$`: what a workflow package a person saves is called. It is
+/// shorter than an artifact name because it is also a folder name when the package is exported.
+pub fn package_name(name: &str) -> bool {
+    name.len() <= 32 && artifact_name(name)
+}
+
+/// The text a refusal gives for the package name rule.
+pub const PACKAGE_NAME_RULE: &str =
+    "1 to 32 lower-case letters, digits, - and _, starting with a letter or digit";
+
 /// `^[a-z][a-z0-9_]*$`. It has no dot, so a settings key such as
 /// `stage.<id>.params.<name>` splits unambiguously.
 pub fn param_name(name: &str) -> bool {

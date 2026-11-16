@@ -29,6 +29,8 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Workflow packages export and import as zips. Deflate only: no encryption, no extra codecs.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 pbjson-build = "0.9"

@@ -175,9 +175,11 @@ service EngineService {
   // loaded workflow or a folder has the name. Otherwise base_hash is the
   // hash GetWorkflowDraft gave, and a package changed since then fails with
   // FailedPrecondition. A built-in or a package in another folder fails
-  // with PermissionDenied. A draft whose checks find an error fails with
-  // FailedPrecondition carrying a CheckWorkflowResponse detail with every
-  // finding. A folder holding an entry the app does not manage, such as a
+  // with PermissionDenied. Beehive keeps packages in its store, not in a
+  // folder. A draft whose checks find an error fails with InvalidArgument,
+  // whose message lists each error with its code (CheckWorkflow gives them
+  // as findings), and an agent the person may not name fails with
+  // PermissionDenied naming it. A folder holding an entry the app does not manage, such as a
   // symlink or a .git folder, fails with FailedPrecondition. A bad draft
   // fails with InvalidArgument, as CheckWorkflow does.
   rpc SaveWorkflow(SaveWorkflowRequest) returns (SaveWorkflowResponse);
@@ -208,6 +210,13 @@ service EngineService {
   // errors are FailedPrecondition with the CheckWorkflowResponse detail
   // SaveWorkflow gives.
   rpc ImportWorkflow(ImportWorkflowRequest) returns (Workflow);
+  // EditWorkflow is the agent's edit_workflow tool: it saves the files as
+  // SaveWorkflow does when the person the agent acts for is at Run or above,
+  // and otherwise stores a proposal for a person to look at and saves nothing.
+  // Beehive addition, because an agent works in text and not in the draft's
+  // bytes. A draft whose checks find an error is InvalidArgument listing them,
+  // whichever happens.
+  rpc EditWorkflow(EditWorkflowRequest) returns (EditWorkflowResponse);
   // ImportPlugin saves the Claude Code plugin folder in a zip as a package
   // with one stage per command. A new package is named name when set, else
   // by the plugin manifest's name; neither is InvalidArgument carrying a
@@ -1575,6 +1584,10 @@ message Proposal {
 
 message GetWorkflowDraftRequest {
   string name = 1;
+  // Beehive addition, for the get_workflow tool. When set, every file comes
+  // back as text in text_files and draft.files is left empty, because an
+  // agent cannot read the bytes a JSON body carries as base64.
+  bool text = 2;
 }
 
 message GetWorkflowDraftResponse {
@@ -1586,6 +1599,8 @@ message GetWorkflowDraftResponse {
   // What the package's files carry, grouped for the builder's Package
   // contents list.
   PackageContents contents = 4;
+  // Every file as text, by slash path, when the request set text.
+  map<string, string> text_files = 5;
 }
 
 // PackageContents is what a package's files carry. Each list is in file
@@ -1670,6 +1685,27 @@ message StartTestRunRequest {
   // test run's own settings (params.<name>). An undeclared name or a value
   // its type refuses is INVALID_ARGUMENT.
   map<string, string> parameters = 4;
+}
+
+message EditWorkflowRequest {
+  // The package name, the same as the name in kiln-package.yaml.
+  string name = 1;
+  // Every file in the package as text, by slash path. A save replaces the
+  // package, so a file left out is removed.
+  map<string, string> files = 2;
+  // The hash get_workflow gave. Empty makes a new package.
+  string base_hash = 3;
+}
+
+message EditWorkflowResponse {
+  // True when the edit was saved; false when it was stored as a proposal.
+  bool saved = 1;
+  // The hash of the files written, when saved.
+  string hash = 2;
+  // The stored proposal's id, when it was not saved.
+  int64 proposal_id = 3;
+  // Warnings and notes. A draft with an error is refused instead.
+  repeated Finding findings = 4;
 }
 
 message SaveWorkflowResponse {

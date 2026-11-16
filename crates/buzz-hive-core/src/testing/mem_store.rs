@@ -13,10 +13,10 @@ use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog,
-    OutboxRepo, OutboxRow, PersonInfo, Posting, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo,
-    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
-    WorkflowsRepo, MESSAGE_KINDS,
+    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, KeptVersion,
+    OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting, Proposal, ProposalsRepo, Pubkey,
+    PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
+    StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -48,6 +48,9 @@ struct State {
     issue_seen:
         std::collections::BTreeMap<(CommunityId, String, u64), chrono::DateTime<chrono::Utc>>,
     pulls: std::collections::BTreeMap<(CommunityId, uuid::Uuid), PullRequest>,
+    /// Proposals in creation order, with the time each was resolved.
+    proposals: Vec<(CommunityId, Proposal, bool)>,
+    next_proposal_id: i64,
 }
 
 #[derive(Clone)]
@@ -185,6 +188,9 @@ impl Tx for MemTx {
         self
     }
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo {
+        self
+    }
+    fn proposals(&mut self) -> &mut dyn ProposalsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -927,6 +933,104 @@ impl WorkflowsRepo for MemTx {
             .options
             .insert((self.community, name.to_owned()), options.clone());
         Ok(())
+    }
+
+    async fn save_version(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        hash: &str,
+        body: serde_json::Value,
+        _created_by: &str,
+    ) -> Result<(), StoreError> {
+        let key = (self.community, name.to_owned());
+        match (self.work.packages.get(&key), base) {
+            (None, None) => {}
+            (Some((false, current)), Some(base)) if current == base => {}
+            _ => {
+                return Err(StoreError::Conflict(
+                    "the workflow changed since you opened it; reload and try again".into(),
+                ))
+            }
+        }
+        self.work
+            .versions
+            .entry((self.community, name.to_owned(), hash.to_owned()))
+            .or_insert(body);
+        self.work.packages.insert(key, (false, hash.to_owned()));
+        Ok(())
+    }
+
+    async fn delete_package(&mut self, name: &str) -> Result<(), StoreError> {
+        let key = (self.community, name.to_owned());
+        self.work.options.remove(&key);
+        self.work
+            .packages
+            .remove(&key)
+            .map(|_| ())
+            .ok_or_else(|| StoreError::NotFound(format!("workflow {name} is not stored")))
+    }
+
+    async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError> {
+        let community = self.community;
+        let active: Vec<(String, String)> = self
+            .work
+            .runs
+            .iter()
+            .filter(|(c, run)| *c == community && run.state != RunState::Ended)
+            .map(|(_, run)| (run.workflow.clone(), run.workflow_hash.clone()))
+            .collect();
+        let mut kept = Vec::new();
+        for ((c, name, hash), body) in &self.work.versions {
+            if *c != community {
+                continue;
+            }
+            let package = self.work.packages.get(&(community, name.clone()));
+            let current = package.is_some_and(|(_, current)| current == hash);
+            let builtin = package.is_some_and(|(builtin, _)| *builtin);
+            let used = active.iter().any(|(n, h)| n == name && h == hash);
+            if (current && !builtin) || used {
+                kept.push(KeptVersion {
+                    name: name.clone(),
+                    hash: hash.clone(),
+                    body: body.clone(),
+                    current,
+                    builtin,
+                });
+            }
+        }
+        Ok(kept)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProposalsRepo for MemTx {
+    async fn insert(
+        &mut self,
+        kind: &str,
+        body: serde_json::Value,
+        requester: &str,
+    ) -> Result<i64, StoreError> {
+        self.work.next_proposal_id += 1;
+        let id = self.work.next_proposal_id;
+        let proposal = Proposal {
+            id,
+            kind: kind.to_owned(),
+            body,
+            requester: requester.to_owned(),
+        };
+        self.work.proposals.push((self.community, proposal, false));
+        Ok(id)
+    }
+
+    async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .filter(|(c, p, resolved)| *c == self.community && p.kind == kind && !resolved)
+            .map(|(_, p, _)| p.clone())
+            .collect())
     }
 }
 

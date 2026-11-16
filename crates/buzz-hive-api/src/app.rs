@@ -86,6 +86,17 @@ impl App {
         Ok(actor)
     }
 
+    /// Reads the saved workflows again after one changed, so the next call sees it. A failure is
+    /// logged and not returned: the change is already committed, and the next change reads again.
+    pub async fn refresh_saved(&self) {
+        let Some(saved) = self.catalog.saved() else {
+            return;
+        };
+        if let Err(error) = saved.refresh(self.store.as_ref(), self.community).await {
+            tracing::error!(%error, "could not read the saved workflows after a change");
+        }
+    }
+
     /// What an engine operation needs, and the one place that finishes it.
     ///
     /// An operation that can queue a post to the relay passes `needs_hive`, and fails here with

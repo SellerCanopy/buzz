@@ -141,6 +141,20 @@ pub const TOOLS: &[Tool] = &[
         schema: check_workflow,
     },
     Tool {
+        name: "get_workflow",
+        route: "GetWorkflowDraft",
+        needs: Level::Read,
+        description: "Read a workflow's files as text, with the hash to pass back as baseHash when you edit it. Pass text true.",
+        schema: get_workflow,
+    },
+    Tool {
+        name: "edit_workflow",
+        route: "EditWorkflow",
+        needs: Level::Read,
+        description: "Change a workflow, or make a new one. Give every file of the package as text: kiln-package.yaml and workflow.yaml, and any prompt files. Pass the baseHash get_workflow gave, or none for a new workflow. When the person you act for may run workflows, it is saved and the workflow changes for the cards that start next, and a card already running keeps the version it started with. Otherwise it is stored as a proposal for a person to save. A draft with an error is refused with the errors listed.",
+        schema: edit_workflow,
+    },
+    Tool {
         name: "list_agents",
         route: "ListAgents",
         needs: Level::Read,
@@ -277,11 +291,35 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "ListTemplateVariables",
-        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+        "an authoring aid for the workflow editor; an agent that edits a workflow reads get_workflow and checks with check_workflow",
     ),
     (
         "ListStageTemplates",
-        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+        "an authoring aid for the workflow editor; an agent that edits a workflow reads get_workflow and checks with check_workflow",
+    ),
+    (
+        "SaveWorkflow",
+        "a person's call from the editor; the engine refuses an agent, which uses edit_workflow and is held to a proposal unless its requester may run workflows",
+    ),
+    (
+        "DuplicateWorkflow",
+        "a person's call from the editor; the engine refuses an agent, which uses edit_workflow with the files of get_workflow under a new name",
+    ),
+    (
+        "DeleteWorkflow",
+        "a person's call from the editor; the engine refuses an agent, because a deleted workflow cannot be asked for again",
+    ),
+    (
+        "SetWorkflowOptions",
+        "a person's call from the editor; the engine refuses an agent, so a card's pauses and hand-offs stay a person's choice",
+    ),
+    (
+        "ExportWorkflow",
+        "a person's download from the editor; an agent reads get_workflow",
+    ),
+    (
+        "ImportWorkflow",
+        "a person's upload from the editor, a zip; an agent makes a workflow with edit_workflow",
     ),
     (
         "GetBrief",
@@ -821,6 +859,43 @@ fn check_workflow() -> Value {
             string("The workflow's name. Empty checks every workflow."),
         )],
         &[],
+    )
+}
+
+fn get_workflow() -> Value {
+    object(
+        vec![
+            ("name", string("The workflow's name.")),
+            (
+                "text",
+                json!({ "type": "boolean", "description": "Pass true: every file comes back as text in textFiles." }),
+            ),
+        ],
+        &["name", "text"],
+    )
+}
+
+fn edit_workflow() -> Value {
+    object(
+        vec![
+            (
+                "name",
+                string("The package name: 1 to 32 lower-case letters, digits, - and _. The same as the name in kiln-package.yaml."),
+            ),
+            (
+                "files",
+                json!({
+                    "type": "object",
+                    "description": "Every file of the package by path, as text. A file left out is removed.",
+                    "additionalProperties": { "type": "string" },
+                }),
+            ),
+            (
+                "baseHash",
+                string("The hash get_workflow gave. Empty makes a new workflow."),
+            ),
+        ],
+        &["name", "files"],
     )
 }
 

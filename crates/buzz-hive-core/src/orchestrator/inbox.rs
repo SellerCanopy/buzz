@@ -195,7 +195,7 @@ pub(super) async fn decide(
         ..*env
     };
     if !matches!(choice, ANSWER_STOP | ANSWER_DISMISS) {
-        let package = env.catalog.get(&held.workflow);
+        let package = env.catalog.pinned(&run.workflow, &run.workflow_hash);
         if let (Some(package), Some(channel)) = (package, update_channel(tx).await?) {
             ask_directory(env, ctx, package, channel).await?;
             // An answer that finishes the workflow hands the card on, after `resolve` has

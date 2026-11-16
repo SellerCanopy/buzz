@@ -43,6 +43,14 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("CheckWorkflow", Level::Read),
     ("ListTemplateVariables", Level::Read),
     ("ListStageTemplates", Level::Read),
+    ("GetWorkflowDraft", Level::Read),
+    ("EditWorkflow", Level::Read),
+    ("SaveWorkflow", Level::Run),
+    ("DuplicateWorkflow", Level::Run),
+    ("DeleteWorkflow", Level::Run),
+    ("SetWorkflowOptions", Level::Run),
+    ("ExportWorkflow", Level::Run),
+    ("ImportWorkflow", Level::Run),
     ("StartStage", Level::Run),
     ("StageDone", Level::Run),
     ("GetRun", Level::Read),
@@ -177,6 +185,14 @@ pub fn router() -> Router<App> {
         workflows::list_template_variables,
     );
     let r = route(r, "ListStageTemplates", workflows::list_stage_templates);
+    let r = route(r, "GetWorkflowDraft", workflows::get_workflow_draft);
+    let r = route(r, "SaveWorkflow", workflows::save_workflow);
+    let r = route(r, "DuplicateWorkflow", workflows::duplicate_workflow);
+    let r = route(r, "DeleteWorkflow", workflows::delete_workflow);
+    let r = route(r, "SetWorkflowOptions", workflows::set_workflow_options);
+    let r = route(r, "ExportWorkflow", workflows::export_workflow);
+    let r = route(r, "ImportWorkflow", workflows::import_workflow);
+    let r = route(r, "EditWorkflow", workflows::edit_workflow);
     let r = route(r, "StartStage", runs::start_stage);
     let r = route(r, "StageDone", stages::stage_done);
     let r = route(r, "GetRun", runs::get_run);

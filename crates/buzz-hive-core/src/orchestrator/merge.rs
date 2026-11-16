@@ -62,7 +62,11 @@ pub async fn merge_card(
                     && !run
                         .current_stage
                         .as_deref()
-                        .and_then(|id| env.catalog.get(&run.workflow)?.stage(id))
+                        .and_then(|id| {
+                            env.catalog
+                                .pinned(&run.workflow, &run.workflow_hash)?
+                                .stage(id)
+                        })
                         .is_some_and(|(stage, _)| waiting_of(stage).is_some())
             }
             None => false,
@@ -148,7 +152,7 @@ async fn start_held(
     }
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     let facts = facts(tx, card, package, run.current_stage.as_deref()).await?;
     let stepped = step(&run, package, &facts, Input::Resume);

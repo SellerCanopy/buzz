@@ -662,7 +662,7 @@ pub(super) async fn locked<'a>(
         .ok_or_else(|| OpError::NotFound(format!("run {} does not exist", active.id)))?;
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     Ok((card, run, package))
 }

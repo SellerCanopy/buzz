@@ -132,7 +132,7 @@ pub(super) async fn evaluate(
     };
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     let Some(waiting) = package.stage(&stage_id).and_then(|(s, _)| waiting_of(s)) else {
         return Ok(false);
