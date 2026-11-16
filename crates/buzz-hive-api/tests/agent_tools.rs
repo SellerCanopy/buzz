@@ -28,6 +28,7 @@ async fn world() -> (App, FakeSupervisor) {
         .unwrap();
     let app = App {
         supervisor: Some(Arc::new(fake.clone())),
+        secrets: None,
         ..app
     };
     (app, fake)
@@ -188,6 +189,7 @@ async fn a_supervisor_that_is_down_leaves_the_change_saved_and_says_so() {
     // No supervisor at all is the same: saved, not applied.
     let bare = App {
         supervisor: None,
+        secrets: None,
         ..app
     };
     let (status, body) = call(
@@ -245,6 +247,7 @@ async fn health_names_an_agent_on_a_channel_session_or_missing_the_allowlist_ent
     // With no supervisor the answer stays unknown, which is no fault of the agents.
     let bare = App {
         supervisor: None,
+        secrets: None,
         ..app
     };
     let (_, health) = call(&bare, "GetHiveHealth", OWNER, json!({})).await;

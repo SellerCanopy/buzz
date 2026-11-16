@@ -107,7 +107,10 @@ fn people_only(ctx: &Ctx) -> Result<(), OpError> {
     Ok(())
 }
 
-async fn known(tx: &mut dyn crate::ports::store::Tx, agent: &str) -> Result<(), OpError> {
+pub(super) async fn known(
+    tx: &mut dyn crate::ports::store::Tx,
+    agent: &str,
+) -> Result<(), OpError> {
     check_agent(agent).map_err(OpError::InvalidArgument)?;
     if !tx.agent_tools().agents().await?.iter().any(|a| a == agent) {
         return Err(OpError::NotFound(format!(
@@ -135,7 +138,7 @@ async fn changed(
         .await
 }
 
-/// Sends the agent's whole saved list to the supervisor.
+/// Sends the agent's whole saved list and the names of its secrets to the supervisor.
 pub async fn apply(
     store: &dyn Store,
     supervisor: Option<&dyn Supervisor>,
@@ -147,13 +150,16 @@ pub async fn apply(
             "no supervisor is configured (BUZZ_HIVE_SUPERVISOR_SOCKET)".into(),
         ));
     };
-    let servers = async {
+    let (servers, secrets) = async {
         let mut tx = store.begin(community).await?;
-        tx.agent_tools().of_agent(agent).await
+        Ok::<_, StoreError>((
+            tx.agent_tools().of_agent(agent).await?,
+            tx.secrets().names_of(agent).await?,
+        ))
     }
     .await
     .map_err(|e| SupervisorError::Unavailable(e.to_string()))?;
-    supervisor.apply(agent, &servers).await
+    supervisor.apply(agent, &servers, &secrets).await
 }
 
 fn log(

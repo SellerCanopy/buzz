@@ -1,5 +1,16 @@
 //! Read the environment once. A missing required value fails startup with the variable named.
 
+/// Where secret values are written. The host supervisor reads them from the same place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretsBackend {
+    /// No store: setting a secret is refused and says how to configure one.
+    None,
+    /// Files under a folder, mode 0600, for local development and tests.
+    Dir(std::path::PathBuf),
+    /// SSM Parameter Store, written with the `aws` program at this path.
+    Ssm { cli: std::path::PathBuf },
+}
+
 pub struct Config {
     /// `BUZZ_HIVE_DATABASE_URL`
     pub database_url: String,
@@ -32,7 +43,10 @@ pub struct Config {
     /// `BUZZ_HIVE_DB_ACQUIRE_TIMEOUT_SECS`, default 10. How long a call waits for a free
     /// database connection.
     pub db_acquire_timeout: std::time::Duration,
-    /// `GH_TOKEN`, the team's GitHub token. Unset means intake and the issue pickers are off.
+    /// `GH_TOKEN`, the team's GitHub token, read from this process's own environment. It is
+    /// not one of the agent secrets of `BUZZ_HIVE_SECRETS_*`: those fill agents' environments
+    /// through the host supervisor, and this is Beehive's own. Unset means intake and the
+    /// issue pickers are off.
     pub github_token: Option<String>,
     /// `BUZZ_HIVE_GITHUB_API_URL`, default `https://api.github.com`. A GitHub Enterprise
     /// server's API address, or a test server's.
@@ -43,6 +57,10 @@ pub struct Config {
     /// `BUZZ_HIVE_AGENTS_DIR`, the folder holding one folder per agent (`deploy/aws/agents`),
     /// read at start to seed the agents' tool servers. Unset means no agent is known.
     pub agents_dir: Option<std::path::PathBuf>,
+    /// `BUZZ_HIVE_SECRETS_DIR` (files, local development) or `BUZZ_HIVE_SECRETS_BACKEND=ssm`
+    /// (SSM, with `BUZZ_HIVE_AWS_CLI`, default `aws`). Not both. Neither means a secret
+    /// cannot be set. Beehive only writes: it has no setting that reads a value back.
+    pub secrets: SecretsBackend,
 }
 
 /// Longest any one statement may run, and the longest a statement waits for a lock.
@@ -95,6 +113,24 @@ impl Config {
                 _ => Err(format!("{name} must be a whole number from 1 to {max}")),
             }
         };
+        let secrets = match (
+            optional("BUZZ_HIVE_SECRETS_DIR"),
+            optional("BUZZ_HIVE_SECRETS_BACKEND"),
+        ) {
+            (None, None) => SecretsBackend::None,
+            (Some(dir), None) => SecretsBackend::Dir(dir.into()),
+            (None, Some(kind)) if kind == "ssm" => SecretsBackend::Ssm {
+                cli: optional("BUZZ_HIVE_AWS_CLI")
+                    .unwrap_or_else(|| "aws".into())
+                    .into(),
+            },
+            (None, Some(_)) => return Err("BUZZ_HIVE_SECRETS_BACKEND must be ssm".into()),
+            (Some(_), Some(_)) => {
+                return Err(
+                    "set BUZZ_HIVE_SECRETS_DIR or BUZZ_HIVE_SECRETS_BACKEND, not both".into(),
+                )
+            }
+        };
         Ok(Self {
             database_url: required("BUZZ_HIVE_DATABASE_URL")?,
             listen,
@@ -118,6 +154,7 @@ impl Config {
             )?),
             supervisor_socket: optional("BUZZ_HIVE_SUPERVISOR_SOCKET").map(Into::into),
             agents_dir: optional("BUZZ_HIVE_AGENTS_DIR").map(Into::into),
+            secrets,
             github_token: optional("GH_TOKEN"),
             github_api_url: match optional("BUZZ_HIVE_GITHUB_API_URL") {
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,
@@ -188,6 +225,45 @@ mod tests {
             let error = Config::from_lookup(env(&pairs)).err().unwrap();
             assert!(error.contains(name), "{error}");
         }
+    }
+
+    #[test]
+    fn the_secret_store_is_files_or_ssm_and_never_both() {
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = FULL.to_vec();
+            pairs.extend_from_slice(extra);
+            Config::from_lookup(env(&pairs))
+        };
+        assert_eq!(with(&[]).unwrap().secrets, SecretsBackend::None);
+        assert_eq!(
+            with(&[("BUZZ_HIVE_SECRETS_DIR", "/srv/secrets")])
+                .unwrap()
+                .secrets,
+            SecretsBackend::Dir("/srv/secrets".into())
+        );
+        assert_eq!(
+            with(&[("BUZZ_HIVE_SECRETS_BACKEND", "ssm")])
+                .unwrap()
+                .secrets,
+            SecretsBackend::Ssm { cli: "aws".into() }
+        );
+        assert_eq!(
+            with(&[
+                ("BUZZ_HIVE_SECRETS_BACKEND", "ssm"),
+                ("BUZZ_HIVE_AWS_CLI", "/usr/local/bin/aws")
+            ])
+            .unwrap()
+            .secrets,
+            SecretsBackend::Ssm {
+                cli: "/usr/local/bin/aws".into()
+            }
+        );
+        assert!(with(&[("BUZZ_HIVE_SECRETS_BACKEND", "vault")]).is_err());
+        assert!(with(&[
+            ("BUZZ_HIVE_SECRETS_BACKEND", "ssm"),
+            ("BUZZ_HIVE_SECRETS_DIR", "/x")
+        ])
+        .is_err());
     }
 
     #[test]

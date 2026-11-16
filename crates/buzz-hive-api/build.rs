@@ -11,6 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prost_build::Config::new()
         .file_descriptor_set_path(&descriptor)
         .compile_well_known_types()
+        // A secret's value must not reach a log line through a stray `{:?}`.
+        .skip_debug([
+            ".kiln.engine.v1.SetTeamSecretRequest",
+            ".kiln.engine.v1.SetAgentSecretRequest",
+        ])
         .extern_path(".google.protobuf", "::pbjson_types")
         .compile_protos(&["proto/kiln/engine/v1/engine.proto"], &["proto"])?;
     pbjson_build::Builder::new()

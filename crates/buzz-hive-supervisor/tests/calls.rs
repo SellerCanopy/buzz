@@ -20,6 +20,7 @@ async fn an_unsigned_badly_signed_stale_replayed_and_unknown_call_is_refused_bef
     let call = Call::ApplyAgentConfig {
         agent: "coder".into(),
         servers: servers(),
+        secrets: Default::default(),
     };
     let now = NOW;
     let line = rig.signer.sign(&call, now);
@@ -109,6 +110,7 @@ async fn an_agent_with_no_folder_is_refused_and_nothing_is_written_or_restarted(
             Call::ApplyAgentConfig {
                 agent: agent.into(),
                 servers: servers(),
+                secrets: Default::default(),
             },
             Call::RestartAgent {
                 agent: agent.into(),

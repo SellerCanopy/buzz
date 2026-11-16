@@ -77,6 +77,7 @@ async fn stack(store: Arc<MemStore>, replay: &Replay) -> Stack {
         code_host: Some(host.clone()),
         intake: wake.clone(),
         supervisor: None,
+        secrets: None,
     };
     let random: Random = Arc::new(|| 0.0);
     let shared = Arc::new(Shared {

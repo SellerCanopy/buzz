@@ -321,6 +321,26 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "a person's call from the agents page; the engine refuses an agent",
     ),
     (
+        "ListSecretNames",
+        "a person reviews which secrets exist on the agents page; an agent has no business listing credentials",
+    ),
+    (
+        "SetTeamSecret",
+        "a secret is a credential, so only a person sets one and the engine refuses an agent; the value is write-only",
+    ),
+    (
+        "SetAgentSecret",
+        "a secret is a credential, so only a person sets one and the engine refuses an agent; the value is write-only",
+    ),
+    (
+        "GrantTeamSecret",
+        "an agent that could grant itself a team secret could take another agent's keys, so only a person grants one",
+    ),
+    (
+        "RevokeTeamSecret",
+        "a person's call from the agents page; the engine refuses an agent",
+    ),
+    (
         "GetStatus",
         "the page's header counts; get_hive_health reports what an agent needs",
     ),

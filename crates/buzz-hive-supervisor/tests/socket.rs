@@ -135,6 +135,7 @@ fn the_binary_applies_a_signed_call_and_restarts_only_when_the_output_changed() 
         let call = Call::ApplyAgentConfig {
             agent: "coder".into(),
             servers,
+            secrets: Default::default(),
         };
         exchange(&socket, &rig.signer.sign(&call, now_ms()))
     };

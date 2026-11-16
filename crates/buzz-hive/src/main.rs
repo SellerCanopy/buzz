@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
+use buzz_hive::config::SecretsBackend;
 use buzz_hive::{
-    agent_seed, config, dir_source, drain, github_adapter, intake, relay_adapter,
-    supervisor_client, timers,
+    agent_seed, config, dir_source, drain, file_secrets, github_adapter, intake, relay_adapter,
+    ssm_adapter, supervisor_client, timers,
 };
 use buzz_hive_api::replay::{ReplayGuard, REPLAY_TTL};
 use buzz_hive_api::token::{SystemClock, TokenMinter};
@@ -13,6 +14,7 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::orchestrator::agent_tools;
 use buzz_hive_core::orchestrator::workflows::record_builtins;
 use buzz_hive_core::ports::code_host::CodeHost;
+use buzz_hive_core::ports::secrets::SecretSink;
 use buzz_hive_core::ports::store::Store;
 use buzz_hive_core::ports::supervisor::Supervisor;
 use buzz_hive_core::workflow::builtin::builtin_source;
@@ -246,6 +248,22 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    // Beehive only writes secret values. The host supervisor reads them from the same store.
+    let secrets: Option<Arc<dyn SecretSink>> = match &config.secrets {
+        SecretsBackend::None => {
+            tracing::warn!("no secret store is set (BUZZ_HIVE_SECRETS_DIR or BUZZ_HIVE_SECRETS_BACKEND=ssm): secrets cannot be set");
+            None
+        }
+        SecretsBackend::Dir(dir) => {
+            tracing::info!(dir = %dir.display(), "secrets are written to files");
+            Some(Arc::new(file_secrets::FileSecretSink::new(dir.clone())))
+        }
+        SecretsBackend::Ssm { cli } => {
+            tracing::info!("secrets are written to SSM Parameter Store");
+            Some(Arc::new(ssm_adapter::SsmSecretSink::new(cli.clone())))
+        }
+    };
+
     let app = App {
         config: Arc::new(ApiConfig {
             public_url: config.public_url.clone(),
@@ -271,6 +289,7 @@ async fn run() -> Result<(), String> {
         code_host: code_host.clone(),
         intake: Arc::new(tokio::sync::Notify::new()),
         supervisor,
+        secrets,
     };
     let bus = app.bus.clone();
     let (stop, stopped) = tokio::sync::watch::channel(false);

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::ToolServer;
 use buzz_hive_core::ports::supervisor::{AgentSettings, Supervisor, SupervisorError};
 use buzz_hive_core::supervisor_wire::{Call, Reply, Signer, MAX_LINE_BYTES};
@@ -65,12 +66,18 @@ impl UnixSupervisor {
 
 #[async_trait::async_trait]
 impl Supervisor for UnixSupervisor {
-    async fn apply(&self, agent: &str, servers: &[ToolServer]) -> Result<bool, SupervisorError> {
+    async fn apply(
+        &self,
+        agent: &str,
+        servers: &[ToolServer],
+        secrets: &SecretNames,
+    ) -> Result<bool, SupervisorError> {
         let result = self
             .call(
                 &Call::ApplyAgentConfig {
                     agent: agent.to_owned(),
                     servers: servers.to_vec(),
+                    secrets: secrets.clone(),
                 },
                 APPLY_TIMEOUT,
             )

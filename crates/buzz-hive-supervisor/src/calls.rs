@@ -6,16 +6,24 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use buzz_hive_core::domain::secret::{check_value, check_var, SecretNames};
 use buzz_hive_core::domain::tool_server::{check_agent, render_mcp, ToolServer};
+use buzz_hive_core::ports::secrets::SecretScope;
 use buzz_hive_core::supervisor_wire::{Call, Reply, Verifier};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::config::{Config, Restart};
+use crate::config::{Config, Restart, Secrets};
+use crate::secrets::{FileSecretSource, NoSecrets, SecretSource, SsmSecretSource};
+
+/// The comment line that lists the variables an apply filled in, so the next apply can take
+/// out the ones no longer granted. It holds names only.
+const INJECTED: &str = "# buzz-hive-injected: ";
 
 /// The longest a restart may take. Compose waits up to the container's 60 second stop grace.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(180);
@@ -23,6 +31,8 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(180);
 pub struct Service {
     config: Config,
     verifier: Verifier,
+    /// The only reader of secret values.
+    secrets: Arc<dyn SecretSource>,
     /// One change at a time, so two applies never interleave their files and restarts.
     writes: Mutex<()>,
 }
@@ -40,10 +50,21 @@ impl Failure {
 
 impl Service {
     pub fn new(config: Config) -> Result<Self, String> {
+        let secrets: Arc<dyn SecretSource> = match &config.secrets {
+            Secrets::None => Arc::new(NoSecrets),
+            Secrets::Dir(dir) => Arc::new(FileSecretSource { dir: dir.clone() }),
+            Secrets::Ssm { cli } => Arc::new(SsmSecretSource { cli: cli.clone() }),
+        };
+        Self::with_secrets(config, secrets)
+    }
+
+    /// A service that reads secret values from `secrets`, whatever the config says.
+    pub fn with_secrets(config: Config, secrets: Arc<dyn SecretSource>) -> Result<Self, String> {
         let verifier = Verifier::new(&config.engine_key)?;
         Ok(Self {
             config,
             verifier,
+            secrets,
             writes: Mutex::new(()),
         })
     }
@@ -64,8 +85,12 @@ impl Service {
         };
         let method = call.method();
         let (agent, outcome) = match call {
-            Call::ApplyAgentConfig { agent, servers } => {
-                let outcome = self.apply(&agent, &servers).await;
+            Call::ApplyAgentConfig {
+                agent,
+                servers,
+                secrets,
+            } => {
+                let outcome = self.apply(&agent, &servers, &secrets).await;
                 (
                     agent,
                     outcome.map(|restarted| json!({ "restarted": restarted })),
@@ -119,12 +144,25 @@ impl Service {
     /// Makes the agent's files what `servers` and the Beehive settings render to, and restarts
     /// the agent when they changed, or when an earlier restart did not finish. Returns whether
     /// it restarted.
-    async fn apply(&self, agent: &str, servers: &[ToolServer]) -> Result<bool, Failure> {
+    async fn apply(
+        &self,
+        agent: &str,
+        servers: &[ToolServer],
+        secrets: &SecretNames,
+    ) -> Result<bool, Failure> {
         self.known(agent)?;
         let _one_at_a_time = self.writes.lock().await;
         let paths = self.paths(agent);
-        let base = parse_env(&read_env(&paths.env)?);
-        let env_text = format_env(&render_env(&self.config.hive_pubkey, &base));
+        let before = read_env(&paths.env)?;
+        let mut base = parse_env(&before);
+        // What an earlier apply filled in comes out first, so a secret no longer granted is
+        // gone from the file and one still granted is read again (a rotated value restarts).
+        for var in injected(&before) {
+            base.remove(&var);
+        }
+        let mut env = render_env(&self.config.hive_pubkey, &base);
+        let filled = self.fill(agent, secrets, &mut env).await?;
+        let env_text = format_env_with(&env, &filled);
         let mcp_text = render_mcp(servers);
         let hash = digest(&mcp_text, &env_text);
 
@@ -147,6 +185,48 @@ impl Service {
         self.restart(agent).await?;
         write_atomic(&paths.applied, 0o600, &hash)?;
         Ok(true)
+    }
+
+    /// Reads each secret `secrets` names and puts it in `env`. An agent's own secret wins over
+    /// a team secret of the same name. A secret that is not in the store, or whose value the
+    /// env file could not hold, fails the apply and says which name, never the value, so no
+    /// agent starts half filled.
+    async fn fill(
+        &self,
+        agent: &str,
+        secrets: &SecretNames,
+        env: &mut BTreeMap<String, String>,
+    ) -> Result<BTreeSet<String>, Failure> {
+        let wanted = secrets
+            .team
+            .iter()
+            .filter(|var| !secrets.own.contains(var))
+            .map(|var| (SecretScope::Team, var))
+            .chain(
+                secrets
+                    .own
+                    .iter()
+                    .map(|var| (SecretScope::Agent(agent.to_owned()), var)),
+            );
+        let mut filled = BTreeSet::new();
+        for (scope, var) in wanted {
+            check_var(var).map_err(Failure::failed)?;
+            let value = self
+                .secrets
+                .read(&scope, var)
+                .await
+                .map_err(Failure::failed)?
+                .ok_or_else(|| {
+                    Failure::failed(format!(
+                        "the secret {var} is granted but not set in the secret store"
+                    ))
+                })?;
+            check_value(value.expose())
+                .map_err(|e| Failure::failed(format!("the secret {var} cannot be written: {e}")))?;
+            env.insert(var.clone(), value.expose().to_owned());
+            filled.insert(var.clone());
+        }
+        Ok(filled)
     }
 
     async fn restart_known(&self, agent: &str) -> Result<(), Failure> {
@@ -267,6 +347,33 @@ pub fn format_env(env: &BTreeMap<String, String>) -> String {
         .collect()
 }
 
+/// [`format_env`], with a first line naming the variables that were filled in from the secret
+/// store. No line when none were. A comment line is valid in an env file.
+pub fn format_env_with(env: &BTreeMap<String, String>, filled: &BTreeSet<String>) -> String {
+    let mut text = String::new();
+    if !filled.is_empty() {
+        let names: Vec<_> = filled.iter().map(String::as_str).collect();
+        text = format!("{INJECTED}{}\n", names.join(","));
+    }
+    text.push_str(&format_env(env));
+    text
+}
+
+/// The variables the file's marker line says an earlier apply filled in.
+pub fn injected(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(INJECTED))
+        .map(|names| {
+            names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| check_var(name).is_ok())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn digest(mcp: &str, env: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(mcp.as_bytes());
@@ -344,6 +451,23 @@ mod tests {
             render_env(HIVE, &env(&[]))["BUZZ_ACP_RESPOND_TO_ALLOWLIST"],
             "aa"
         );
+    }
+
+    #[test]
+    fn the_marker_line_names_what_was_filled_in_and_the_file_still_parses() {
+        let env = env(&[("A", "1"), ("GH_TOKEN", "x")]);
+        let filled: BTreeSet<String> = ["GH_TOKEN".to_owned(), "DOCS_TOKEN".to_owned()].into();
+        let text = format_env_with(&env, &filled);
+        assert_eq!(
+            text,
+            "# buzz-hive-injected: DOCS_TOKEN,GH_TOKEN\nA=1\nGH_TOKEN=x\n"
+        );
+        assert_eq!(injected(&text), filled);
+        assert_eq!(parse_env(&text), env);
+        assert_eq!(format_env_with(&env, &BTreeSet::new()), format_env(&env));
+        assert!(injected("A=1\n").is_empty());
+        // A marker naming a reserved variable is not trusted.
+        assert!(injected("# buzz-hive-injected: BUZZ_PRIVATE_KEY,lower\n").is_empty());
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod merge;
 pub mod poll;
 mod repos;
 mod runs;
+mod secrets;
 mod settings;
 mod stages;
 mod status;
@@ -28,7 +29,6 @@ use buzz_hive_core::access::Level;
 
 use crate::app::App;
 use crate::tools::TOOLS;
-use crate::unary::unary;
 
 /// Every procedure served now, with the level it needs.
 pub const ROUTES: &[(&str, Level)] = &[
@@ -133,6 +133,11 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListAgentToolServers", Level::Read),
     ("SetAgentToolServer", Level::Admin),
     ("RemoveAgentToolServer", Level::Admin),
+    ("ListSecretNames", Level::Admin),
+    ("SetTeamSecret", Level::Admin),
+    ("SetAgentSecret", Level::Admin),
+    ("GrantTeamSecret", Level::Admin),
+    ("RevokeTeamSecret", Level::Admin),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -199,7 +204,11 @@ where
     F: Fn(App, crate::unary::Ctx, Req) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Res, crate::error::HiveError>> + Send + 'static,
 {
-    r.route(&path(method), unary(needs(method), handler))
+    let sealed = secrets::WRITE_ONLY.contains(&method);
+    r.route(
+        &path(method),
+        crate::unary::unary_with(needs(method), sealed, handler),
+    )
 }
 
 /// A route for every entry in [`ROUTES`].
@@ -312,5 +321,10 @@ pub fn router() -> Router<App> {
         "RemoveAgentToolServer",
         agent_tools::remove_agent_tool_server,
     );
+    let r = route(r, "ListSecretNames", secrets::list_secret_names);
+    let r = route(r, "SetTeamSecret", secrets::set_team_secret);
+    let r = route(r, "SetAgentSecret", secrets::set_agent_secret);
+    let r = route(r, "GrantTeamSecret", secrets::grant_team_secret);
+    let r = route(r, "RevokeTeamSecret", secrets::revoke_team_secret);
     route(r, "GetUsage", status::get_usage)
 }

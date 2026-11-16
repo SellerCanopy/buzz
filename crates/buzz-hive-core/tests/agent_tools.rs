@@ -253,7 +253,12 @@ async fn the_settings_check_is_unknown_without_a_supervisor_or_when_it_fails() {
     struct Down;
     #[async_trait::async_trait]
     impl Supervisor for Down {
-        async fn apply(&self, _: &str, _: &[ToolServer]) -> Result<bool, SupervisorError> {
+        async fn apply(
+            &self,
+            _: &str,
+            _: &[ToolServer],
+            _: &buzz_hive_core::domain::secret::SecretNames,
+        ) -> Result<bool, SupervisorError> {
             Err(SupervisorError::Unavailable("down".into()))
         }
         async fn settings(

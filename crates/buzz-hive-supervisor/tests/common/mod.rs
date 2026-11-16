@@ -5,10 +5,11 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
 use buzz_hive_core::supervisor_wire::{Call, Reply, Signer};
 use buzz_hive_supervisor::calls::Service;
-use buzz_hive_supervisor::config::{Config, Restart};
+use buzz_hive_supervisor::config::{Config, Restart, Secrets};
 use serde_json::json;
 
 pub const HIVE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -66,6 +67,7 @@ impl Rig {
             agents_src: root.join("src/agents"),
             render_dir: root.join("render"),
             restart: Restart::Command(restart),
+            secrets: Secrets::Dir(root.join("secrets")),
             socket_uid: None,
         };
         Self {
@@ -94,11 +96,30 @@ impl Rig {
     }
 
     pub async fn apply(&self, agent: &str, servers: Vec<ToolServer>) -> Reply {
+        self.apply_with(agent, servers, SecretNames::default())
+            .await
+    }
+
+    pub async fn apply_with(
+        &self,
+        agent: &str,
+        servers: Vec<ToolServer>,
+        secrets: SecretNames,
+    ) -> Reply {
         self.call(&Call::ApplyAgentConfig {
             agent: agent.into(),
             servers,
+            secrets,
         })
         .await
+    }
+
+    /// Puts a value where the file secret source reads it: `team/env/<var>` or
+    /// `agents/<agent>/env/<var>` under the rig's secrets folder.
+    pub fn put_secret(&self, relative: &str, value: &str) {
+        let path = self.root().join("secrets").join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value).unwrap();
     }
 
     /// The agents restarted so far, in order.

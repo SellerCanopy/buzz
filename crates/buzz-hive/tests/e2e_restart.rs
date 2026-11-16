@@ -157,6 +157,7 @@ fn in_process(world: &World, address: SocketAddr) -> App {
         code_host: None,
         intake: Arc::new(tokio::sync::Notify::new()),
         supervisor: None,
+        secrets: None,
     }
 }
 

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::secret::SecretNames;
 use crate::domain::tool_server::{check_list, ToolServer};
 
 /// How far a call's timestamp may be from the supervisor's clock.
@@ -27,10 +28,13 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 /// The supervisor's three calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
-    /// Make `servers` the agent's whole list and restart it if its files changed.
+    /// Make `servers` the agent's whole list, fill its environment with the secrets named in
+    /// `secrets`, and restart it if its files changed. Only names are sent: the supervisor
+    /// reads each value from the secret store itself.
     ApplyAgentConfig {
         agent: String,
         servers: Vec<ToolServer>,
+        secrets: SecretNames,
     },
     /// Restart the agent.
     RestartAgent { agent: String },
@@ -42,6 +46,8 @@ pub enum Call {
 struct Apply {
     agent: String,
     servers: Vec<ToolServer>,
+    #[serde(default)]
+    secrets: SecretNames,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,9 +66,14 @@ impl Call {
 
     fn body(&self) -> String {
         match self {
-            Self::ApplyAgentConfig { agent, servers } => serde_json::to_string(&Apply {
+            Self::ApplyAgentConfig {
+                agent,
+                servers,
+                secrets,
+            } => serde_json::to_string(&Apply {
                 agent: agent.clone(),
                 servers: servers.clone(),
+                secrets: secrets.clone(),
             }),
             Self::RestartAgent { agent } | Self::AgentSettings { agent } => {
                 serde_json::to_string(&Named {
@@ -77,7 +88,11 @@ impl Call {
         let bad = |e: serde_json::Error| Refusal::BadBody(e.to_string());
         match method {
             "ApplyAgentConfig" => {
-                let Apply { agent, servers } = serde_json::from_str(body).map_err(bad)?;
+                let Apply {
+                    agent,
+                    servers,
+                    secrets,
+                } = serde_json::from_str(body).map_err(bad)?;
                 // A spec is checked again here, so a caller that skipped the engine's checks
                 // still cannot write what the engine would refuse.
                 for server in &servers {
@@ -85,7 +100,12 @@ impl Call {
                         .map_err(Refusal::BadBody)?;
                 }
                 check_list(&servers).map_err(Refusal::BadBody)?;
-                Ok(Self::ApplyAgentConfig { agent, servers })
+                secrets.check().map_err(Refusal::BadBody)?;
+                Ok(Self::ApplyAgentConfig {
+                    agent,
+                    servers,
+                    secrets,
+                })
             }
             "RestartAgent" => Ok(Self::RestartAgent {
                 agent: serde_json::from_str::<Named>(body).map_err(bad)?.agent,
@@ -303,6 +323,10 @@ mod tests {
             servers: vec![
                 ToolServer::new("fs", Transport::Stdio, &json!({"command": "x"})).unwrap(),
             ],
+            secrets: SecretNames {
+                own: vec!["DOCS_TOKEN".into()],
+                team: vec!["GH_TOKEN".into()],
+            },
         }
     }
 
@@ -417,6 +441,30 @@ mod tests {
             verifier.open(&sign("ApplyAgentConfig", literal, 12), 12),
             Err(Refusal::BadBody(_))
         ));
+    }
+
+    #[test]
+    fn secret_names_travel_and_a_reserved_or_malformed_name_is_refused() {
+        let (signer, verifier) = pair();
+        assert_eq!(
+            verifier.open(&signer.sign(&apply(), 5), 5).unwrap(),
+            apply()
+        );
+        for bad in ["BUZZ_PRIVATE_KEY", "BUZZ_ACP_SESSION_POLICY", "lower"] {
+            let body = json!({"agent": "coder", "servers": [], "secrets": {"team": [bad]}});
+            let signature = hex::encode(
+                signer
+                    .pair
+                    .sign(&message("ApplyAgentConfig", &body.to_string(), 6))
+                    .as_ref(),
+            );
+            let line = json!({"method": "ApplyAgentConfig", "body": body.to_string(), "timestamp": 6, "signature": signature})
+                .to_string();
+            assert!(
+                matches!(verifier.open(&line, 6), Err(Refusal::BadBody(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

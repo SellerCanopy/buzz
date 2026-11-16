@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use buzz_hive::supervisor_client::UnixSupervisor;
+use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
 use buzz_hive_core::ports::supervisor::{Supervisor, SupervisorError};
 use buzz_hive_core::supervisor_wire::{Call, Reply, Verifier};
@@ -57,15 +58,36 @@ async fn an_apply_is_signed_with_the_secrets_key_and_returns_whether_the_agent_r
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("s.sock");
     let seen = serve(&socket, Reply::done(json!({"restarted": true})));
-    let restarted = client(&socket).apply("coder", &[fs()]).await.unwrap();
+    let restarted = client(&socket)
+        .apply("coder", &[fs()], &Default::default())
+        .await
+        .unwrap();
     assert!(restarted);
     assert_eq!(
         *seen.lock().unwrap(),
         [Call::ApplyAgentConfig {
             agent: "coder".into(),
-            servers: vec![fs()]
+            servers: vec![fs()],
+            secrets: Default::default(),
         }]
     );
+}
+
+#[tokio::test]
+async fn an_apply_carries_secret_names_and_nothing_else_about_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("s.sock");
+    let seen = serve(&socket, Reply::done(json!({"restarted": false})));
+    let names = SecretNames {
+        own: vec!["DOCS_TOKEN".into()],
+        team: vec!["GH_TOKEN".into()],
+    };
+    client(&socket).apply("coder", &[], &names).await.unwrap();
+    let calls = seen.lock().unwrap();
+    let Call::ApplyAgentConfig { secrets, .. } = &calls[0] else {
+        panic!("{calls:?}")
+    };
+    assert_eq!(secrets, &names);
 }
 
 #[tokio::test]
@@ -97,7 +119,10 @@ async fn each_reply_code_becomes_its_error() {
     ] {
         let socket = dir.path().join(format!("{code}.sock"));
         serve(&socket, Reply::failed(code, "why"));
-        let error = client(&socket).apply("coder", &[]).await.unwrap_err();
+        let error = client(&socket)
+            .apply("coder", &[], &Default::default())
+            .await
+            .unwrap_err();
         assert!(check(&error), "{code} gave {error}");
         assert!(error.to_string().contains("why"), "{error}");
     }
@@ -117,7 +142,10 @@ async fn a_supervisor_that_is_not_there_is_unavailable_and_a_wrong_key_is_refuse
     serve(&socket, Reply::done(json!({"restarted": false})));
     let other = UnixSupervisor::new(socket, b"another secret of enough length!!").unwrap();
     assert!(matches!(
-        other.apply("coder", &[]).await.unwrap_err(),
+        other
+            .apply("coder", &[], &Default::default())
+            .await
+            .unwrap_err(),
         SupervisorError::Refused(_)
     ));
 }

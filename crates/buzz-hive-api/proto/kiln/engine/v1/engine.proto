@@ -608,6 +608,31 @@ service EngineService {
   // Beehive addition: takes a tool server off an agent and applies the agent as
   // SetAgentToolServer does. Needs Admin. A server the agent does not have is NotFound.
   rpc RemoveAgentToolServer(RemoveAgentToolServerRequest) returns (AgentToolsChange);
+  // Beehive addition: every secret's name, who set it and when, and which agents hold each
+  // team secret. Never a value: a secret is write-only. Needs Admin, since it shows what
+  // credentials exist. An agent is PermissionDenied.
+  rpc ListSecretNames(ListSecretNamesRequest) returns (ListSecretNamesResponse);
+  // Beehive addition: sets or replaces a team secret. The value goes to the secret store and
+  // is never stored, logged, returned or read back by the engine. The host supervisor fills it
+  // into the environment of each agent granted it, so a replaced value reaches them and they
+  // restart. Needs Admin; an agent is PermissionDenied. A name that is not capital letters,
+  // digits and '_', one the deploy sets itself (BUZZ_, CLAUDE, ANTHROPIC_, OPENAI_, CODEX_,
+  // HOME, PATH...), or a value with a space, quote, '$' or line break, or over 4096 bytes, is
+  // InvalidArgument and the error never repeats the value. No secret store configured is
+  // FailedPrecondition. Appends a secret.changed event with the name only.
+  rpc SetTeamSecret(SetTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: sets or replaces one agent's own secret, then applies that agent. As
+  // SetTeamSecret, and an agent with no folder is NotFound. An own secret wins over a team
+  // secret of the same name. An agent holds at most 64 secrets, own and granted together.
+  rpc SetAgentSecret(SetAgentSecretRequest) returns (SecretChange);
+  // Beehive addition: gives an agent a team secret by name, then applies the agent. An agent
+  // gets no team secret until it is granted one. A name no team secret has is NotFound.
+  // Needs Admin. Granting what the agent already has changes nothing.
+  rpc GrantTeamSecret(GrantTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: takes a team secret from an agent and applies the agent, which removes
+  // it from the agent's environment. Needs Admin. A secret the agent was not granted is
+  // NotFound. The value stays in the store for the agents that still hold it.
+  rpc RevokeTeamSecret(RevokeTeamSecretRequest) returns (SecretChange);
 }
 
 message GetStatusRequest {}
@@ -3219,5 +3244,74 @@ message AgentToolsChange {
   // Whether the agent restarted because its files changed.
   bool restarted = 3;
   // Why the change was not applied, empty when it was.
+  string apply_error = 4;
+}
+
+message ListSecretNamesRequest {}
+
+message ListSecretNamesResponse {
+  // Team secrets, by name.
+  repeated SecretName team = 1;
+  // Agent secrets, by agent then name.
+  repeated AgentSecretName agents = 2;
+  // Which agent holds which team secret, by agent then name.
+  repeated SecretGrant grants = 3;
+}
+
+// SecretName is a secret's name and who last set it. There is no value.
+message SecretName {
+  string name = 1;
+  // The pubkey of the person who last set it.
+  string updated_by = 2;
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+message AgentSecretName {
+  string agent = 1;
+  SecretName secret = 2;
+}
+
+message SecretGrant {
+  string agent = 1;
+  string name = 2;
+}
+
+// The value is write-only: the engine hands it to the secret store and keeps nothing.
+message SetTeamSecretRequest {
+  string name = 1;
+  string value = 2;
+}
+
+message SetAgentSecretRequest {
+  string agent = 1;
+  string name = 2;
+  string value = 3;
+}
+
+message GrantTeamSecretRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+message RevokeTeamSecretRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+// SecretChange says which agents the change reached. The change is saved even when the host
+// supervisor could not be reached; each agent says so.
+message SecretChange {
+  // Agents the change was applied to: the agents holding a replaced team secret, or the one
+  // agent of a grant, revoke or own secret. Empty when no agent holds the secret yet.
+  repeated SecretApplied applied = 1;
+}
+
+message SecretApplied {
+  string agent = 1;
+  // Whether the supervisor wrote the agent's environment.
+  bool applied = 2;
+  // Whether the agent restarted because its environment changed.
+  bool restarted = 3;
+  // Why it was not applied, empty when it was.
   string apply_error = 4;
 }

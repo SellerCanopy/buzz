@@ -148,6 +148,8 @@ supervise_agents() {
     echo "BUZZ_HIVE_SUPERVISOR_SOCKET_UID=1000"
     echo "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC=$BUZZ_HOME/deploy/aws/agents"
     echo "BUZZ_HIVE_SUPERVISOR_RENDER_DIR=$agents_dir"
+    # Agent and team secrets are read from SSM with the host's aws program and instance role.
+    echo "BUZZ_HIVE_SUPERVISOR_SECRETS=ssm"
   } > "$unit_env"
   chmod 600 "$unit_env"
   mkdir -p "$agents_dir"

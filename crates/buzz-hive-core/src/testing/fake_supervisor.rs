@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::domain::secret::SecretNames;
 use crate::domain::tool_server::ToolServer;
 use crate::ports::supervisor::{AgentSettings, Supervisor, SupervisorError};
 
@@ -17,6 +18,7 @@ struct Inner {
 struct Deployed {
     settings: AgentSettings,
     servers: Vec<ToolServer>,
+    secrets: SecretNames,
 }
 
 /// A [`Supervisor`] held in memory. An agent applied to becomes `thread` and allowlisted, as
@@ -41,6 +43,7 @@ impl FakeSupervisor {
                     allowlisted,
                 },
                 servers: Vec::new(),
+                secrets: SecretNames::default(),
             },
         );
     }
@@ -60,6 +63,16 @@ impl FakeSupervisor {
             .map(|d| d.servers.clone())
     }
 
+    /// The secret names the agent was last given.
+    pub fn secrets(&self, agent: &str) -> Option<SecretNames> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent)
+            .map(|d| d.secrets.clone())
+    }
+
     /// Every apply made, with the server names each carried.
     pub fn applied(&self) -> Vec<(String, Vec<String>)> {
         self.inner.lock().unwrap().applied.clone()
@@ -68,7 +81,12 @@ impl FakeSupervisor {
 
 #[async_trait::async_trait]
 impl Supervisor for FakeSupervisor {
-    async fn apply(&self, agent: &str, servers: &[ToolServer]) -> Result<bool, SupervisorError> {
+    async fn apply(
+        &self,
+        agent: &str,
+        servers: &[ToolServer],
+        secrets: &SecretNames,
+    ) -> Result<bool, SupervisorError> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.failures.is_empty() {
             return Err(inner.failures.remove(0));
@@ -77,9 +95,11 @@ impl Supervisor for FakeSupervisor {
             return Err(SupervisorError::NotFound(agent.to_owned()));
         };
         let changed = deployed.servers != servers
+            || deployed.secrets != *secrets
             || deployed.settings.session_policy != "thread"
             || !deployed.settings.allowlisted;
         deployed.servers = servers.to_vec();
+        deployed.secrets = secrets.clone();
         deployed.settings = AgentSettings {
             session_policy: "thread".into(),
             allowlisted: true,

@@ -136,6 +136,11 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // A person set or removed one of an agent's tool servers. The payload has the agent, the
     // server's name and whether it was `set` or `removed`. Nothing of the spec is in it.
     ("agent_tools.changed", 22),
+    // A person set a secret, or granted or revoked a team secret for an agent. The payload has
+    // the scope (`team` or `agent`), the agent when there is one, the variable's name and
+    // whether it was `set`, `granted` or `revoked`. The event's actor and time say who and
+    // when. It never holds a value.
+    ("secret.changed", 23),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

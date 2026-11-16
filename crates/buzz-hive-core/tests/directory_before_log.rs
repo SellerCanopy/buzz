@@ -124,6 +124,9 @@ impl Tx for SpyTx {
     fn agent_tools(&mut self) -> &mut dyn buzz_hive_core::ports::store::AgentToolsRepo {
         self.inner.agent_tools()
     }
+    fn secrets(&mut self) -> &mut dyn buzz_hive_core::ports::store::SecretsRepo {
+        self.inner.secrets()
+    }
     fn jobs(&mut self) -> &mut dyn buzz_hive_core::ports::store::JobsRepo {
         self.inner.jobs()
     }

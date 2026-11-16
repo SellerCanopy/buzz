@@ -12,6 +12,17 @@ pub enum Restart {
     Command(PathBuf),
 }
 
+/// Where the supervisor reads secret values from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Secrets {
+    /// No store: an apply that names a secret fails.
+    None,
+    /// Files under a folder, for local development.
+    Dir(PathBuf),
+    /// SSM Parameter Store, read with the `aws` program at this path.
+    Ssm { cli: PathBuf },
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `BUZZ_HIVE_SUPERVISOR_SOCKET`
@@ -31,6 +42,10 @@ pub struct Config {
     /// `BUZZ_HIVE_SUPERVISOR_RESTART_CMD`, a program that takes the agent name. Unset means
     /// the Compose recreate of `compose.agents.yml`, next to `agents_src`.
     pub restart: Restart,
+    /// `BUZZ_HIVE_SUPERVISOR_SECRETS_DIR` (files, local development) or
+    /// `BUZZ_HIVE_SUPERVISOR_SECRETS=ssm` (SSM, with `BUZZ_HIVE_SUPERVISOR_AWS_CLI`, default
+    /// `aws`). Not both. Neither means no secret can be filled in.
+    pub secrets: Secrets,
     /// `BUZZ_HIVE_SUPERVISOR_SOCKET_UID`, the user id that owns the socket, which is the one
     /// `buzz-hive` runs as. Unset leaves the owner as it is.
     pub socket_uid: Option<u32>,
@@ -73,6 +88,23 @@ impl Config {
                     .map_err(|_| "BUZZ_HIVE_SUPERVISOR_SOCKET_UID must be a user id".to_owned())
             })
             .transpose()?;
+        let secrets = match (
+            optional("BUZZ_HIVE_SUPERVISOR_SECRETS_DIR"),
+            optional("BUZZ_HIVE_SUPERVISOR_SECRETS"),
+        ) {
+            (None, None) => Secrets::None,
+            (Some(dir), None) => Secrets::Dir(dir.into()),
+            (None, Some(kind)) if kind == "ssm" => Secrets::Ssm {
+                cli: optional("BUZZ_HIVE_SUPERVISOR_AWS_CLI")
+                    .unwrap_or_else(|| "aws".into())
+                    .into(),
+            },
+            (None, Some(_)) => return Err("BUZZ_HIVE_SUPERVISOR_SECRETS must be ssm".into()),
+            (Some(_), Some(_)) => return Err(
+                "set BUZZ_HIVE_SUPERVISOR_SECRETS_DIR or BUZZ_HIVE_SUPERVISOR_SECRETS, not both"
+                    .into(),
+            ),
+        };
         Ok(Self {
             socket: required("BUZZ_HIVE_SUPERVISOR_SOCKET")?.into(),
             engine_key: key("BUZZ_HIVE_SUPERVISOR_PUBKEY")?,
@@ -80,6 +112,7 @@ impl Config {
             agents_src,
             render_dir: required("BUZZ_HIVE_SUPERVISOR_RENDER_DIR")?.into(),
             restart,
+            secrets,
             socket_uid,
         })
     }
@@ -120,6 +153,57 @@ mod tests {
             lookup("", Some("/usr/local/bin/stub")).unwrap().restart,
             Restart::Command("/usr/local/bin/stub".into())
         );
+    }
+
+    #[test]
+    fn the_secret_store_is_files_or_ssm_and_never_both() {
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            let key = "ab".repeat(32);
+            Config::from_lookup(|name| {
+                if let Some((_, v)) = pairs.iter().find(|(k, _)| *k == name) {
+                    return Some((*v).to_owned());
+                }
+                match name {
+                    "BUZZ_HIVE_SUPERVISOR_SOCKET" => Some("/run/s.sock".into()),
+                    "BUZZ_HIVE_SUPERVISOR_PUBKEY" | "BUZZ_HIVE_SUPERVISOR_HIVE_PUBKEY" => {
+                        Some(key.clone())
+                    }
+                    "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
+                    "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
+                    _ => None,
+                }
+            })
+        };
+        assert_eq!(with(&[]).unwrap().secrets, Secrets::None);
+        assert_eq!(
+            with(&[("BUZZ_HIVE_SUPERVISOR_SECRETS_DIR", "/srv/secrets")])
+                .unwrap()
+                .secrets,
+            Secrets::Dir("/srv/secrets".into())
+        );
+        assert_eq!(
+            with(&[("BUZZ_HIVE_SUPERVISOR_SECRETS", "ssm")])
+                .unwrap()
+                .secrets,
+            Secrets::Ssm { cli: "aws".into() }
+        );
+        assert_eq!(
+            with(&[
+                ("BUZZ_HIVE_SUPERVISOR_SECRETS", "ssm"),
+                ("BUZZ_HIVE_SUPERVISOR_AWS_CLI", "/usr/local/bin/aws")
+            ])
+            .unwrap()
+            .secrets,
+            Secrets::Ssm {
+                cli: "/usr/local/bin/aws".into()
+            }
+        );
+        assert!(with(&[("BUZZ_HIVE_SUPERVISOR_SECRETS", "vault")]).is_err());
+        assert!(with(&[
+            ("BUZZ_HIVE_SUPERVISOR_SECRETS", "ssm"),
+            ("BUZZ_HIVE_SUPERVISOR_SECRETS_DIR", "/x")
+        ])
+        .is_err());
     }
 
     #[test]

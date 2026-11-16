@@ -756,3 +756,59 @@ be watched in the agent's log.
 - `buzz-hive keys` and `buzz-hive apply-agents` are one-shot commands for the deploy: the first
   prints the two public keys the supervisor is configured with, the second sends every known
   agent's list to it.
+
+## Phase 23: agent secrets and team secrets (the backend)
+
+- Migration `0021_secrets.sql` (the plan said 0015, which was taken) makes `hive.team_secrets`,
+  `hive.agent_secrets` and `hive.agent_secret_grants`. They hold names, who set each and when.
+  No column can hold a value, and a test lists the columns to keep it so.
+- A secret is write-only. `ports::secrets::SecretSink` has `put` and no read. `SecretString`
+  prints `[redacted]`. The request type's `Debug` is skipped in `buzz-hive-api/build.rs`, and a
+  route whose body holds a value (`WRITE_ONLY` in `routes/secrets.rs`) refuses an undecodable
+  body without serde's words, which repeat the value they met.
+- The engine puts a value in the store (`BUZZ_HIVE_SECRETS_DIR` files, mode 0600, for local
+  development; SSM under `/buzz/` when `BUZZ_HIVE_SECRETS_BACKEND=ssm`) and records the name.
+  The host supervisor reads it. `ApplyAgentConfig` carries `secrets: {own, team}` names only, so
+  the apply call never carries a value either.
+- A team secret reaches an agent only by a grant, by name. An agent with no grant gets no team
+  secret. An own secret wins over a team secret of the same name. Rotating a team secret applies
+  every agent holding it, and the supervisor restarts the agent, because the rendered file's hash
+  includes the values.
+- The supervisor lists what it filled in on the first line of the agent's env file
+  (`# buzz-hive-injected: A,B`, names only). The next apply takes those variables out first, so a
+  revoked secret leaves the file. An apply that cannot read a granted secret fails naming the
+  variable and writes nothing, so no agent starts half filled.
+- Served (all Admin, a person only; an agent is refused whatever its level): `ListSecretNames`,
+  `SetTeamSecret`, `SetAgentSecret`, `GrantTeamSecret`, `RevokeTeamSecret`. None is a tool.
+  Event kind `secret.changed`, with the name and no value.
+- Names: capital letters, digits and `_`, at most 64, and not one the deploy sets itself
+  (`BUZZ_`, `CLAUDE`, `ANTHROPIC_`, `OPENAI_`, `CODEX_`, `HOME`, `PATH`...). Values: the character
+  set `make agents-env` accepts, at most 4096 bytes, because the value lands unquoted in an env
+  file. An agent holds at most 64 secrets.
+- `deploy/aws/iam/` holds the policy text: the engine may put and not get, the supervisor may get
+  and not put, both on `/buzz/agents/*/env/*` and `/buzz/team/env/*`.
+  `tests/aws/test-hive-secrets-iam.sh` checks it.
+
+### Deviations
+
+- `aws-sdk-ssm` cannot be resolved offline, and the plan's own rule is no new dependency that
+  widens `Cargo.lock`. The engine's `SsmSecretSink` and the supervisor's `SsmSecretSource` run the
+  `aws` program instead, as `scripts/aws/agents-env.sh` already does, and are tested with stub
+  programs. The value goes to `aws` in a 0600 file, never on the command line. Swapping in the
+  SDK later changes one file on each side.
+- The engine's `GH_TOKEN` stays on its own environment. The supervisor renders agents only, and
+  the plan has `buzz-hive` read its token from its own env.
+- A third table, `hive.agent_secrets`, holds an agent's own secret names. The plan named two.
+- The read side (`SecretSource`) is in `buzz-hive-supervisor` only. No type the engine holds can
+  name it.
+- IAM: `infra/iam.tf` gained a `WriteTeamSecrets` statement, since `/buzz/agents/*` did not
+  cover `/buzz/team/`.
+
+### Not verified
+
+- Nothing ran against AWS. The `aws` program is a stub in every test.
+- The engine and the supervisor share one instance role today, so the engine/supervisor IAM
+  separation is policy text until the engine container is denied the instance metadata service
+  or has its own role.
+- `deploy/aws/Dockerfile.hive` does not install the `aws` program, so `BUZZ_HIVE_SECRETS_BACKEND=ssm`
+  needs it added to the hive image before production use.

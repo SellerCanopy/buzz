@@ -63,6 +63,7 @@ pub fn app_with(directory: FakeDirectory, store: MemStore) -> App {
         code_host: None,
         intake: Arc::new(tokio::sync::Notify::new()),
         supervisor: None,
+        secrets: None,
     }
 }
 

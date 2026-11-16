@@ -5,6 +5,7 @@
 //! supervisor knows its agents by the folders under `deploy/aws/agents/` and takes nothing
 //! else from a call.
 
+use crate::domain::secret::SecretNames;
 use crate::domain::tool_server::ToolServer;
 
 /// What the supervisor reports about one agent's settings.
@@ -32,9 +33,16 @@ pub enum SupervisorError {
 #[async_trait::async_trait]
 pub trait Supervisor: Send + Sync {
     /// Makes `servers` the agent's whole tool list, sets the settings every stage agent
-    /// needs, and restarts the agent when its files changed. Returns whether it restarted.
-    /// The call is safe to repeat: the same list changes nothing the second time.
-    async fn apply(&self, agent: &str, servers: &[ToolServer]) -> Result<bool, SupervisorError>;
+    /// needs, fills its environment with the secrets `secrets` names (the supervisor reads
+    /// the values itself, so none pass through here), and restarts the agent when its files
+    /// changed. Returns whether it restarted. The call is safe to repeat: the same list
+    /// changes nothing the second time.
+    async fn apply(
+        &self,
+        agent: &str,
+        servers: &[ToolServer],
+        secrets: &SecretNames,
+    ) -> Result<bool, SupervisorError>;
 
     /// Reads the agent's settings. Changes nothing.
     async fn settings(&self, agent: &str) -> Result<AgentSettings, SupervisorError>;
