@@ -6,8 +6,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use buzz_hive_core::domain::agent_login::{CallbackUrl, LoginState};
 use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::ToolServer;
+use buzz_hive_core::ports::secrets::SecretString;
 use buzz_hive_core::ports::supervisor::{AgentSettings, Supervisor, SupervisorError};
 use buzz_hive_core::supervisor_wire::{Call, Reply, Signer, MAX_LINE_BYTES};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -17,6 +19,11 @@ use tokio::net::UnixStream;
 const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Reading settings only reads a file.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// A sign-in start waits up to 30 seconds for the CLI's link, a paste up to 30 for it to take
+/// the address. These leave room for the socket round trip.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(40);
+/// `claude mcp list` health-checks every server, so a status can take a minute.
+const LOGIN_STATUS_TIMEOUT: Duration = Duration::from_secs(70);
 
 pub struct UnixSupervisor {
     socket: PathBuf,
@@ -108,6 +115,67 @@ impl Supervisor for UnixSupervisor {
                 "the reply does not carry the agent's settings".into(),
             )),
         }
+    }
+
+    async fn login_start(
+        &self,
+        agent: &str,
+        server: &str,
+    ) -> Result<SecretString, SupervisorError> {
+        let result = self
+            .call(
+                &Call::LoginStart {
+                    agent: agent.to_owned(),
+                    server: server.to_owned(),
+                },
+                LOGIN_TIMEOUT,
+            )
+            .await?;
+        // The reply is dropped here whatever it holds: only the link leaves, wrapped.
+        result["url"]
+            .as_str()
+            .map(SecretString::new)
+            .ok_or_else(|| SupervisorError::Unavailable("the reply has no sign-in link".into()))
+    }
+
+    async fn login_paste(
+        &self,
+        agent: &str,
+        server: &str,
+        url: &CallbackUrl,
+    ) -> Result<(), SupervisorError> {
+        let result = self
+            .call(
+                &Call::LoginPaste {
+                    agent: agent.to_owned(),
+                    server: server.to_owned(),
+                    url: url.clone(),
+                },
+                LOGIN_TIMEOUT,
+            )
+            .await?;
+        match result["signed_in"].as_bool() {
+            Some(true) => Ok(()),
+            _ => Err(SupervisorError::Unavailable(
+                "the reply does not say the sign-in finished".into(),
+            )),
+        }
+    }
+
+    async fn login_status(&self, agent: &str, server: &str) -> Result<LoginState, SupervisorError> {
+        let result = self
+            .call(
+                &Call::LoginStatus {
+                    agent: agent.to_owned(),
+                    server: server.to_owned(),
+                },
+                LOGIN_STATUS_TIMEOUT,
+            )
+            .await?;
+        result["state"]
+            .as_str()
+            .and_then(LoginState::parse)
+            .ok_or_else(|| SupervisorError::Unavailable("the reply has no sign-in state".into()))
     }
 }
 

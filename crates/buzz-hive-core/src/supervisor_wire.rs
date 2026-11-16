@@ -4,8 +4,8 @@
 //! `{method, body, timestamp, signature}`: `body` is the call's JSON as text, `timestamp` is
 //! milliseconds, and `signature` is Ed25519 over `method`, `body` and `timestamp` joined by
 //! newlines. The supervisor refuses a call that is unsigned, badly signed, more than a minute
-//! off its clock, a repeat of one it already saw, or not one of the three methods, before it
-//! reads the body.
+//! off its clock, a repeat of one it already saw, or not one of its methods, before it reads the
+//! body.
 //!
 //! The signing key is derived from the engine's token secret, as the claim key is, so no
 //! second secret is stored. The supervisor holds the public half only.
@@ -17,15 +17,16 @@ use std::sync::Mutex;
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::agent_login::CallbackUrl;
 use crate::domain::secret::SecretNames;
-use crate::domain::tool_server::{check_list, ToolServer};
+use crate::domain::tool_server::{check_list, check_name, ToolServer};
 
 /// How far a call's timestamp may be from the supervisor's clock.
 pub const WINDOW_MS: i64 = 60_000;
 /// The longest request line the supervisor reads.
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
-/// The supervisor's three calls.
+/// The supervisor's closed set of calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     /// Make `servers` the agent's whole list, fill its environment with the secrets named in
@@ -40,6 +41,18 @@ pub enum Call {
     RestartAgent { agent: String },
     /// Read the agent's settings.
     AgentSettings { agent: String },
+    /// Start the CLI's OAuth sign-in for a tool server in the agent's container and keep the
+    /// process waiting. The reply carries the link to open.
+    LoginStart { agent: String, server: String },
+    /// Write the address the browser ended on to the waiting process. `url` prints as
+    /// `[redacted]`: it can carry the authorization code.
+    LoginPaste {
+        agent: String,
+        server: String,
+        url: CallbackUrl,
+    },
+    /// Read whether the agent's CLI holds a sign-in for the server.
+    LoginStatus { agent: String, server: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,12 +68,29 @@ struct Named {
     agent: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Login {
+    agent: String,
+    server: String,
+}
+
+/// The body of `LoginPaste`. It has no `Debug`, so it cannot reach a log line.
+#[derive(Serialize, Deserialize)]
+struct Paste {
+    agent: String,
+    server: String,
+    url: String,
+}
+
 impl Call {
     pub fn method(&self) -> &'static str {
         match self {
             Self::ApplyAgentConfig { .. } => "ApplyAgentConfig",
             Self::RestartAgent { .. } => "RestartAgent",
             Self::AgentSettings { .. } => "AgentSettings",
+            Self::LoginStart { .. } => "LoginStart",
+            Self::LoginPaste { .. } => "LoginPaste",
+            Self::LoginStatus { .. } => "LoginStatus",
         }
     }
 
@@ -80,6 +110,17 @@ impl Call {
                     agent: agent.clone(),
                 })
             }
+            Self::LoginStart { agent, server } | Self::LoginStatus { agent, server } => {
+                serde_json::to_string(&Login {
+                    agent: agent.clone(),
+                    server: server.clone(),
+                })
+            }
+            Self::LoginPaste { agent, server, url } => serde_json::to_string(&Paste {
+                agent: agent.clone(),
+                server: server.clone(),
+                url: url.expose().to_owned(),
+            }),
         }
         .expect("a call serializes")
     }
@@ -113,6 +154,24 @@ impl Call {
             "AgentSettings" => Ok(Self::AgentSettings {
                 agent: serde_json::from_str::<Named>(body).map_err(bad)?.agent,
             }),
+            "LoginStart" | "LoginStatus" => {
+                let Login { agent, server } = serde_json::from_str(body).map_err(bad)?;
+                check_name(&server).map_err(Refusal::BadBody)?;
+                Ok(if method == "LoginStart" {
+                    Self::LoginStart { agent, server }
+                } else {
+                    Self::LoginStatus { agent, server }
+                })
+            }
+            "LoginPaste" => {
+                // serde's words repeat the value they met, and this body holds an address with
+                // a code in it, so a body that does not decode says nothing about its content.
+                let Paste { agent, server, url } = serde_json::from_str(body)
+                    .map_err(|_| Refusal::BadBody("the sign-in request is not accepted".into()))?;
+                check_name(&server).map_err(Refusal::BadBody)?;
+                let url = CallbackUrl::parse(&url).map_err(|e| Refusal::BadBody(e.into()))?;
+                Ok(Self::LoginPaste { agent, server, url })
+            }
             other => Err(Refusal::UnknownMethod(other.to_owned())),
         }
     }
@@ -174,7 +233,7 @@ impl Signer {
     }
 
     /// A signed line for any method and body, which a test needs to reach the supervisor's
-    /// refusal of a method that is not one of the three.
+    /// refusal of a method that is not one of its calls.
     #[cfg(any(test, feature = "testing"))]
     pub fn sign_raw(&self, method: &str, body: &str, now_ms: i64) -> String {
         self.line(method, body.to_owned(), now_ms)
@@ -463,6 +522,71 @@ mod tests {
             assert!(
                 matches!(verifier.open(&line, 6), Err(Refusal::BadBody(_))),
                 "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_calls_travel_and_a_paste_is_checked_and_never_echoed() {
+        let (signer, verifier) = pair();
+        let url = CallbackUrl::parse("http://localhost:45219/callback?code=TOPSECRETCODE").unwrap();
+        for call in [
+            Call::LoginStart {
+                agent: "coder".into(),
+                server: "docs".into(),
+            },
+            Call::LoginPaste {
+                agent: "coder".into(),
+                server: "docs".into(),
+                url: url.clone(),
+            },
+            Call::LoginStatus {
+                agent: "coder".into(),
+                server: "docs".into(),
+            },
+        ] {
+            assert_eq!(verifier.open(&signer.sign(&call, 7), 7), Ok(call.clone()));
+            assert!(!format!("{call:?}").contains("TOPSECRETCODE"));
+        }
+        let sign = |method: &str, body: &str, timestamp: i64| {
+            let signature =
+                hex::encode(signer.pair.sign(&message(method, body, timestamp)).as_ref());
+            json!({"method": method, "body": body, "timestamp": timestamp, "signature": signature})
+                .to_string()
+        };
+        // A wrong shape, a body of the wrong type and a bad server name are all refused, and
+        // the refusal holds none of what was sent.
+        let mut at = 100;
+        for (method, body) in [
+            (
+                "LoginPaste",
+                r#"{"agent":"coder","server":"docs","url":"https://evil.example.org/x?code=TOPSECRETCODE"}"#,
+            ),
+            (
+                "LoginPaste",
+                r#"{"agent":"coder","server":"docs","url":"http://localhost:1/x?code=TOPSECRETCODE\nmore"}"#,
+            ),
+            (
+                "LoginPaste",
+                r#"{"agent":"coder","server":"docs","url":987654321}"#,
+            ),
+            (
+                "LoginPaste",
+                r#"{"agent":"coder","server":"-rf","url":"http://localhost:1/x?code=TOPSECRETCODE"}"#,
+            ),
+            ("LoginStart", r#"{"agent":"coder","server":"a b"}"#),
+            ("LoginStatus", r#"{"agent":"coder","server":"--help"}"#),
+        ] {
+            at += 1;
+            let refused = verifier.open(&sign(method, body, at), at).unwrap_err();
+            assert!(
+                matches!(refused, Refusal::BadBody(_)),
+                "{body}: {refused:?}"
+            );
+            let text = format!("{refused} {refused:?}");
+            assert!(
+                !text.contains("TOPSECRETCODE") && !text.contains("987654321"),
+                "{text}"
             );
         }
     }

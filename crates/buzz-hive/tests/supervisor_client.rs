@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use buzz_hive::supervisor_client::UnixSupervisor;
+use buzz_hive_core::domain::agent_login::{CallbackUrl, LoginState};
 use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
 use buzz_hive_core::ports::supervisor::{Supervisor, SupervisorError};
@@ -147,5 +148,99 @@ async fn a_supervisor_that_is_not_there_is_unavailable_and_a_wrong_key_is_refuse
             .await
             .unwrap_err(),
         SupervisorError::Refused(_)
+    ));
+}
+
+const ADDRESS: &str = "http://localhost:45219/callback?code=TOPSECRETCODE&state=s";
+
+#[tokio::test]
+async fn a_sign_in_start_returns_the_link_and_a_paste_and_a_status_send_what_they_were_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("login.sock");
+    let seen = serve(
+        &socket,
+        Reply::done(json!({
+            "url": "https://auth.example.org/authorize?state=s",
+            "signed_in": true,
+            "state": "connected",
+        })),
+    );
+    let c = client(&socket);
+    let link = c.login_start("coder", "docs").await.unwrap();
+    assert_eq!(link.expose(), "https://auth.example.org/authorize?state=s");
+    assert!(
+        !format!("{link:?}").contains("auth.example.org"),
+        "{link:?}"
+    );
+
+    let url = CallbackUrl::parse(ADDRESS).unwrap();
+    c.login_paste("coder", "docs", &url).await.unwrap();
+    assert_eq!(
+        c.login_status("coder", "docs").await.unwrap(),
+        LoginState::Connected
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            Call::LoginStart {
+                agent: "coder".into(),
+                server: "docs".into()
+            },
+            Call::LoginPaste {
+                agent: "coder".into(),
+                server: "docs".into(),
+                url
+            },
+            Call::LoginStatus {
+                agent: "coder".into(),
+                server: "docs".into()
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sign_in_replies_that_are_not_what_was_asked_for_are_unavailable_and_a_rejection_is_refused(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let url = CallbackUrl::parse(ADDRESS).unwrap();
+
+    let socket = dir.path().join("empty.sock");
+    serve(&socket, Reply::done(json!({})));
+    let c = client(&socket);
+    assert!(matches!(
+        c.login_start("coder", "docs").await.unwrap_err(),
+        SupervisorError::Unavailable(_)
+    ));
+    assert!(matches!(
+        c.login_paste("coder", "docs", &url).await.unwrap_err(),
+        SupervisorError::Unavailable(_)
+    ));
+    assert!(matches!(
+        c.login_status("coder", "docs").await.unwrap_err(),
+        SupervisorError::Unavailable(_)
+    ));
+
+    // The CLI would not take the address: a refusal of the paste, not a supervisor that is down.
+    let socket = dir.path().join("rejected.sock");
+    serve(
+        &socket,
+        Reply::failed("rejected", "the sign-in did not accept that address"),
+    );
+    let error = client(&socket)
+        .login_paste("coder", "docs", &url)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SupervisorError::Refused(_)), "{error}");
+    assert!(!error.to_string().contains("TOPSECRETCODE"), "{error}");
+
+    let socket = dir.path().join("nothing.sock");
+    serve(&socket, Reply::failed("not_found", "no sign-in is waiting"));
+    assert!(matches!(
+        client(&socket)
+            .login_paste("coder", "docs", &url)
+            .await
+            .unwrap_err(),
+        SupervisorError::NotFound(_)
     ));
 }

@@ -341,6 +341,18 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
         "a person's call from the agents page; the engine refuses an agent",
     ),
     (
+        "StartAgentLogin",
+        "a sign-in gives an agent a credential for a tool server, so only a person starts one and the engine refuses an agent; the link is the sign-in itself",
+    ),
+    (
+        "PasteAgentLogin",
+        "a person pastes back the address their own browser ended on; it can carry an authorization code, which an agent must never handle",
+    ),
+    (
+        "GetAgentLoginStatus",
+        "a person reads whether a tool server is signed in on the agents page; an agent has no business reading it",
+    ),
+    (
         "GetStatus",
         "the page's header counts; get_hive_health reports what an agent needs",
     ),

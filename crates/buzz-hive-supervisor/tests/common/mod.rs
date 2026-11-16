@@ -9,7 +9,8 @@ use buzz_hive_core::domain::secret::SecretNames;
 use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
 use buzz_hive_core::supervisor_wire::{Call, Reply, Signer};
 use buzz_hive_supervisor::calls::Service;
-use buzz_hive_supervisor::config::{Config, Restart, Secrets};
+use buzz_hive_supervisor::config::{Config, Exec, Restart, Secrets};
+use buzz_hive_supervisor::login::Limits;
 use serde_json::json;
 
 pub const HIVE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -39,6 +40,11 @@ pub struct Rig {
 
 impl Rig {
     pub fn new() -> Self {
+        Self::with_limits(Limits::default())
+    }
+
+    /// A rig whose sign-ins use `limits`, so a test can expire one in a moment.
+    pub fn with_limits(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         for agent in ["coder", "researcher"] {
@@ -59,6 +65,17 @@ impl Rig {
         )
         .unwrap();
         std::fs::set_permissions(&restart, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The sign-in stubs: an exec runner that stands in for `docker compose exec`, and a
+        // stand-in for the Claude CLI next to it.
+        for script in ["exec-stub.sh", "claude-stub.sh"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/support")
+                    .join(script),
+                root.join(script),
+            )
+            .unwrap();
+        }
         let signer = Signer::from_secret(SECRET).unwrap();
         let config = Config {
             socket: root.join("supervisor.sock"),
@@ -67,11 +84,14 @@ impl Rig {
             agents_src: root.join("src/agents"),
             render_dir: root.join("render"),
             restart: Restart::Command(restart),
+            exec: Exec::Command(root.join("exec-stub.sh")),
             secrets: Secrets::Dir(root.join("secrets")),
             socket_uid: None,
         };
         Self {
-            service: Service::new(config.clone()).unwrap(),
+            service: Service::new(config.clone())
+                .unwrap()
+                .with_login_limits(limits),
             signer,
             config,
             dir,
@@ -89,6 +109,17 @@ impl Rig {
             .clock
             .fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
         self.service.handle(&self.signer.sign(call, now), now).await
+    }
+
+    /// Signs `body` as `method` with the engine's key and sends it, for a call the typed
+    /// `Call` cannot say (a body the wire refuses, a method that does not exist).
+    pub async fn raw(&self, method: &str, body: &str) -> Reply {
+        let now = self
+            .clock
+            .fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
+        self.service
+            .handle(&self.signer.sign_raw(method, body, now), now)
+            .await
     }
 
     pub fn now(&self) -> i64 {
@@ -133,6 +164,26 @@ impl Rig {
 
     pub fn render(&self, relative: &str) -> PathBuf {
         self.root().join("render").join(relative)
+    }
+
+    /// A file the stub CLI keeps, under `stub-state`.
+    pub fn stub(&self, relative: &str) -> PathBuf {
+        self.root().join("stub-state").join(relative)
+    }
+
+    /// Makes the stub CLI `normal`, `reject`, `hang`, `silent` or `list-failed`.
+    pub fn set_stub_mode(&self, mode: &str) {
+        std::fs::create_dir_all(self.root().join("stub-state")).unwrap();
+        std::fs::write(self.stub("mode"), mode).unwrap();
+    }
+
+    /// What the stub CLI was run with, one invocation a line: `<agent> mcp login ...`.
+    pub fn stub_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.stub("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     pub fn make_restart_fail(&self, fails: bool) {

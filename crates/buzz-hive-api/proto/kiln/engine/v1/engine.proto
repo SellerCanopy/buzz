@@ -633,6 +633,23 @@ service EngineService {
   // it from the agent's environment. Needs Admin. A secret the agent was not granted is
   // NotFound. The value stays in the store for the agents that still hold it.
   rpc RevokeTeamSecret(RevokeTeamSecretRequest) returns (SecretChange);
+  // Beehive addition: starts the Claude CLI's OAuth sign-in for one of an agent's HTTP tool
+  // servers and returns the link to open. The host supervisor keeps the waiting process for ten
+  // minutes, one per agent and server; a second start replaces it. Needs Admin; an agent is
+  // PermissionDenied. An agent with no folder, or a server the agent does not have as an HTTP
+  // server, is NotFound. No supervisor configured, or one that cannot run the sign-in, is
+  // FailedPrecondition. The link is the sign-in itself: the engine keeps and logs none of it.
+  rpc StartAgentLogin(StartAgentLoginRequest) returns (StartAgentLoginResponse);
+  // Beehive addition: hands the address the browser ended on (http://localhost:PORT/...?code=...)
+  // to the waiting sign-in and returns once the CLI has taken it, up to 30 seconds. Needs
+  // Admin. An address that is not that shape is InvalidArgument, as is one the CLI does not
+  // accept (start again: the provider's code works once). Nothing waiting, or a sign-in older
+  // than ten minutes, is NotFound. The address can carry the authorization code, so no error,
+  // event or log line repeats it.
+  rpc PasteAgentLogin(PasteAgentLoginRequest) returns (PasteAgentLoginResponse);
+  // Beehive addition: whether the agent's CLI holds a sign-in for the server, from
+  // `claude mcp list`: state is "needs-sign-in" or "connected". Needs Admin. Changes nothing.
+  rpc GetAgentLoginStatus(GetAgentLoginStatusRequest) returns (AgentLoginStatus);
 }
 
 message GetStatusRequest {}
@@ -3314,4 +3331,41 @@ message SecretApplied {
   bool restarted = 3;
   // Why it was not applied, empty when it was.
   string apply_error = 4;
+}
+
+message StartAgentLoginRequest {
+  string agent = 1;
+  // The name of one of the agent's HTTP tool servers.
+  string server = 2;
+}
+
+// The link is the sign-in itself, so this message has no Debug output.
+message StartAgentLoginResponse {
+  // An https address to open in a browser.
+  string url = 1;
+}
+
+// The address can carry the authorization code, so this message has no Debug output.
+message PasteAgentLoginRequest {
+  string agent = 1;
+  string server = 2;
+  // The address the browser ended on, as pasted. Surrounding space is ignored.
+  string url = 3;
+}
+
+message PasteAgentLoginResponse {
+  // True once the CLI took the address and finished signing in.
+  bool signed_in = 1;
+}
+
+message GetAgentLoginStatusRequest {
+  string agent = 1;
+  string server = 2;
+}
+
+message AgentLoginStatus {
+  string agent = 1;
+  string server = 2;
+  // needs-sign-in or connected.
+  string state = 3;
 }

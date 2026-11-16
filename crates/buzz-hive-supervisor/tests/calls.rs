@@ -75,7 +75,7 @@ async fn an_unsigned_badly_signed_stale_replayed_and_unknown_call_is_refused_bef
 #[tokio::test]
 async fn a_method_outside_the_closed_set_is_refused_even_when_signed() {
     let rig = Rig::new();
-    for method in ["RunShell", "ReadFile", "LoginStart", "applyagentconfig", ""] {
+    for method in ["RunShell", "ReadFile", "LoginRun", "applyagentconfig", ""] {
         let line = rig
             .signer
             .sign_raw(method, r#"{"agent":"coder"}"#, rig.now());

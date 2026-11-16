@@ -138,6 +138,11 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("SetAgentSecret", Level::Admin),
     ("GrantTeamSecret", Level::Admin),
     ("RevokeTeamSecret", Level::Admin),
+    // A sign-in gives an agent a credential for a tool server, so it is an Admin's call and
+    // the core refuses an agent whatever its level.
+    ("StartAgentLogin", Level::Admin),
+    ("PasteAgentLogin", Level::Admin),
+    ("GetAgentLoginStatus", Level::Admin),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -326,5 +331,12 @@ pub fn router() -> Router<App> {
     let r = route(r, "SetAgentSecret", secrets::set_agent_secret);
     let r = route(r, "GrantTeamSecret", secrets::grant_team_secret);
     let r = route(r, "RevokeTeamSecret", secrets::revoke_team_secret);
+    let r = route(r, "StartAgentLogin", agent_tools::start_agent_login);
+    let r = route(r, "PasteAgentLogin", agent_tools::paste_agent_login);
+    let r = route(
+        r,
+        "GetAgentLoginStatus",
+        agent_tools::get_agent_login_status,
+    );
     route(r, "GetUsage", status::get_usage)
 }

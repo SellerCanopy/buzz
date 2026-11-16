@@ -812,3 +812,62 @@ be watched in the agent's log.
   or has its own role.
 - `deploy/aws/Dockerfile.hive` does not install the `aws` program, so `BUZZ_HIVE_SECRETS_BACKEND=ssm`
   needs it added to the hive image before production use.
+
+## Phase 24: signing an agent in to an OAuth tool server (the backend)
+
+- Three supervisor calls, signed and refused like the others (`LoginStart`, `LoginPaste`,
+  `LoginStatus`), and three engine rpcs (`StartAgentLogin`, `PasteAgentLogin`,
+  `GetAgentLoginStatus`), all Admin, a person only. None is a tool.
+- `LoginStart` runs `claude mcp login <server> --no-browser` in the agent's container through
+  `BUZZ_HIVE_SUPERVISOR_EXEC_CMD` (a program run as `<program> <agent> claude ...`, standing in
+  for `docker compose exec -T agent ...` the way `BUZZ_HIVE_SUPERVISOR_RESTART_CMD` stands in for
+  the restart). It keeps the process on pipes in a table keyed by `(agent, server)` for ten
+  minutes, reads until an `https://` link appears (up to 30 s) and returns it. A second start for
+  the same key ends the first process. The server must be an HTTP server in the agent's rendered
+  `mcp.json`.
+- `LoginPaste` checks the address again (`CallbackUrl`: `http://localhost:PORT/...?code=...`,
+  also `127.0.0.1`, no user, fragment, space or control character, at most 2048 bytes), writes it
+  as one line to the waiting process, closes its stdin and waits up to 30 s for exit 0. A wrong
+  shape is refused before anything is written and the session stays. An address the CLI does not
+  accept, or a timeout, uses the session up (the provider's code works once), so the admin starts
+  again.
+- `LoginStatus` runs `claude mcp list` and reads the server's line: `needs-sign-in` or
+  `connected`. A line that says anything else (`Failed to connect`) is a failure, not either state.
+- The link is the sign-in and the pasted address can carry the authorization code. Both are held
+  in types that print `[redacted]` (`SecretString`), no `Debug` is generated for the two
+  messages that carry them, `PasteAgentLogin` is in `WRITE_ONLY` (an undecodable body is refused
+  without serde's words), the supervisor never copies the CLI's output into an error or a log
+  (the stub echoes the pasted line on both streams to prove it), and TRACE log captures in the
+  supervisor and API tests assert neither the link nor the code appears.
+- Supervisor `tests/support/exec-stub.sh` and `claude-stub.sh` are the stand-ins. Nothing in the
+  tests calls Docker, AWS or a provider.
+
+### Deviations
+
+- The exec setting is `BUZZ_HIVE_SUPERVISOR_EXEC_CMD`, run as `<program> <agent> claude ...`. The
+  plan said `docker exec -i`; the default is `docker compose exec -T agent` on the same Compose
+  project the restart uses, because that is how the supervisor already reaches an agent.
+- A new reply code `rejected` (the CLI did not take the address). The engine client maps it to
+  `Refused` and the core to `InvalidArgument`.
+- `Supervisor` gained three required methods. Both implementers (`UnixSupervisor`,
+  `FakeSupervisor`) and the test double in `tests/agent_tools.rs` have them.
+- No event is written for a sign-in (logs name the actor, agent and server only). Say so if the
+  event log should have a `agent.signed_in` kind.
+- `PasteAgentLogin` is in `WRITE_ONLY`, and `StartAgentLoginResponse` and `PasteAgentLoginRequest`
+  have `skip_debug` in `buzz-hive-api/build.rs`.
+- The Compose command builder moved out of `restart()` into `calls::compose`, shared with exec.
+
+### Not verified (needs a real container)
+
+- Spike 8, login without a terminal session: the real `claude mcp login <server> --no-browser`
+  and `claude mcp list` output formats are assumed (the link on stdout, a line per server ending
+  in `Connected` or `Needs authentication`). Not verified, needs a real container.
+- Spike 9, token survival across a container restart: not verified, needs a real container.
+  Open item, untested: `Dockerfile.agents` and `compose.agents.yml` mount a named volume at
+  `/home/agent`, so the CLI's credential directory (under that home) should persist if the CLI
+  keeps tokens there. If the CLI keeps them elsewhere (an OS keychain, `/tmp`), mount that
+  directory as a volume in `Dockerfile.agents` and re-test. No change was made to
+  `Dockerfile.agents`.
+- Whether stopping the local `docker compose exec` client ends the `claude` process inside the
+  container (the supervisor kills the client on expiry).
+- Real Docker exec, a real OAuth provider, and the 24.2 buzz-app screen.

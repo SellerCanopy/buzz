@@ -267,6 +267,28 @@ async fn the_settings_check_is_unknown_without_a_supervisor_or_when_it_fails() {
         ) -> Result<buzz_hive_core::ports::supervisor::AgentSettings, SupervisorError> {
             Err(SupervisorError::Unavailable("down".into()))
         }
+        async fn login_start(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<buzz_hive_core::ports::secrets::SecretString, SupervisorError> {
+            Err(SupervisorError::Unavailable("down".into()))
+        }
+        async fn login_paste(
+            &self,
+            _: &str,
+            _: &str,
+            _: &buzz_hive_core::domain::agent_login::CallbackUrl,
+        ) -> Result<(), SupervisorError> {
+            Err(SupervisorError::Unavailable("down".into()))
+        }
+        async fn login_status(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<buzz_hive_core::domain::agent_login::LoginState, SupervisorError> {
+            Err(SupervisorError::Unavailable("down".into()))
+        }
     }
     let (answer, issues) = settings_check(&f.store, Some(&Down), &person())
         .await

@@ -12,6 +12,19 @@ pub enum Restart {
     Command(PathBuf),
 }
 
+/// How a program is run inside an agent's container, for the Claude CLI's sign-in and its
+/// `mcp list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exec {
+    /// `docker compose exec -T agent <argv>` in the agent's Compose project, as the container's
+    /// own user, so the CLI keeps its tokens in that user's home.
+    Compose { compose_file: PathBuf },
+    /// A program run with the agent's name first and then the whole argv (`claude mcp login
+    /// ...`), standing in for `docker compose exec`. Tests and the local stack point it at a
+    /// stub.
+    Command(PathBuf),
+}
+
 /// Where the supervisor reads secret values from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Secrets {
@@ -42,6 +55,13 @@ pub struct Config {
     /// `BUZZ_HIVE_SUPERVISOR_RESTART_CMD`, a program that takes the agent name. Unset means
     /// the Compose recreate of `compose.agents.yml`, next to `agents_src`.
     pub restart: Restart,
+    /// `BUZZ_HIVE_SUPERVISOR_EXEC_CMD`, a program that stands in for `docker compose exec` when
+    /// the sign-in calls run the Claude CLI in an agent's container. It is run as
+    /// `<program> <agent> claude mcp login <server> --no-browser` and
+    /// `<program> <agent> claude mcp list`, with the sign-in's stdin and stdout piped through
+    /// it. Unset means `docker compose exec -T agent ...` on the same Compose project the
+    /// restart uses.
+    pub exec: Exec,
     /// `BUZZ_HIVE_SUPERVISOR_SECRETS_DIR` (files, local development) or
     /// `BUZZ_HIVE_SUPERVISOR_SECRETS=ssm` (SSM, with `BUZZ_HIVE_SUPERVISOR_AWS_CLI`, default
     /// `aws`). Not both. Neither means no secret can be filled in.
@@ -73,14 +93,19 @@ impl Config {
             }
         };
         let agents_src = PathBuf::from(required("BUZZ_HIVE_SUPERVISOR_AGENTS_SRC")?);
+        let compose_file = agents_src
+            .parent()
+            .ok_or("BUZZ_HIVE_SUPERVISOR_AGENTS_SRC has no parent folder")?
+            .join("compose.agents.yml");
         let restart = match optional("BUZZ_HIVE_SUPERVISOR_RESTART_CMD") {
             Some(cmd) => Restart::Command(cmd.into()),
             None => Restart::Compose {
-                compose_file: agents_src
-                    .parent()
-                    .ok_or("BUZZ_HIVE_SUPERVISOR_AGENTS_SRC has no parent folder")?
-                    .join("compose.agents.yml"),
+                compose_file: compose_file.clone(),
             },
+        };
+        let exec = match optional("BUZZ_HIVE_SUPERVISOR_EXEC_CMD") {
+            Some(cmd) => Exec::Command(cmd.into()),
+            None => Exec::Compose { compose_file },
         };
         let socket_uid = optional("BUZZ_HIVE_SUPERVISOR_SOCKET_UID")
             .map(|v| {
@@ -112,6 +137,7 @@ impl Config {
             agents_src,
             render_dir: required("BUZZ_HIVE_SUPERVISOR_RENDER_DIR")?.into(),
             restart,
+            exec,
             secrets,
             socket_uid,
         })
@@ -123,6 +149,14 @@ mod tests {
     use super::*;
 
     fn lookup(missing: &'static str, restart: Option<&'static str>) -> Result<Config, String> {
+        lookup_exec(missing, restart, None)
+    }
+
+    fn lookup_exec(
+        missing: &'static str,
+        restart: Option<&'static str>,
+        exec: Option<&'static str>,
+    ) -> Result<Config, String> {
         let key = "ab".repeat(32);
         Config::from_lookup(|name| {
             if name == missing {
@@ -136,6 +170,7 @@ mod tests {
                 "BUZZ_HIVE_SUPERVISOR_AGENTS_SRC" => Some("/opt/buzz/deploy/aws/agents".into()),
                 "BUZZ_HIVE_SUPERVISOR_RENDER_DIR" => Some("/opt/buzz/agents".into()),
                 "BUZZ_HIVE_SUPERVISOR_RESTART_CMD" => restart.map(str::to_owned),
+                "BUZZ_HIVE_SUPERVISOR_EXEC_CMD" => exec.map(str::to_owned),
                 _ => None,
             }
         })
@@ -153,6 +188,27 @@ mod tests {
             lookup("", Some("/usr/local/bin/stub")).unwrap().restart,
             Restart::Command("/usr/local/bin/stub".into())
         );
+    }
+
+    #[test]
+    fn the_exec_defaults_to_compose_exec_and_a_program_stands_in_for_it() {
+        assert_eq!(
+            lookup("", None).unwrap().exec,
+            Exec::Compose {
+                compose_file: "/opt/buzz/deploy/aws/compose.agents.yml".into()
+            }
+        );
+        assert_eq!(
+            lookup_exec("", None, Some("/usr/local/bin/exec-stub"))
+                .unwrap()
+                .exec,
+            Exec::Command("/usr/local/bin/exec-stub".into())
+        );
+        // The two settings are independent: a stub restart keeps the real exec.
+        assert!(matches!(
+            lookup("", Some("/x")).unwrap().exec,
+            Exec::Compose { .. }
+        ));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::domain::agent_login::{CallbackUrl, LoginState};
 use crate::domain::secret::SecretNames;
 use crate::domain::tool_server::ToolServer;
+use crate::ports::secrets::SecretString;
 use crate::ports::supervisor::{AgentSettings, Supervisor, SupervisorError};
 
 #[derive(Default)]
@@ -13,6 +15,14 @@ struct Inner {
     failures: Vec<SupervisorError>,
     /// Every apply, as the agent and the names it was given.
     applied: Vec<(String, Vec<String>)>,
+    /// Sign-ins started and not yet pasted, by agent and server.
+    waiting: Vec<(String, String)>,
+    /// Servers an agent is signed in to.
+    signed_in: Vec<(String, String)>,
+    /// Every address pasted, in order. Test-only: the real engine never keeps one.
+    pasted: Vec<String>,
+    /// Every call to a login method, as `method agent server`.
+    login_calls: Vec<String>,
 }
 
 struct Deployed {
@@ -77,6 +87,21 @@ impl FakeSupervisor {
     pub fn applied(&self) -> Vec<(String, Vec<String>)> {
         self.inner.lock().unwrap().applied.clone()
     }
+
+    /// The link `login_start` returns for a server.
+    pub fn link(agent: &str, server: &str) -> String {
+        format!("https://auth.example.org/authorize?agent={agent}&server={server}&state=fake")
+    }
+
+    /// Every address pasted, in order.
+    pub fn pasted(&self) -> Vec<String> {
+        self.inner.lock().unwrap().pasted.clone()
+    }
+
+    /// Every login call made, as `method agent server`.
+    pub fn login_calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().login_calls.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -119,5 +144,55 @@ impl Supervisor for FakeSupervisor {
             .get(agent)
             .map(|d| d.settings.clone())
             .ok_or_else(|| SupervisorError::NotFound(agent.to_owned()))
+    }
+
+    async fn login_start(
+        &self,
+        agent: &str,
+        server: &str,
+    ) -> Result<SecretString, SupervisorError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.login_calls.push(format!("start {agent} {server}"));
+        if !inner.agents.contains_key(agent) {
+            return Err(SupervisorError::NotFound(agent.to_owned()));
+        }
+        let key = (agent.to_owned(), server.to_owned());
+        inner.waiting.retain(|k| *k != key);
+        inner.waiting.push(key);
+        Ok(SecretString::new(Self::link(agent, server)))
+    }
+
+    async fn login_paste(
+        &self,
+        agent: &str,
+        server: &str,
+        url: &CallbackUrl,
+    ) -> Result<(), SupervisorError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.login_calls.push(format!("paste {agent} {server}"));
+        let key = (agent.to_owned(), server.to_owned());
+        let Some(at) = inner.waiting.iter().position(|k| *k == key) else {
+            return Err(SupervisorError::NotFound(
+                "no sign-in is waiting for this tool server; start it again".into(),
+            ));
+        };
+        inner.waiting.remove(at);
+        inner.pasted.push(url.expose().to_owned());
+        inner.signed_in.push(key);
+        Ok(())
+    }
+
+    async fn login_status(&self, agent: &str, server: &str) -> Result<LoginState, SupervisorError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.login_calls.push(format!("status {agent} {server}"));
+        if !inner.agents.contains_key(agent) {
+            return Err(SupervisorError::NotFound(agent.to_owned()));
+        }
+        let key = (agent.to_owned(), server.to_owned());
+        Ok(if inner.signed_in.contains(&key) {
+            LoginState::Connected
+        } else {
+            LoginState::NeedsSignIn
+        })
     }
 }

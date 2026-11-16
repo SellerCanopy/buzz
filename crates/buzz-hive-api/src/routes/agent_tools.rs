@@ -1,14 +1,18 @@
-//! The tool servers each agent starts, set by a person and applied by the host supervisor.
+//! The tool servers each agent starts, set by a person and applied by the host supervisor, and
+//! the OAuth sign-in of an agent's HTTP tool servers.
 
 use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
+use buzz_hive_core::orchestrator::agent_login;
 use buzz_hive_core::orchestrator::agent_tools::{self, Saved};
 use buzz_hive_core::ports::supervisor::SupervisorError;
 
 use crate::app::App;
 use crate::error::HiveError;
 use crate::proto::{
-    AgentToolServer, AgentToolServers, AgentToolsChange, ListAgentToolServersRequest,
-    ListAgentToolServersResponse, RemoveAgentToolServerRequest, SetAgentToolServerRequest,
+    AgentLoginStatus, AgentToolServer, AgentToolServers, AgentToolsChange,
+    GetAgentLoginStatusRequest, ListAgentToolServersRequest, ListAgentToolServersResponse,
+    PasteAgentLoginRequest, PasteAgentLoginResponse, RemoveAgentToolServerRequest,
+    SetAgentToolServerRequest, StartAgentLoginRequest, StartAgentLoginResponse,
 };
 use crate::unary::Ctx;
 
@@ -82,6 +86,64 @@ pub async fn remove_agent_tool_server(
     )
     .await?;
     finish(&app, ctx, &req.agent, saved).await
+}
+
+/// Starts the sign-in. The link is the sign-in itself: it goes to the caller and nowhere else.
+pub async fn start_agent_login(
+    app: App,
+    ctx: Ctx,
+    req: StartAgentLoginRequest,
+) -> Result<StartAgentLoginResponse, HiveError> {
+    let link = agent_login::start(
+        app.store.as_ref(),
+        app.supervisor.as_deref(),
+        &ctx.op(),
+        &req.agent,
+        &req.server,
+    )
+    .await?;
+    Ok(StartAgentLoginResponse {
+        url: link.expose().to_owned(),
+    })
+}
+
+/// Hands the pasted address to the waiting sign-in. The address can carry a code, so it is
+/// checked and passed on and no message repeats it.
+pub async fn paste_agent_login(
+    app: App,
+    ctx: Ctx,
+    req: PasteAgentLoginRequest,
+) -> Result<PasteAgentLoginResponse, HiveError> {
+    agent_login::paste(
+        app.store.as_ref(),
+        app.supervisor.as_deref(),
+        &ctx.op(),
+        &req.agent,
+        &req.server,
+        &req.url,
+    )
+    .await?;
+    Ok(PasteAgentLoginResponse { signed_in: true })
+}
+
+pub async fn get_agent_login_status(
+    app: App,
+    ctx: Ctx,
+    req: GetAgentLoginStatusRequest,
+) -> Result<AgentLoginStatus, HiveError> {
+    let state = agent_login::status(
+        app.store.as_ref(),
+        app.supervisor.as_deref(),
+        &ctx.op(),
+        &req.agent,
+        &req.server,
+    )
+    .await?;
+    Ok(AgentLoginStatus {
+        agent: req.agent,
+        server: req.server,
+        state: state.as_str().to_owned(),
+    })
 }
 
 /// Publishes the change's events and answers with the agent's list as it now stands.

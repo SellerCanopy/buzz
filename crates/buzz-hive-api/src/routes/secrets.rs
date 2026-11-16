@@ -14,9 +14,10 @@ use crate::proto::{
 use crate::routes::poll::timestamp;
 use crate::unary::Ctx;
 
-/// The routes whose request body holds a secret value. A body that does not decode is refused
-/// without echoing any of it.
-pub const WRITE_ONLY: &[&str] = &["SetTeamSecret", "SetAgentSecret"];
+/// The routes whose request body holds a secret value, or a pasted sign-in address that can
+/// carry an authorization code. A body that does not decode is refused without echoing any of
+/// it.
+pub const WRITE_ONLY: &[&str] = &["SetTeamSecret", "SetAgentSecret", "PasteAgentLogin"];
 
 pub async fn list_secret_names(
     app: App,

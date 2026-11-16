@@ -1,5 +1,6 @@
-//! What the three calls do. A call names an agent and nothing else about the host: the
-//! files it writes and the program it runs are fixed by the supervisor's own settings.
+//! What the calls do. A call names an agent (and, for a sign-in, one of its tool servers) and
+//! nothing else about the host: the files it writes and the programs it runs are fixed by the
+//! supervisor's own settings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -9,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use buzz_hive_core::domain::agent_login::CallbackUrl;
 use buzz_hive_core::domain::secret::{check_value, check_var, SecretNames};
-use buzz_hive_core::domain::tool_server::{check_agent, render_mcp, ToolServer};
+use buzz_hive_core::domain::tool_server::{
+    check_agent, check_name, parse_mcp, render_mcp, ToolServer, Transport,
+};
 use buzz_hive_core::ports::secrets::SecretScope;
 use buzz_hive_core::supervisor_wire::{Call, Reply, Verifier};
 use serde_json::json;
@@ -19,6 +23,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, Restart, Secrets};
+use crate::login::{Limits, LoginError, Logins};
 use crate::secrets::{FileSecretSource, NoSecrets, SecretSource, SsmSecretSource};
 
 /// The comment line that lists the variables an apply filled in, so the next apply can take
@@ -35,10 +40,15 @@ pub struct Service {
     secrets: Arc<dyn SecretSource>,
     /// One change at a time, so two applies never interleave their files and restarts.
     writes: Mutex<()>,
+    /// The sign-ins waiting for a paste.
+    logins: Logins,
 }
 
 enum Failure {
     NotFound(String),
+    /// The call was understood and the other side said no, for example a sign-in the CLI did
+    /// not accept. Starting over is the way on.
+    Rejected(String),
     Failed(String),
 }
 
@@ -66,7 +76,14 @@ impl Service {
             verifier,
             secrets,
             writes: Mutex::new(()),
+            logins: Logins::new(Limits::default()),
         })
+    }
+
+    /// The same service with other login times, which a test shortens.
+    pub fn with_login_limits(mut self, limits: Limits) -> Self {
+        self.logins = Logins::new(limits);
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -84,6 +101,8 @@ impl Service {
             }
         };
         let method = call.method();
+        // Of a sign-in call only the agent is logged: the pasted address can carry a code, and
+        // the link is the sign-in itself.
         let (agent, outcome) = match call {
             Call::ApplyAgentConfig {
                 agent,
@@ -104,6 +123,18 @@ impl Service {
                 let outcome = self.settings(&agent);
                 (agent, outcome)
             }
+            Call::LoginStart { agent, server } => {
+                let outcome = self.login_start(&agent, &server).await;
+                (agent, outcome)
+            }
+            Call::LoginPaste { agent, server, url } => {
+                let outcome = self.login_paste(&agent, &server, &url).await;
+                (agent, outcome)
+            }
+            Call::LoginStatus { agent, server } => {
+                let outcome = self.login_status(&agent, &server).await;
+                (agent, outcome)
+            }
         };
         match outcome {
             Ok(result) => {
@@ -113,6 +144,10 @@ impl Service {
             Err(Failure::NotFound(message)) => {
                 tracing::warn!(method, %agent, %message, "call refused");
                 Reply::failed("not_found", message)
+            }
+            Err(Failure::Rejected(message)) => {
+                tracing::warn!(method, %agent, %message, "call rejected");
+                Reply::failed("rejected", message)
             }
             Err(Failure::Failed(message)) => {
                 tracing::error!(method, %agent, %message, "call failed");
@@ -243,15 +278,8 @@ impl Service {
                 command
             }
             Restart::Compose { compose_file } => {
-                let mut command = Command::new("docker");
-                command
-                    .args(["compose", "-p"])
-                    .arg(format!("buzz-agent-{agent}"))
-                    .arg("-f")
-                    .arg(compose_file)
-                    .arg("--env-file")
-                    .arg(self.config.render_dir.join(format!("{agent}.compose.env")))
-                    .args(["up", "-d", "--force-recreate"]);
+                let mut command = compose(&self.config, compose_file, agent);
+                command.args(["up", "-d", "--force-recreate"]);
                 command
             }
         };
@@ -283,6 +311,68 @@ impl Service {
         )))
     }
 
+    /// The agent's HTTP tool servers are the only ones a sign-in may name: the server is one the
+    /// admin set and the supervisor wrote, never a name the call made up.
+    fn known_http_server(&self, agent: &str, server: &str) -> Result<(), Failure> {
+        self.known(agent)?;
+        check_name(server).map_err(Failure::failed)?;
+        let listed = read_if_there(&self.paths(agent).mcp)
+            .and_then(|text| parse_mcp(&text).ok())
+            .unwrap_or_default();
+        if listed
+            .iter()
+            .any(|s| s.name == server && s.transport == Transport::Http)
+        {
+            Ok(())
+        } else {
+            Err(Failure::NotFound(format!(
+                "agent {agent} has no HTTP tool server named {server}"
+            )))
+        }
+    }
+
+    async fn login_start(&self, agent: &str, server: &str) -> Result<serde_json::Value, Failure> {
+        self.known_http_server(agent, server)?;
+        let link = self
+            .logins
+            .start(&self.config, agent, server)
+            .await
+            .map_err(login_failure)?;
+        Ok(json!({ "url": link.expose() }))
+    }
+
+    async fn login_paste(
+        &self,
+        agent: &str,
+        server: &str,
+        url: &CallbackUrl,
+    ) -> Result<serde_json::Value, Failure> {
+        self.known_http_server(agent, server)?;
+        self.logins
+            .paste(agent, server, url)
+            .await
+            .map_err(login_failure)?;
+        Ok(json!({ "signed_in": true }))
+    }
+
+    async fn login_status(&self, agent: &str, server: &str) -> Result<serde_json::Value, Failure> {
+        self.known_http_server(agent, server)?;
+        let state = self
+            .logins
+            .status(&self.config, agent, server)
+            .await
+            .map_err(login_failure)?;
+        match state {
+            Some(Ok(state)) => Ok(json!({ "state": state.as_str() })),
+            Some(Err(())) => Err(Failure::failed(format!(
+                "the agent reports {server} as neither signed in nor waiting for a sign-in; see the agent's log"
+            ))),
+            None => Err(Failure::NotFound(format!(
+                "the agent does not list a tool server named {server}"
+            ))),
+        }
+    }
+
     /// The session policy and respond-to list the agent's env file holds now.
     fn settings(&self, agent: &str) -> Result<serde_json::Value, Failure> {
         self.known(agent)?;
@@ -292,6 +382,33 @@ impl Service {
             "session_policy": env.get("BUZZ_ACP_SESSION_POLICY").map_or("channel", String::as_str),
             "allowlisted": allowlisted,
         }))
+    }
+}
+
+/// `docker compose` on the agent's own Compose project, with the env file the deploy rendered
+/// for it. The restart and the sign-in's `exec` both start from this.
+pub(crate) fn compose(config: &Config, compose_file: &Path, agent: &str) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .args(["compose", "-p"])
+        .arg(format!("buzz-agent-{agent}"))
+        .arg("-f")
+        .arg(compose_file)
+        .arg("--env-file")
+        .arg(config.render_dir.join(format!("{agent}.compose.env")));
+    command
+}
+
+fn login_failure(error: LoginError) -> Failure {
+    match error {
+        LoginError::NoSession => Failure::NotFound(
+            "no sign-in is waiting for this tool server (it may have expired); start it again"
+                .into(),
+        ),
+        LoginError::Rejected => Failure::Rejected(
+            "the sign-in did not accept that address; start the sign-in again".into(),
+        ),
+        LoginError::Failed(message) => Failure::failed(message),
     }
 }
 

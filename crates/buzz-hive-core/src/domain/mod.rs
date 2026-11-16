@@ -1,5 +1,6 @@
 //! The things Beehive keeps: cards and the event log, and the rest as later phases add them.
 
+pub mod agent_login;
 pub mod artifact;
 pub mod card;
 pub mod events;

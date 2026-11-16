@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod activity;
+pub mod agent_login;
 pub mod agent_tools;
 pub mod artifacts;
 pub mod assistant;
