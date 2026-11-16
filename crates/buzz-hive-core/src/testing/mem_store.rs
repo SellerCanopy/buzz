@@ -9,15 +9,16 @@ use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, IssueState, RepoRef, StoredIssue};
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::tool_server::ToolServer;
 use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardReposRepo,
-    CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job,
-    JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting,
-    Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo,
-    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
-    MESSAGE_KINDS,
+    AccessRepo, AccessRow, AgentInfo, AgentLink, AgentToolsRepo, ArtifactSave, ArtifactsRepo,
+    CardReposRepo, CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo,
+    IssuesRepo, Job, JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow,
+    PersonInfo, Posting, Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo,
+    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
+    WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -54,6 +55,9 @@ struct State {
     next_proposal_id: i64,
     /// In the order added.
     card_repos: Vec<(CommunityId, uuid::Uuid, String)>,
+    /// The agents seeded, and their tool servers by agent and name.
+    tool_agents: std::collections::BTreeSet<(CommunityId, String)>,
+    tool_servers: std::collections::BTreeMap<(CommunityId, String, String), ToolServer>,
     /// In creation order, each with when it ends as failed.
     jobs: Vec<(CommunityId, Job, Option<chrono::DateTime<chrono::Utc>>)>,
 }
@@ -235,6 +239,9 @@ impl Tx for MemTx {
         self
     }
     fn card_repos(&mut self) -> &mut dyn CardReposRepo {
+        self
+    }
+    fn agent_tools(&mut self) -> &mut dyn AgentToolsRepo {
         self
     }
     fn jobs(&mut self) -> &mut dyn JobsRepo {
@@ -1203,6 +1210,69 @@ impl CardReposRepo for MemTx {
             .card_repos
             .retain(|(c, id, have)| !(*c == community && *id == card && have == repo));
         Ok(self.work.card_repos.len() < before)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentToolsRepo for MemTx {
+    async fn agents(&mut self) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .work
+            .tool_agents
+            .iter()
+            .filter(|(c, _)| *c == self.community)
+            .map(|(_, agent)| agent.clone())
+            .collect())
+    }
+
+    async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .iter()
+            .filter(|((c, _, _), _)| *c == self.community)
+            .map(|((_, agent, _), server)| (agent.clone(), server.clone()))
+            .collect())
+    }
+
+    async fn of_agent(&mut self, agent: &str) -> Result<Vec<ToolServer>, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .iter()
+            .filter(|((c, a, _), _)| *c == self.community && a == agent)
+            .map(|(_, server)| server.clone())
+            .collect())
+    }
+
+    async fn set(&mut self, agent: &str, server: &ToolServer) -> Result<(), StoreError> {
+        self.work.tool_servers.insert(
+            (self.community, agent.to_owned(), server.name.clone()),
+            server.clone(),
+        );
+        Ok(())
+    }
+
+    async fn remove(&mut self, agent: &str, name: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .work
+            .tool_servers
+            .remove(&(self.community, agent.to_owned(), name.to_owned()))
+            .is_some())
+    }
+
+    async fn seed(&mut self, agent: &str, servers: &[ToolServer]) -> Result<bool, StoreError> {
+        if !self
+            .work
+            .tool_agents
+            .insert((self.community, agent.to_owned()))
+        {
+            return Ok(false);
+        }
+        for server in servers {
+            AgentToolsRepo::set(self, agent, server).await?;
+        }
+        Ok(true)
     }
 }
 

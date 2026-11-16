@@ -9,6 +9,7 @@ use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::ports::relay::Relay;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
+use buzz_hive_core::ports::supervisor::Supervisor;
 use buzz_hive_core::resolve::{resolve_actor, Actor};
 use buzz_hive_core::workflow::load::Catalog;
 use buzz_hive_core::workflow::source::CatalogSource;
@@ -58,6 +59,9 @@ pub struct App {
     pub code_host: Option<Arc<dyn CodeHost>>,
     /// Wakes the intake supervisor after a rule was saved or deleted.
     pub intake: Arc<tokio::sync::Notify>,
+    /// The host supervisor that writes agents' tool servers and settings, `None` when the
+    /// service has no socket for it (`BUZZ_HIVE_SUPERVISOR_SOCKET`).
+    pub supervisor: Option<Arc<dyn Supervisor>>,
 }
 
 impl App {

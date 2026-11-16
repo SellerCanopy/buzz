@@ -37,6 +37,12 @@ pub struct Config {
     /// `BUZZ_HIVE_GITHUB_API_URL`, default `https://api.github.com`. A GitHub Enterprise
     /// server's API address, or a test server's.
     pub github_api_url: String,
+    /// `BUZZ_HIVE_SUPERVISOR_SOCKET`, the Unix socket of the host supervisor that writes the
+    /// agents' tool servers. Unset means a change is saved and reported as not applied.
+    pub supervisor_socket: Option<std::path::PathBuf>,
+    /// `BUZZ_HIVE_AGENTS_DIR`, the folder holding one folder per agent (`deploy/aws/agents`),
+    /// read at start to seed the agents' tool servers. Unset means no agent is known.
+    pub agents_dir: Option<std::path::PathBuf>,
 }
 
 /// Longest any one statement may run, and the longest a statement waits for a lock.
@@ -110,6 +116,8 @@ impl Config {
                 10,
                 300,
             )?),
+            supervisor_socket: optional("BUZZ_HIVE_SUPERVISOR_SOCKET").map(Into::into),
+            agents_dir: optional("BUZZ_HIVE_AGENTS_DIR").map(Into::into),
             github_token: optional("GH_TOKEN"),
             github_api_url: match optional("BUZZ_HIVE_GITHUB_API_URL") {
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,

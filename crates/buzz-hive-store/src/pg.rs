@@ -12,13 +12,14 @@ use buzz_hive_core::domain::intake::{
 };
 use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::domain::timer::{Timer, TimerKind};
+use buzz_hive_core::domain::tool_server::{ToolServer, Transport};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardReposRepo, CardsRepo, CommunityId,
-    EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo, KeptVersion,
-    OutboxBacklog, OutboxRepo, OutboxRow, Posting, Proposal, ProposalsRepo, PullRequestsRepo,
-    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
-    UsageRepo, WorkflowsRepo,
+    AccessRepo, AccessRow, AgentToolsRepo, ArtifactSave, ArtifactsRepo, CardReposRepo, CardsRepo,
+    CommunityId, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo,
+    KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, Posting, Proposal, ProposalsRepo,
+    PullRequestsRepo, RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage,
+    TimersRepo, Tx, UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -111,6 +112,9 @@ impl Tx for PgTx {
         self
     }
     fn card_repos(&mut self) -> &mut dyn CardReposRepo {
+        self
+    }
+    fn agent_tools(&mut self) -> &mut dyn AgentToolsRepo {
         self
     }
     fn jobs(&mut self) -> &mut dyn JobsRepo {
@@ -1108,6 +1112,114 @@ impl CardReposRepo for PgTx {
         .map_err(store_error)?;
         Ok(removed.rows_affected() == 1)
     }
+}
+
+#[async_trait::async_trait]
+impl AgentToolsRepo for PgTx {
+    async fn agents(&mut self) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT agent FROM hive.agent_tool_agents WHERE community_id = $1 ORDER BY agent",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)
+    }
+
+    async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError> {
+        let rows: Vec<(String, String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT agent, name, transport, spec FROM hive.agent_tool_servers \
+             WHERE community_id = $1 ORDER BY agent, name",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter()
+            .map(|(agent, name, transport, spec)| {
+                Ok((agent, decode_server(name, &transport, spec)?))
+            })
+            .collect()
+    }
+
+    async fn of_agent(&mut self, agent: &str) -> Result<Vec<ToolServer>, StoreError> {
+        let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT name, transport, spec FROM hive.agent_tool_servers \
+             WHERE community_id = $1 AND agent = $2 ORDER BY name",
+        )
+        .bind(self.community)
+        .bind(agent)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter()
+            .map(|(name, transport, spec)| decode_server(name, &transport, spec))
+            .collect()
+    }
+
+    async fn set(&mut self, agent: &str, server: &ToolServer) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.agent_tool_servers (community_id, agent, name, transport, spec) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (community_id, agent, name) \
+             DO UPDATE SET transport = EXCLUDED.transport, spec = EXCLUDED.spec",
+        )
+        .bind(self.community)
+        .bind(agent)
+        .bind(&server.name)
+        .bind(server.transport.as_str())
+        .bind(&server.spec)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn remove(&mut self, agent: &str, name: &str) -> Result<bool, StoreError> {
+        let removed = sqlx::query(
+            "DELETE FROM hive.agent_tool_servers WHERE community_id = $1 AND agent = $2 AND name = $3",
+        )
+        .bind(self.community)
+        .bind(agent)
+        .bind(name)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(removed.rows_affected() == 1)
+    }
+
+    async fn seed(&mut self, agent: &str, servers: &[ToolServer]) -> Result<bool, StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO hive.agent_tool_agents (community_id, agent) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(self.community)
+        .bind(agent)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        if inserted.rows_affected() == 0 {
+            return Ok(false);
+        }
+        for server in servers {
+            AgentToolsRepo::set(self, agent, server).await?;
+        }
+        Ok(true)
+    }
+}
+
+fn decode_server(
+    name: String,
+    transport: &str,
+    spec: serde_json::Value,
+) -> Result<ToolServer, StoreError> {
+    let transport = Transport::parse(transport)
+        .ok_or_else(|| StoreError::Conflict(format!("stored transport {transport} for {name}")))?;
+    Ok(ToolServer {
+        name,
+        transport,
+        spec,
+    })
 }
 
 #[async_trait::async_trait]

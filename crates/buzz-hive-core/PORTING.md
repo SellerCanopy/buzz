@@ -681,7 +681,7 @@ Not ported, each with its decision:
 - Duplicate search is a normalized title match (lowercase, whitespace collapsed) over the open
   cards and the first 100 open issues of each named repo, not the host's search syntax.
 - The plan's "listener lag" in `get_hive_health` is the age of the oldest unsent outbox post,
-  since the relay listener was dropped in Phase 12. `allowlist_applied` is `"unknown"` until
+  since the relay listener was dropped in Phase 12. `allowlist_applied` was `"unknown"` until
   Phase 22.
 - `AcceptTicketProposal` reads the open proposals, so a proposal that was accepted is not
   found again.
@@ -689,3 +689,70 @@ Not ported, each with its decision:
   could never satisfy. It now compares against all the card's repos.
 - `OpenProposal` gained a `ticket` field so `ListProposals` shows the tickets waiting.
 
+## Phase 22: the host supervisor and each agent's tool servers
+
+- Migration `0020_agent_tool_servers.sql` (the plan said 0014, which was taken) makes
+  `hive.agent_tool_agents` and `hive.agent_tool_servers`. An agent row means its folder under
+  `deploy/aws/agents` was read once; that read seeds its servers once, so a server a person
+  removed does not come back at the next start and a second seed changes nothing.
+- Served: `ListAgentToolServers` (Read), `SetAgentToolServer` and `RemoveAgentToolServer`
+  (Admin; an agent is refused whatever its level). None is a tool: a tool server runs code with
+  the agent's keys, so only a person sets one. A change is saved first and applied second: a
+  supervisor that is down leaves it saved and the reply says `applied: false` with the reason.
+  Event kind `agent_tools.changed`.
+- `crates/buzz-hive-supervisor` is a host service, not a container, and the only code that
+  holds Docker access for the agents. It takes three signed calls on a Unix socket
+  (`ApplyAgentConfig`, `RestartAgent`, `AgentSettings`), signed with an Ed25519 key derived from
+  the engine's token secret (the supervisor holds the public half only), within 60 seconds of
+  its clock, once. It names an agent only by the folders it lists and never takes a path.
+  A secret never travels in a call: a spec holds `${NAME}` references, and the deploy's env file
+  holds the values.
+- It renders each agent's `mcp.json` and, for every stage agent, `BUZZ_ACP_SESSION_POLICY=thread`
+  and the Beehive account in the respond-to allowlist. `get_hive_health` reads both back through
+  the supervisor and names an agent that is on `channel` or lacks the entry (`agentIssues`).
+- An agent restarts only when what it would run changed, judged by a hash of the rendered files
+  and kept in `applied.sha256` after a restart finished. The default restart recreates the
+  container (`up -d --force-recreate`), because `docker compose restart` does not read the env
+  file again.
+
+### Turn attestation is not in Phase 22
+
+Finding 1.3 of the checkpoint 3 review asked whether the supervisor should hold a credential
+that binds each claim to the agent's current turn. It does not, and an agent can still claim
+from any recent message that mentions it.
+
+- Why: the supervisor never sees a turn start, and `deploy/aws/Dockerfile.agents` runs the
+  harness and the agent as one user in one container. Any path that carries a per-turn
+  credential from the harness to the engine is open to the agent too, so the binding would hold
+  only until an agent reads it.
+- What real binding needs: the harness and the agent running as separate users (or separate
+  containers), the credential readable by the harness user only, and the engine checking the
+  turn against it. That is an agents-image change, not a supervisor change.
+- Left as it is, and recorded here as a residual risk. One cheap tightening stays open: the
+  claim takes its thread root from author-written tags (`crates/buzz-hive-api/src/claims.rs`),
+  and reading it from the relay's `thread_metadata` would narrow that without the supervisor.
+
+### Spike 7: an HTTP entry in `mcp.json`
+
+The golden `crates/buzz-hive-supervisor/tests/golden/apply/mcp.json` holds an HTTP server as
+`{"type": "http", "url": ..., "headers": {...}}` and a stdio one with no `type`, which is Claude
+Code's `.mcp.json` shape. `buzz-acp` never reads that file (the Claude adapter in the agent
+container does), so there is no Rust loader to run it through. The test
+`the_golden_mcp_json_holds_an_http_entry_in_claude_codes_shape` checks the shape and that the
+engine's own parser reads the file back. Not run: the file against the live adapter. That needs
+the agents image and a reachable HTTP tool server, so the first deploy of an HTTP server should
+be watched in the agent's log.
+
+### Deviations
+
+- Plan question 8 (copy a workflow's skills into the agent home) is not built. `ListSkills`
+  stays pending.
+- The wire types (`Call`, `Signer`, `Verifier`) live in `buzz-hive-core`, so the engine's client
+  and the supervisor share one definition and one test.
+- The apply call carries the agent's whole server list, so the supervisor needs no database.
+- With a forced `respond_to: allowlist`, an agent that answered `anyone` now answers its
+  allowlist plus the Beehive account. That narrows `anyone`; the alternative is to leave
+  `anyone` alone and flag it in the health read.
+- `buzz-hive keys` and `buzz-hive apply-agents` are one-shot commands for the deploy: the first
+  prints the two public keys the supervisor is configured with, the second sends every known
+  agent's list to it.

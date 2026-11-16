@@ -592,6 +592,22 @@ service EngineService {
   // proposal until a person accepts it, and then becomes an issue on the card's repo.
   // A fault an open card or issue already describes gets a note or comment instead.
   rpc FileTicket(FileTicketRequest) returns (FileTicketResponse);
+  // Beehive addition: every agent that has a folder in deploy/aws/agents, each with the
+  // tool servers it starts. Needs Read.
+  rpc ListAgentToolServers(ListAgentToolServersRequest) returns (ListAgentToolServersResponse);
+  // Beehive addition: adds a tool server to an agent, or replaces the one with its name,
+  // then asks the host supervisor to write the agent's mcp.json and restart it when that
+  // changed. Needs Admin; an agent is PermissionDenied. An agent with no folder is
+  // NotFound. A name or spec the checks refuse is InvalidArgument: a spec holds a command
+  // and args, or a url, and an env or headers value must name its secret as ${NAME}, since a
+  // secret value is never sent. An agent already holding 32 servers is FailedPrecondition.
+  // The change is saved even when the supervisor cannot be reached; the reply says so in
+  // applied and apply_error, and the next change applies the whole list again. Appends an
+  // agent_tools.changed event.
+  rpc SetAgentToolServer(SetAgentToolServerRequest) returns (AgentToolsChange);
+  // Beehive addition: takes a tool server off an agent and applies the agent as
+  // SetAgentToolServer does. Needs Admin. A server the agent does not have is NotFound.
+  rpc RemoveAgentToolServer(RemoveAgentToolServerRequest) returns (AgentToolsChange);
 }
 
 message GetStatusRequest {}
@@ -1983,9 +1999,23 @@ message GetHiveHealthResponse {
   // How long the oldest unsent post has waited, 0 when none waits. A post that waits long
   // means the relay is not taking what Beehive sends it.
   int64 oldest_pending_seconds = 6;
-  // Whether the relay's allowlist has been applied to this engine's account. Always
-  // "unknown" until Phase 22 reads it.
+  // Whether every agent answers this engine's account on a thread session, as the host
+  // supervisor reports it: "yes", "no" when agent_issues names some, or "unknown" when no
+  // supervisor answers.
   string allowlist_applied = 7;
+  // The agents that are not on session_policy thread or do not list this engine's account in
+  // their respond-to list. Empty when allowlist_applied is not "no".
+  repeated AgentSettingIssue agent_issues = 8;
+}
+
+message AgentSettingIssue {
+  string agent = 1;
+  // channel or thread.
+  string session_policy = 2;
+  // Whether the respond-to list holds this engine's account.
+  bool allowlisted = 3;
+  // What is wrong, in a sentence.
+  string problem = 4;
 }
 
 message ReportDiagnosisRequest {
@@ -3144,4 +3174,50 @@ message ActivityEntry {
   // The type's own fields as JSON.
   string fields_json = 14;
   int32 v = 15;
+}
+
+message ListAgentToolServersRequest {}
+
+message ListAgentToolServersResponse {
+  // By agent name. An agent with no server is listed with an empty list.
+  repeated AgentToolServers agents = 1;
+}
+
+// AgentToolServers is one agent and the tool servers it starts.
+message AgentToolServers {
+  string agent = 1;
+  // By name.
+  repeated AgentToolServer servers = 2;
+}
+
+// AgentToolServer is one entry of an agent's mcp.json. It never holds a secret value.
+message AgentToolServer {
+  string name = 1;
+  // stdio or http.
+  string transport = 2;
+  // JSON. A stdio server has command, and optionally args and env. An http server has url,
+  // and optionally headers. A value of env or headers is a ${NAME} reference.
+  string spec_json = 3;
+}
+
+message SetAgentToolServerRequest {
+  string agent = 1;
+  AgentToolServer server = 2;
+}
+
+message RemoveAgentToolServerRequest {
+  string agent = 1;
+  string name = 2;
+}
+
+// AgentToolsChange is the agent's list after a change, and whether the agent has it yet.
+message AgentToolsChange {
+  AgentToolServers agent = 1;
+  // Whether the host supervisor wrote the agent's files. False means the change is saved and
+  // not applied yet.
+  bool applied = 2;
+  // Whether the agent restarted because its files changed.
+  bool restarted = 3;
+  // Why the change was not applied, empty when it was.
+  string apply_error = 4;
 }

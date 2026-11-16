@@ -6,6 +6,7 @@
 
 mod access;
 mod activity;
+mod agent_tools;
 mod agents;
 mod artifacts;
 mod assistant;
@@ -127,6 +128,11 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("AddIssueRepo", Level::Run),
     ("RemoveIssueRepo", Level::Run),
     ("AcceptTicketProposal", Level::Run),
+    // Tool servers run code with an agent's keys, so changing them is an Admin's call; the
+    // core refuses an agent whatever its level.
+    ("ListAgentToolServers", Level::Read),
+    ("SetAgentToolServer", Level::Admin),
+    ("RemoveAgentToolServer", Level::Admin),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -295,5 +301,16 @@ pub fn router() -> Router<App> {
     let r = route(r, "AcceptTicketProposal", diagnose::accept_ticket_proposal);
     let r = route(r, "AddIssueRepo", repos::add_issue_repo);
     let r = route(r, "RemoveIssueRepo", repos::remove_issue_repo);
+    let r = route(
+        r,
+        "ListAgentToolServers",
+        agent_tools::list_agent_tool_servers,
+    );
+    let r = route(r, "SetAgentToolServer", agent_tools::set_agent_tool_server);
+    let r = route(
+        r,
+        "RemoveAgentToolServer",
+        agent_tools::remove_agent_tool_server,
+    );
     route(r, "GetUsage", status::get_usage)
 }

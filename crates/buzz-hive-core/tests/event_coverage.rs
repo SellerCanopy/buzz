@@ -14,6 +14,7 @@ use buzz_hive_core::domain::events::EVENT_KINDS;
 use buzz_hive_core::domain::intake::RepoRef;
 use buzz_hive_core::orchestrator::access::set_level;
 use buzz_hive_core::orchestrator::activity::log_work;
+use buzz_hive_core::orchestrator::agent_tools;
 use buzz_hive_core::orchestrator::artifacts::{save_artifact, set_handoff};
 use buzz_hive_core::orchestrator::assistant::{
     assistant_result, expire_jobs, start_job, JobKind, Reported, Start,
@@ -31,12 +32,12 @@ use buzz_hive_core::orchestrator::wait::{record, Seen};
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::code_host::PullStatus;
 use buzz_hive_core::ports::store::Store;
-use buzz_hive_core::testing::{FakeCodeHost, ManualClock};
+use buzz_hive_core::testing::{FakeCodeHost, FakeSupervisor, ManualClock};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 21;
+const CURRENT_PHASE: u8 = 22;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -457,6 +458,24 @@ async fn repo_scenarios(f: &Fixture) {
         .unwrap();
 }
 
+/// Phase 22: a person sets an agent's tool server.
+async fn agent_tools_scenarios(f: &Fixture) {
+    agent_tools::seed(&f.store, COMMUNITY, "coder", None)
+        .await
+        .unwrap();
+    let supervisor = FakeSupervisor::new();
+    supervisor.deploy("coder", "thread", true);
+    let server = buzz_hive_core::domain::tool_server::ToolServer::new(
+        "docs",
+        buzz_hive_core::domain::tool_server::Transport::Stdio,
+        &serde_json::json!({"command": "docs-mcp"}),
+    )
+    .unwrap();
+    agent_tools::set(&f.store, Some(&supervisor), &person(), "coder", server)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let (f, clock) = Fixture::timed();
@@ -473,6 +492,7 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     pull_request_scenarios(&f).await;
     assistant_scenarios(&f, &clock).await;
     repo_scenarios(&f).await;
+    agent_tools_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

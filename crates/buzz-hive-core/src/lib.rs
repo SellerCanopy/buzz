@@ -13,6 +13,7 @@ pub mod orchestrator;
 pub mod ports;
 pub mod resolve;
 pub mod rules;
+pub mod supervisor_wire;
 pub mod tool_names;
 pub mod workflow;
 

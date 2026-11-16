@@ -121,6 +121,9 @@ impl Tx for SpyTx {
     fn card_repos(&mut self) -> &mut dyn buzz_hive_core::ports::store::CardReposRepo {
         self.inner.card_repos()
     }
+    fn agent_tools(&mut self) -> &mut dyn buzz_hive_core::ports::store::AgentToolsRepo {
+        self.inner.agent_tools()
+    }
     fn jobs(&mut self) -> &mut dyn buzz_hive_core::ports::store::JobsRepo {
         self.inner.jobs()
     }

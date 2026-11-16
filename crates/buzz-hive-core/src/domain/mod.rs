@@ -7,5 +7,6 @@ pub mod inbox;
 pub mod intake;
 pub mod run;
 pub mod timer;
+pub mod tool_server;
 pub mod usage;
 pub mod workflow;

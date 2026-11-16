@@ -87,6 +87,7 @@ async fn run(world: &World) {
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,
         intake: Arc::new(tokio::sync::Notify::new()),
+        supervisor: None,
     };
     let router = buzz_hive_api::finish(buzz_hive_api::routes(), app.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

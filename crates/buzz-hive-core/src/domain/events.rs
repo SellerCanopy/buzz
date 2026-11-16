@@ -133,6 +133,9 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // A repo was added to a card or taken off it. The payload has the card's repos now, first
     // repo first, and the repo `added` or `removed`.
     ("card.repos", 21),
+    // A person set or removed one of an agent's tool servers. The payload has the agent, the
+    // server's name and whether it was `set` or `removed`. Nothing of the spec is in it.
+    ("agent_tools.changed", 22),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

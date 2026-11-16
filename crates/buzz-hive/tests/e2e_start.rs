@@ -200,6 +200,7 @@ async fn a_started_run_posts_the_status_and_the_task_and_the_relay_returns_both(
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,
         intake: Arc::new(tokio::sync::Notify::new()),
+        supervisor: None,
     };
     let me = owner.public_key().to_hex();
 

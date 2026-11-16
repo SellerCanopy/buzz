@@ -8,6 +8,7 @@ use crate::domain::inbox::InboxItem;
 use crate::domain::intake::{IntakeRule, Issue, RepoRef, StoredIssue};
 use crate::domain::run::Run;
 use crate::domain::timer::{Timer, TimerKind};
+use crate::domain::tool_server::ToolServer;
 use crate::workflow::options::WorkflowOptions;
 
 pub type CommunityId = uuid::Uuid;
@@ -65,6 +66,7 @@ pub trait Tx: Send {
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     fn proposals(&mut self) -> &mut dyn ProposalsRepo;
     fn card_repos(&mut self) -> &mut dyn CardReposRepo;
+    fn agent_tools(&mut self) -> &mut dyn AgentToolsRepo;
     fn jobs(&mut self) -> &mut dyn JobsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
@@ -318,6 +320,24 @@ pub trait CardReposRepo: Send {
     async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError>;
     /// Drops `repo`. `false` when the card did not have it.
     async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError>;
+}
+
+/// The tool servers each agent starts. An agent is known once its folder was read at a start.
+#[async_trait::async_trait]
+pub trait AgentToolsRepo: Send {
+    /// The agents whose folder was read, by name.
+    async fn agents(&mut self) -> Result<Vec<String>, StoreError>;
+    /// Every server with its agent, by agent then name.
+    async fn list(&mut self) -> Result<Vec<(String, ToolServer)>, StoreError>;
+    /// One agent's servers, by name.
+    async fn of_agent(&mut self, agent: &str) -> Result<Vec<ToolServer>, StoreError>;
+    /// Adds the server or replaces the one with its name.
+    async fn set(&mut self, agent: &str, server: &ToolServer) -> Result<(), StoreError>;
+    /// Drops the server. `false` when the agent did not have it.
+    async fn remove(&mut self, agent: &str, name: &str) -> Result<bool, StoreError>;
+    /// Makes the agent known and gives it `servers`, once. `false` and no change when the agent
+    /// was seeded before, so a server a person removed does not come back at the next start.
+    async fn seed(&mut self, agent: &str, servers: &[ToolServer]) -> Result<bool, StoreError>;
 }
 
 /// Where a job stands. A job leaves `Running` once and never returns.

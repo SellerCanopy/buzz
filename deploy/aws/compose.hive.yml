@@ -11,6 +11,11 @@
 # WebSocket address on the stack's network (ws://relay:3000 unless .aws.env sets another).
 # Without both, the service starts but runs cannot start. Add the account's public key to
 # the relay's members so the relay accepts its posts.
+# Agents' tool servers: the hive service reads the agent folders (BUZZ_HIVE_AGENTS_DIR) and
+# asks the host's buzz-hive-supervisor, over the socket in /run/buzz-hive, to write each
+# agent's mcp.json and restart it. The supervisor is a systemd service on the host
+# (deploy/aws/buzz-hive-supervisor.service), never a container: it is the only code with
+# Docker access.
 # The database name in BUZZ_HIVE_DATABASE_URL must be the one the relay uses
 # (POSTGRES_DB, default buzz). hive-db-init stops the stack when the two differ.
 services:
@@ -61,6 +66,13 @@ services:
       - ../../.env.hive
     environment:
       BUZZ_HIVE_LISTEN: 0.0.0.0:3100
+      BUZZ_HIVE_AGENTS_DIR: /etc/buzz-hive/agents
+      BUZZ_HIVE_SUPERVISOR_SOCKET: /run/buzz-hive/supervisor.sock
+    volumes:
+      # The folders under deploy/aws/agents say which agents exist; read-only.
+      - ../aws/agents:/etc/buzz-hive/agents:ro
+      # The supervisor's socket. The folder is made by the supervisor's unit.
+      - /run/buzz-hive:/run/buzz-hive
     # The runtime image has bash but no curl, so probe /healthz over /dev/tcp.
     healthcheck:
       test:

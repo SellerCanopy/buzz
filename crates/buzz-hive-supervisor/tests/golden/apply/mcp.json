@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "buzz-hive": {
+      "command": "buzz-hive-mcp"
+    },
+    "docs": {
+      "type": "http",
+      "headers": {
+        "Authorization": "Bearer ${DOCS_TOKEN}"
+      },
+      "url": "https://mcp.example.org/mcp"
+    },
+    "filesystem": {
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem@1.0.0",
+        "/home/agent"
+      ],
+      "command": "npx"
+    }
+  }
+}
