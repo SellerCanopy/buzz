@@ -130,6 +130,9 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // none. The payload has the job id, its kind, its state (done or failed), the agent's
     // message and the proposal it stored, or why it failed.
     ("job.result", 20),
+    // A repo was added to a card or taken off it. The payload has the card's repos now, first
+    // repo first, and the repo `added` or `removed`.
+    ("card.repos", 21),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

@@ -415,6 +415,36 @@ impl CodeHost for GitHub {
             .ok_or_else(|| HostError::Other("GitHub's reply to a comment has no id".into()))
     }
 
+    async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        title: &str,
+        body: &str,
+        key: &str,
+    ) -> Result<Issue, HostError> {
+        let marker = marker(key);
+        // A repeat after a failure finds the issue the first try opened, which is among the
+        // most recently updated.
+        let recent = self
+            .list_issues(repo, &IssueFilter::default(), Page::first(30))
+            .await?;
+        if let Some(found) = recent
+            .into_iter()
+            .find(|issue| issue.body.lines().any(|line| line.trim() == marker))
+        {
+            return Ok(found);
+        }
+        let url = self.url(&["repos", &repo.owner, &repo.name, "issues"], &[]);
+        let made = self
+            .post(
+                url,
+                &json!({ "title": title, "body": format!("{body}\n\n{marker}") }),
+            )
+            .await?;
+        issue_from(&made, Some(repo), None)
+            .ok_or_else(|| HostError::Other("GitHub's reply to a new issue is not an issue".into()))
+    }
+
     async fn open_pull_request(
         &self,
         request: &NewPullRequest,

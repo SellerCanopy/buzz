@@ -118,6 +118,9 @@ impl Tx for SpyTx {
     fn proposals(&mut self) -> &mut dyn buzz_hive_core::ports::store::ProposalsRepo {
         self.inner.proposals()
     }
+    fn card_repos(&mut self) -> &mut dyn buzz_hive_core::ports::store::CardReposRepo {
+        self.inner.card_repos()
+    }
     fn jobs(&mut self) -> &mut dyn buzz_hive_core::ports::store::JobsRepo {
         self.inner.jobs()
     }
@@ -155,6 +158,15 @@ impl EventsRepo for SpyTx {
         limit: i64,
     ) -> Result<Vec<Event>, StoreError> {
         self.inner.events().of_card(card, kind, seq, limit).await
+    }
+    async fn of_run(
+        &mut self,
+        card: Uuid,
+        run: Uuid,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.inner.events().of_run(card, run, seq, limit).await
     }
 }
 

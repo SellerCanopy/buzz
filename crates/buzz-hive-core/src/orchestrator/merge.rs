@@ -164,8 +164,8 @@ fn precondition(message: &str) -> IntakeError {
     OpError::FailedPrecondition(message.to_owned()).into()
 }
 
-/// Checks `repos` is the card's one repo, which is the only order a card with one repo has.
-/// Returns the card.
+/// Checks `repos` names every repo on the card once. Nothing is stored: the card has one pull
+/// request, in its first repo, so no order changes what merges. Returns the card.
 pub async fn set_merge_order(
     env: &Env<'_>,
     ctx: &Ctx,
@@ -179,8 +179,8 @@ pub async fn set_merge_order(
         .get(card_id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
-    let issue = tx.issues().by_card(card_id).await?;
-    let own: Vec<String> = issue.iter().map(|row| row.issue.repo.to_string()).collect();
+    let mut own = super::repos::repos_of(&mut *tx, card_id).await?;
+    own.sort();
     let mut want = repos.to_vec();
     want.sort();
     if want != own {

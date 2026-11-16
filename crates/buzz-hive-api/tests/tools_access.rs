@@ -69,3 +69,15 @@ async fn an_agent_whose_owner_can_only_read_cannot_act_above_read() {
     };
     assert_refused_exactly_above(&app, Level::Read).await;
 }
+
+#[tokio::test]
+async fn an_agent_at_read_may_read_a_runs_events_and_is_refused_retry_stage() {
+    let app = app(MemStore::new()).await;
+    set_agent_level(&app, Level::Read).await;
+    let run = serde_json::json!({"runId": uuid::Uuid::nil()});
+    let (status, body) = call(&app, "GetRunEvents", AGENT, run.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = call(&app, "RetryRun", AGENT, run).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "permission_denied");
+}

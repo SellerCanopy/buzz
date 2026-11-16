@@ -562,6 +562,21 @@ service EngineService {
   // writes the Kiln task, adds the card, and records the card on the
   // proposal. A repeat returns the same card and opens nothing new.
   rpc AcceptTicketProposal(AcceptTicketProposalRequest) returns (AcceptTicketProposalResponse);
+  // Beehive: GetRunEvents reads one run's events after a seq, oldest first, for an
+  // agent diagnosing the run. A run that does not exist is NotFound.
+  rpc GetRunEvents(GetRunEventsRequest) returns (GetRunEventsResponse);
+  // Beehive: GetHiveHealth reports what an agent needs to say whether the engine itself
+  // is at fault: runs that have sat in a stage too long, the post backlog and how old
+  // its oldest post is.
+  rpc GetHiveHealth(GetHiveHealthRequest) returns (GetHiveHealthResponse);
+  // Beehive: ReportDiagnosis records an agent's diagnosis of a run in the run's card
+  // activity. A diagnosis with no evidence quote is InvalidArgument.
+  rpc ReportDiagnosis(ReportDiagnosisRequest) returns (ReportDiagnosisResponse);
+  // Beehive: FileTicket reports a fault. An engine or UI fault becomes a Backlog card
+  // linked to the repos named. A fault in a card's own code is held as a ticket
+  // proposal until a person accepts it, and then becomes an issue on the card's repo.
+  // A fault an open card or issue already describes gets a note or comment instead.
+  rpc FileTicket(FileTicketRequest) returns (FileTicketResponse);
 }
 
 message GetStatusRequest {}
@@ -1140,7 +1155,8 @@ message RestoreCardRequest {
 }
 
 message AddIssueRepoRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
   // owner/name on the issue's host.
   string repo = 2;
   // The branch a new branch starts from. Empty for the repo's default branch.
@@ -1148,7 +1164,8 @@ message AddIssueRepoRequest {
 }
 
 message RemoveIssueRepoRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
   // owner/name.
   string repo = 2;
 }
@@ -1915,6 +1932,81 @@ message AcceptTicketProposalResponse {
   AssistantProposal proposal = 2;
 }
 
+message GetRunEventsRequest {
+  // Beehive: the run's UUID.
+  string run_id = 1;
+  // Return events with seq greater than this; 0 starts from the beginning.
+  int64 after_seq = 2;
+  // 0 means 100. Over 500 is InvalidArgument.
+  int32 limit = 3;
+}
+
+message GetRunEventsResponse {
+  repeated Event events = 1;
+  // The seq to pass as after_seq on the next call; after_seq when there were none.
+  int64 next_seq = 2;
+}
+
+message GetHiveHealthRequest {}
+
+message StuckRun {
+  string run_id = 1;
+  string card_id = 2;
+  string stage_id = 3;
+  // How long the run has been in the stage.
+  int64 seconds = 4;
+}
+
+message GetHiveHealthResponse {
+  int64 head_seq = 1;
+  // Runs in state running whose stage was entered more than stuck_after_seconds ago.
+  repeated StuckRun stuck_runs = 2;
+  int64 stuck_after_seconds = 3;
+  // Posts to the relay not sent yet, failed ones included.
+  int64 outbox_pending = 4;
+  int64 outbox_failed = 5;
+  // How long the oldest unsent post has waited, 0 when none waits. A post that waits long
+  // means the relay is not taking what Beehive sends it.
+  int64 oldest_pending_seconds = 6;
+  // Whether the relay's allowlist has been applied to this engine's account. Always
+  // "unknown" until Phase 22 reads it.
+  string allowlist_applied = 7;
+}
+
+message ReportDiagnosisRequest {
+  // Beehive: the run's UUID.
+  string run_id = 1;
+  // At least one evidence quote is required.
+  Diagnosis diagnosis = 2;
+}
+
+message ReportDiagnosisResponse {
+  // The seq of the activity.added event on the run's card that holds the diagnosis.
+  int64 event_seq = 1;
+}
+
+message FileTicketRequest {
+  // engine, ui or code.
+  string kind = 1;
+  string title = 2;
+  string body = 3;
+  // owner/name of the repos the ticket concerns. A code fault names one repo, which must
+  // be on the card, or none for the card's first repo.
+  repeated string repos = 4;
+  // Beehive: the card whose own code is at fault. Required for kind code.
+  string card_id = 5;
+}
+
+message FileTicketResponse {
+  // created: a Backlog card was made (card_id). noted: an open card already had the
+  // fault and got a note (card_id). commented: an open issue already had it and got a
+  // comment (issue). proposed: a code fault waits for a person (proposal_id).
+  string outcome = 1;
+  string card_id = 2;
+  IssueRef issue = 3;
+  int64 proposal_id = 4;
+}
+
 message ResolveProposalRequest {
   int64 proposal_id = 1;
   // accepted or discarded.
@@ -1949,6 +2041,9 @@ message OpenProposal {
   string base_hash = 3;
   // The assistant job that made it, empty for an edit_workflow proposal.
   string job_id = 4;
+  // Beehive: set instead of draft for a ticket an agent proposed. Accept it with
+  // AcceptTicketProposal.
+  TicketProposal ticket = 5;
 }
 
 message AssistantResultRequest {

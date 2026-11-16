@@ -62,7 +62,7 @@ pub fn timestamp(at: chrono::DateTime<chrono::Utc>) -> pbjson_types::Timestamp {
     }
 }
 
-fn to_proto(event: Event) -> ProtoEvent {
+pub(super) fn to_proto(event: Event) -> ProtoEvent {
     ProtoEvent {
         seq: event.seq,
         r#type: event.kind,

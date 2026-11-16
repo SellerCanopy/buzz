@@ -814,3 +814,77 @@ async fn an_exchange_nobody_asked_for_fails_the_test_too() {
     let replay = Replay::start(vec![Exchange::get("/user/orgs").fixture("orgs.json")]).await;
     replay.finish();
 }
+
+fn issue_json(number: u64, body: &str) -> String {
+    serde_json::json!({
+        "number": number,
+        "title": "Export drops the last row",
+        "body": body,
+        "state": "open",
+        "labels": [],
+        "assignees": [],
+        "user": {"login": "example-bot"},
+        "html_url": format!("https://github.example.org/example-org/api/issues/{number}"),
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn an_issue_is_opened_with_a_marker_for_its_key() {
+    let replay = Replay::start(vec![
+        // Nothing carries the key yet.
+        open_issues().body("[]"),
+        Exchange::post("/repos/example-org/api/issues")
+            .status(201)
+            .body(&issue_json(9, "Off by one.")),
+    ])
+    .await;
+    let made = github(&replay)
+        .await
+        .create_issue(
+            &repo(),
+            "Export drops the last row",
+            "Off by one.",
+            "ticket-proposal:4",
+        )
+        .await
+        .unwrap();
+    assert_eq!(made.number, 9);
+    assert_eq!(made.repo, repo());
+    let post = replay
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST")
+        .unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(sent["title"], "Export drops the last row");
+    let body = sent["body"].as_str().unwrap();
+    assert!(body.starts_with("Off by one."), "{body}");
+    assert!(
+        body.contains("<!-- buzz-hive:ticket-proposal:4 -->"),
+        "the key is in the body: {body}"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_repeated_key_finds_the_issue_it_opened_and_posts_nothing() {
+    let marked = "Off by one.\n\n<!-- buzz-hive:ticket-proposal:4 -->";
+    let replay = Replay::start(vec![
+        open_issues().body(&format!("[{}]", issue_json(9, marked)))
+    ])
+    .await;
+    let found = github(&replay)
+        .await
+        .create_issue(
+            &repo(),
+            "Export drops the last row",
+            "Off by one.",
+            "ticket-proposal:4",
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.number, 9);
+    assert!(replay.requests().iter().all(|r| r.method != "POST"));
+    replay.finish();
+}

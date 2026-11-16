@@ -61,7 +61,11 @@ pub(super) async fn facts(
     // A card made from an issue has the issue's labels as last read, and the issue's repo; any
     // other has neither.
     let issue = tx.issues().by_card(card.id).await?;
-    let repo = issue.as_ref().map(|row| row.issue.repo.to_string());
+    // The card runs in its first repo: its issue's, or for a card with none the first added.
+    let repo = super::repos::repos_of(tx, card.id)
+        .await?
+        .into_iter()
+        .next();
     let labels = issue.map(|row| row.issue.labels).unwrap_or_default();
     let pull_request = tx
         .pull_requests()
@@ -692,6 +696,7 @@ async fn task_text(
         },
         channel: Some(channel),
         visit,
+        repos: super::repos::repos_of(tx, card.id).await?,
         issue: tx.issues().by_card(card.id).await?.map(|row| IssueText {
             repo: row.issue.repo.to_string(),
             number: row.issue.number,

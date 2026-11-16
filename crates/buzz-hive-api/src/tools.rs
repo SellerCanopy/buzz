@@ -16,6 +16,7 @@ use buzz_hive_core::orchestrator::assistant::MAX_MESSAGE_BYTES;
 use buzz_hive_core::orchestrator::cards::{
     MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
 };
+use buzz_hive_core::orchestrator::diagnose::{DEFAULT_EVENTS_LIMIT, MAX_EVENTS_LIMIT};
 use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
@@ -276,15 +277,52 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "get_hive_health",
-        route: "GetStatus",
+        route: "GetHiveHealth",
         needs: Level::Read,
-        description: "Read Beehive's version, the newest event number, the running card count and how many posts to the relay are waiting or have failed.",
+        description: "Read whether Beehive itself looks well: runs that have sat in one stage too long, how many posts to the relay are waiting or have failed, and how long the oldest has waited. allowlistApplied is always \"unknown\" for now: do not treat it as a fault.",
         schema: no_arguments,
+    },
+    Tool {
+        name: "get_run_events",
+        route: "GetRunEvents",
+        needs: Level::Read,
+        description: "Read one run's events, oldest first, to find out what happened to it. Give nextSeq of the last reply as afterSeq to read on.",
+        schema: get_run_events,
+    },
+    Tool {
+        name: "report_diagnosis",
+        route: "ReportDiagnosis",
+        needs: Level::Run,
+        description: "Record your diagnosis of a run in its card's activity. Name the likely cause and quote what you read that shows it: at least one evidence quote is required, and a diagnosis without one is refused. List in gaps what you could not see.",
+        schema: report_diagnosis,
+    },
+    Tool {
+        name: "file_ticket",
+        route: "FileTicket",
+        needs: Level::Run,
+        description: "Report a fault. kind engine (Beehive) or ui (the app's screens) makes a Backlog card linked to the repos you name. kind code (the card's own code) holds a ticket for a person to accept, which then opens a GitHub issue on the card's repo, so give cardId. An open card or issue that already says the same gets your report as a note or comment instead of a second one.",
+        schema: file_ticket,
     },
 ];
 
 /// Routes that are deliberately not tools, each with the reason.
 pub const NOT_TOOLS: &[(&str, &str)] = &[
+    (
+        "GetStatus",
+        "the page's header counts; get_hive_health reports what an agent needs",
+    ),
+    (
+        "AddIssueRepo",
+        "a person links a repo to a card on the card page; an agent names repos in file_ticket",
+    ),
+    (
+        "RemoveIssueRepo",
+        "a person unlinks a repo on the card page",
+    ),
+    (
+        "AcceptTicketProposal",
+        "a person decides a ticket an agent proposed, so an agent never accepts its own",
+    ),
     (
         "PollEvents",
         "the board's live feed for a client; an agent reads get_card and list_runs",
@@ -864,6 +902,78 @@ fn record_decision() -> Value {
             ),
         ],
         &["cardId", "summary", "why"],
+    )
+}
+
+fn get_run_events() -> Value {
+    object(
+        vec![
+            ("runId", string("The run's id.")),
+            (
+                "afterSeq",
+                json!({ "type": "integer", "description": "Read events after this seq. 0 reads from the start." }),
+            ),
+            (
+                "limit",
+                json!({ "type": "integer", "description": format!("At most this many, up to {MAX_EVENTS_LIMIT}. 0 means {DEFAULT_EVENTS_LIMIT}.") }),
+            ),
+        ],
+        &["runId"],
+    )
+}
+
+fn report_diagnosis() -> Value {
+    let evidence = json!({
+        "type": "object",
+        "properties": {
+            "source": { "type": "string", "description": "Where you read it, such as \"event 8812\"." },
+            "quote": { "type": "string", "description": "The words you read, copied exactly." },
+        },
+        "required": ["quote"],
+    });
+    object(
+        vec![
+            ("runId", string("The run's id.")),
+            (
+                "diagnosis",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "cause": string("One sentence naming the likely cause."),
+                        "stageId": string("The stage the fault is in. Empty if you cannot say."),
+                        "evidence": { "type": "array", "items": evidence, "description": "At least one quote." },
+                        "gaps": { "type": "array", "items": { "type": "string" }, "description": "What you could not see." },
+                    },
+                    "required": ["cause", "evidence"],
+                }),
+            ),
+        ],
+        &["runId", "diagnosis"],
+    )
+}
+
+fn file_ticket() -> Value {
+    object(
+        vec![
+            (
+                "kind",
+                json!({ "type": "string", "enum": ["engine", "ui", "code"], "description": "engine: Beehive is at fault. ui: the app's screens are. code: the card's own code is." }),
+            ),
+            ("title", string("One line naming the fault.")),
+            (
+                "body",
+                string("What happened, what you expected, and the evidence."),
+            ),
+            (
+                "repos",
+                json!({ "type": "array", "items": { "type": "string" }, "description": "owner/name of the repos it concerns. For code, the one repo of the card; empty means the card's first repo." }),
+            ),
+            (
+                "cardId",
+                string("The card whose code is at fault. Required for kind code."),
+            ),
+        ],
+        &["kind", "title", "body"],
     )
 }
 

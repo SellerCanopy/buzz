@@ -14,11 +14,11 @@ use buzz_hive_core::domain::run::{Run, RunState};
 use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
-    AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo, KeptVersion, OutboxBacklog,
-    OutboxRepo, OutboxRow, Posting, Proposal, ProposalsRepo, PullRequestsRepo, RunsRepo,
-    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
-    WorkflowsRepo,
+    AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardReposRepo, CardsRepo, CommunityId,
+    EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo, KeptVersion,
+    OutboxBacklog, OutboxRepo, OutboxRow, Posting, Proposal, ProposalsRepo, PullRequestsRepo,
+    RunsRepo, SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx,
+    UsageRepo, WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -108,6 +108,9 @@ impl Tx for PgTx {
         self
     }
     fn proposals(&mut self) -> &mut dyn ProposalsRepo {
+        self
+    }
+    fn card_repos(&mut self) -> &mut dyn CardReposRepo {
         self
     }
     fn jobs(&mut self) -> &mut dyn JobsRepo {
@@ -562,6 +565,30 @@ impl EventsRepo for PgTx {
         .bind(self.community)
         .bind(card)
         .bind(kind)
+        .bind(seq)
+        .bind(limit.max(0))
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_event).collect()
+    }
+
+    async fn of_run(
+        &mut self,
+        card: uuid::Uuid,
+        run: uuid::Uuid,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT seq, kind, card_id, run_id, actor_pubkey, actor_kind, payload, at \
+             FROM hive.events \
+             WHERE community_id = $1 AND card_id = $2 AND run_id = $3 AND seq > $4 \
+             ORDER BY seq LIMIT $5",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(run)
         .bind(seq)
         .bind(limit.max(0))
         .fetch_all(&mut *self.tx)
@@ -1035,6 +1062,46 @@ impl WorkflowsRepo for PgTx {
                 builtin,
             })
             .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl CardReposRepo for PgTx {
+    async fn of_card(&mut self, card: uuid::Uuid) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT repo FROM hive.card_repos WHERE community_id = $1 AND card_id = $2 ORDER BY seq",
+        )
+        .bind(self.community)
+        .bind(card)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)
+    }
+
+    async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.card_repos (community_id, card_id, repo) VALUES ($1, $2, $3)",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(repo)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError> {
+        let removed = sqlx::query(
+            "DELETE FROM hive.card_repos WHERE community_id = $1 AND card_id = $2 AND repo = $3",
+        )
+        .bind(self.community)
+        .bind(card)
+        .bind(repo)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(removed.rows_affected() == 1)
     }
 }
 
@@ -2039,15 +2106,20 @@ impl OutboxRepo for PgTx {
     }
 
     async fn backlog(&mut self) -> Result<OutboxBacklog, StoreError> {
-        let (pending, failed): (i64, i64) = sqlx::query_as(
-            "SELECT count(*), count(*) FILTER (WHERE attempts > 0) FROM hive.outbox \
-             WHERE community_id = $1 AND done_at IS NULL",
-        )
-        .bind(self.community)
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(store_error)?;
-        Ok(OutboxBacklog { pending, failed })
+        let (pending, failed, oldest): (i64, i64, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT count(*), count(*) FILTER (WHERE attempts > 0), min(created_at) \
+                 FROM hive.outbox WHERE community_id = $1 AND done_at IS NULL",
+            )
+            .bind(self.community)
+            .fetch_one(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        Ok(OutboxBacklog {
+            pending,
+            failed,
+            oldest,
+        })
     }
 
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {

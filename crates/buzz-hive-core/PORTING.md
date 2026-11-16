@@ -132,12 +132,12 @@ spec's title and are confirmed when that phase starts.
 | `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is not ported: a card made from an issue starts with no parameters) | 16 |
 | `paused-turn` | changed (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; Phase 12 opens the Needs you item that a reply finishes, in `tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`) | 12 |
 | `permissions` | changed (Phase 14 ports the contract against Beehive levels: an admin sets a person's or an agent's level, the engine then allows and refuses to match, and Settings lists the same levels. Kiln's permission asks are dropped, Buzz owns permissions. Covered by buzz-app `e2e/permissions.spec.mjs`) | 14 |
-| `pick-repo` | pending | 21 |
+| `pick-repo` | changed (Phase 21: a card with no repo gets its first with `AddIssueRepo`, which makes it the repo the card runs in; the spec's start-the-stage-and-close-the-item flow is the existing `StartStage` and the Needs you answer, and the Repos tab itself is in buzz-app) | 21 |
 | `plugin-command` | dropped (plugins) | 1 |
 | `plugin-contents` | dropped (plugins) | 1 |
 | `prompt-skill` | dropped (prompt skills) | 1 |
 | `remove` | pending | 4 |
-| `repos` | pending | 21 |
+| `repos` | changed (Phase 21: `AddIssueRepo` and `RemoveIssueRepo` in `buzz-hive-api/tests/diagnose.rs`, over `FakeCodeHost`. The spec's reorder is not ported: the merge order is the order added, see the Phase 21 section) | 21 |
 | `reset` | pending | 17 |
 | `runners` | dropped (runner pairing, stages run on Buzz agents) | 1 |
 | `select` | pending | 5 |
@@ -622,3 +622,70 @@ spec's title and are confirmed when that phase starts.
   Buzz is the conversation).
 - Events: `job.started` and `job.result`. A job that runs out of time ends `failed` with one
   `job.result`, from the timer loop's sweep.
+
+## Phase 21: agents diagnose failed runs, and a card's repos
+
+- Migration `0019_card_repos.sql` makes `hive.card_repos (community_id, card_id, repo, seq)`. A
+  card's repos are its issue's repo first, then these in the order added. `seq` is an identity
+  column, so a repo added after a middle one was removed goes last and never takes a place.
+- **A card with several repos still runs in the first repo** (design question 12, followed as
+  the plan says). The first repo is the issue's, or for a card with no issue the first added.
+  `Facts.repo` drives the pull request, so one pull request opens, in that repo. The other repos
+  are linked context: the stage task names them as "context to read, not a place to change".
+- Served: `AddIssueRepo`, `RemoveIssueRepo` and `AcceptTicketProposal` (Run), and the tools
+  `get_run_events` (Read), `get_hive_health` (Read), `report_diagnosis` (Run) and `file_ticket`
+  (Run). `AddIssueRepo` and `RemoveIssueRepo` take the card id as a UUID string, since Beehive
+  ids are not integers. The three routes are not tools: an agent does not widen what a card
+  works on, and a ticket is accepted by a person.
+- A new event kind `card.repos` (Phase 21) tells the UI the card's repos changed.
+- `file_ticket` kinds: `engine` and `ui` faults become a Backlog card linked to the named repos,
+  with no GitHub issue. A `code` fault names a card and one of its repos and becomes a
+  proposal; a person's `AcceptTicketProposal` opens the issue and imports it. Both first look
+  for the same fault: an open card with the same title gets a note, an open issue on the
+  repos gets a comment, and no second card is made.
+- `base` on `AddIssueRepo` is checked as a branch name and not stored: a card's branch is made
+  from the repo's default branch (Phase 17), so a per-repo base has nothing to feed.
+
+### Multirepo tests from `scenario_multirepo_test.go`
+
+Ported (Beehive tests in `buzz-hive-api/tests/diagnose.rs` and
+`buzz-hive-store/tests/postgres_card_repos.rs`): a missing or forbidden repo writes no row (the
+host answers not found for both); adding a repo already there or a malformed one is refused
+(`web`, empty, `a/b/c`, `a/..`, `../web`, `a/b?x`); removing the main repo while others remain,
+or a repo the card lacks, is refused; repos are frozen while a run is active; adding after
+removing a middle repo keeps the order unique; a card with no issue takes its first repo as
+main and the second after it; a bare name and an unknown repo are refused; removing the last
+repo returns the card to none; a bad base is refused before the host is asked; remove is
+refused while the issue lists the repo, and while the repo has an open pull request.
+
+Not ported, each with its decision:
+
+| Go test | decision |
+|---|---|
+| `AddingARepoPreparesAWorktreeInEach`, `AStartFailureInTheSecondRepoFailsTheStage`, `ARefusedRemovalLeavesTheWorktreeAlone` | dropped: a card has no folder on the engine, so no worktree is prepared (Phase 17) |
+| `AgentNarrowsTheRepos`, `AReportNamingAnUnknownRepoChangesNothing`, `AReportCanWidenTheRepos`, `ANarrowedReportKeepsTheMainRepo`, `AOneRepoCardIgnoresTheReposField` | dropped: a stage report does not carry a repo list, since only the first repo is worked in |
+| `OpenPullRequestOpensOnePerRepoAndLinksThem`, `ARepoWithNoCommitsGetsNoPullRequest`, the `OpenPullRequest*Retry*` pair, `OpenPullRequestFailsWhenNoRepoHasCommits`, `OpenPullRequestSkipsADroppedRepo`, `ADroppedRepoWithAPullRequestStillGetsMarkReady`, `PullRequestActionsNameEveryFailingRepo` | dropped: one pull request, in the first repo (question 12) |
+| `CopyArtifactAndRunCommandTakeARepo` | dropped: both act in the card's one repo |
+| `WaitForCIChecksEveryPullRequest`, `WaitForCIStaysPendingWhileOneRepoIsPending`, `PullRequestWaitReadsEveryPullRequest` | dropped: one pull request is waited on |
+| `MergeFollowsTheOrderAndStopsAtTheFirstFailure`, the `SetMergeOrder*` tests, `TheClosesLinkFollowsTheMergeOrder` | dropped: one pull request merges, and the merge order is the order added. `SetMergeOrder` still accepts the card's repos in any order and stores nothing (Phase 18); it now compares with all the card's repos, so a card with several repos is no longer refused |
+| `SyncBaseNamesEveryConflictingRepo`, `SyncBaseStillSyncsTheCleanRepo`, `ASyncWaitsForAnActiveRun` | dropped: no worktree to sync |
+| `CleanupKeepsReposWithUnpushedCommitsAndRetryRemovesTheRest`, `CleanupKeepsTheBranchWhereAPullRequestIsOpen` | dropped: no worktree to clean (Phase 17) |
+| `ReviewCommentsOnEveryRepoReachTheAgentWithTheirRepo`, the `Reply*` tests, `BannerLinksTheFirstPullRequestWhenTheMainRepoHasNone` | dropped: review comments and the banner belong to the one pull request |
+| `IntakeAddsTheReposAnIssueListsBeforeAnyStage`, the `FrontMatter*` tests, `StageStartAddsNoRepoTheIssueFrontMatterLists` | dropped: Beehive does not read repos from an issue's front matter; a person or the intake rule names them |
+| The `LocalIssue` tests | ported as the card with no issue, which is Beehive's only local card |
+| `ARepoWithItsOwnBaseBranchesFromItAndOpensItsPullRequestAgainstIt` | dropped: `base` is checked and not stored |
+| Go `repos_test.go`: `SyncIssueRepos*`, `DropWorktree`, `RepoFailures`, `RemovalAndAWorktreeStartTakeTheIssueLockInTurn` | dropped: the sync and the worktree lock go with the worktrees. `ParseRepo`, `ParseCardRepoMatchesTheRepoACardHas` and `RemovalRefusalOnAKilnTask` are covered by `RepoRef::parse` and the removal refusals |
+
+### Deviations
+
+- Duplicate search is a normalized title match (lowercase, whitespace collapsed) over the open
+  cards and the first 100 open issues of each named repo, not the host's search syntax.
+- The plan's "listener lag" in `get_hive_health` is the age of the oldest unsent outbox post,
+  since the relay listener was dropped in Phase 12. `allowlist_applied` is `"unknown"` until
+  Phase 22.
+- `AcceptTicketProposal` reads the open proposals, so a proposal that was accepted is not
+  found again.
+- `set_merge_order` compared against the issue's repo only, which a card with a second repo
+  could never satisfy. It now compares against all the card's repos.
+- `OpenProposal` gained a `ticket` field so `ListProposals` shows the tickets waiting.
+

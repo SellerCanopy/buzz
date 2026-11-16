@@ -89,6 +89,7 @@ pub async fn get_card(app: App, ctx: Ctx, req: GetCardRequest) -> Result<Card, H
         proto.issue_labels = row.issue.labels;
         proto.branch = card_branch(id, &proto.title);
     }
+    proto.repos = crate::routes::repos::card_repos(&app, &ctx, id, proto.issue.is_some()).await?;
     Ok(proto)
 }
 

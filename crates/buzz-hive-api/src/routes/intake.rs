@@ -145,7 +145,7 @@ fn rule_to_proto(rule: IntakeRule) -> ProtoRule {
     }
 }
 
-fn issue_ref(repo: &RepoRef, number: u64) -> IssueRef {
+pub(super) fn issue_ref(repo: &RepoRef, number: u64) -> IssueRef {
     IssueRef {
         host: HOST.to_owned(),
         owner: repo.owner.clone(),

@@ -12,11 +12,12 @@ use crate::domain::timer::{Timer, TimerKind};
 use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo,
-    KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting, Proposal,
-    ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo, StageThread,
-    Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
+    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardReposRepo,
+    CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job,
+    JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting,
+    Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo,
+    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -51,6 +52,8 @@ struct State {
     /// Proposals in creation order, with the time each was resolved.
     proposals: Vec<(CommunityId, Proposal, bool)>,
     next_proposal_id: i64,
+    /// In the order added.
+    card_repos: Vec<(CommunityId, uuid::Uuid, String)>,
     /// In creation order, each with when it ends as failed.
     jobs: Vec<(CommunityId, Job, Option<chrono::DateTime<chrono::Utc>>)>,
 }
@@ -195,6 +198,9 @@ impl Tx for MemTx {
     fn proposals(&mut self) -> &mut dyn ProposalsRepo {
         self
     }
+    fn card_repos(&mut self) -> &mut dyn CardReposRepo {
+        self
+    }
     fn jobs(&mut self) -> &mut dyn JobsRepo {
         self
     }
@@ -286,6 +292,28 @@ impl EventsRepo for MemTx {
                     && event.seq > seq
                     && event.kind == kind
                     && event.card_id == Some(card)
+            })
+            .take(limit.max(0) as usize)
+            .map(|(_, event)| event.clone())
+            .collect())
+    }
+
+    async fn of_run(
+        &mut self,
+        card: uuid::Uuid,
+        run: uuid::Uuid,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let log = self.log.lock().unwrap();
+        Ok(log
+            .events
+            .iter()
+            .filter(|(community, event)| {
+                *community == self.community
+                    && event.seq > seq
+                    && event.card_id == Some(card)
+                    && event.run_id == Some(run)
             })
             .take(limit.max(0) as usize)
             .map(|(_, event)| event.clone())
@@ -787,14 +815,19 @@ impl OutboxRepo for MemTx {
             .outbox
             .iter()
             .filter(|(c, row)| *c == self.community && row.done_at.is_none());
-        let (mut pending, mut failed) = (0, 0);
+        let (mut pending, mut failed, mut oldest) = (0, 0, None);
         for (_, row) in waiting {
             pending += 1;
             if row.attempts > 0 {
                 failed += 1;
             }
+            oldest = oldest.min(Some(row.created_at)).or(Some(row.created_at));
         }
-        Ok(OutboxBacklog { pending, failed })
+        Ok(OutboxBacklog {
+            pending,
+            failed,
+            oldest,
+        })
     }
 
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
@@ -866,6 +899,9 @@ impl CardsRepo for MemTx {
             .inbox
             .retain(|(c, i)| !(*c == community && i.card_id == id));
         self.work.pulls.remove(&(community, id));
+        self.work
+            .card_repos
+            .retain(|(c, card, _)| !(*c == community && *card == id));
         Ok(())
     }
 }
@@ -1065,6 +1101,49 @@ impl ProposalsRepo for MemTx {
             .iter_mut()
             .find(|(c, p, resolved)| *c == community && p.id == id && !resolved);
         Ok(open.map(|(_, _, resolved)| *resolved = true).is_some())
+    }
+}
+
+#[async_trait::async_trait]
+impl CardReposRepo for MemTx {
+    async fn of_card(&mut self, card: uuid::Uuid) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .work
+            .card_repos
+            .iter()
+            .filter(|(c, id, _)| *c == self.community && *id == card)
+            .map(|(_, _, repo)| repo.clone())
+            .collect())
+    }
+
+    async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError> {
+        let community = self.community;
+        if self.find(card).is_none() {
+            return Err(StoreError::NotFound(format!("card {card}")));
+        }
+        if self
+            .work
+            .card_repos
+            .iter()
+            .any(|(c, id, have)| *c == community && *id == card && have == repo)
+        {
+            return Err(StoreError::Conflict(format!(
+                "{repo} is already on the card"
+            )));
+        }
+        self.work
+            .card_repos
+            .push((community, card, repo.to_owned()));
+        Ok(())
+    }
+
+    async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError> {
+        let community = self.community;
+        let before = self.work.card_repos.len();
+        self.work
+            .card_repos
+            .retain(|(c, id, have)| !(*c == community && *id == card && have == repo));
+        Ok(self.work.card_repos.len() < before)
     }
 }
 

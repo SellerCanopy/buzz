@@ -10,10 +10,12 @@ mod agents;
 mod artifacts;
 mod assistant;
 mod cards;
+mod diagnose;
 mod inbox;
 pub mod intake;
 mod merge;
 pub mod poll;
+mod repos;
 mod runs;
 mod settings;
 mod stages;
@@ -116,6 +118,15 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListProposals", Level::Read),
     ("ResolveProposal", Level::Read),
     ("AssistantResult", Level::Read),
+    // An agent diagnoses a run at Read and reports at Run. The repo calls change what a card
+    // works in, so they are Run; accepting a ticket is checked to be a person in the handler.
+    ("GetRunEvents", Level::Read),
+    ("GetHiveHealth", Level::Read),
+    ("ReportDiagnosis", Level::Run),
+    ("FileTicket", Level::Run),
+    ("AddIssueRepo", Level::Run),
+    ("RemoveIssueRepo", Level::Run),
+    ("AcceptTicketProposal", Level::Run),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -277,5 +288,12 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListProposals", assistant::list_proposals);
     let r = route(r, "ResolveProposal", assistant::resolve_proposal);
     let r = route(r, "AssistantResult", assistant::assistant_result);
+    let r = route(r, "GetRunEvents", diagnose::get_run_events);
+    let r = route(r, "GetHiveHealth", diagnose::get_hive_health);
+    let r = route(r, "ReportDiagnosis", diagnose::report_diagnosis);
+    let r = route(r, "FileTicket", diagnose::file_ticket);
+    let r = route(r, "AcceptTicketProposal", diagnose::accept_ticket_proposal);
+    let r = route(r, "AddIssueRepo", repos::add_issue_repo);
+    let r = route(r, "RemoveIssueRepo", repos::remove_issue_repo);
     route(r, "GetUsage", status::get_usage)
 }

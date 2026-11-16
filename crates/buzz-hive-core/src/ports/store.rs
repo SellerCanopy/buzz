@@ -64,6 +64,7 @@ pub trait Tx: Send {
     fn issues(&mut self) -> &mut dyn IssuesRepo;
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     fn proposals(&mut self) -> &mut dyn ProposalsRepo;
+    fn card_repos(&mut self) -> &mut dyn CardReposRepo;
     fn jobs(&mut self) -> &mut dyn JobsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
@@ -148,6 +149,15 @@ pub trait EventsRepo: Send {
         &mut self,
         card: uuid::Uuid,
         kind: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError>;
+    /// A run's committed events with seq greater than `seq`, oldest first, at most `limit`.
+    /// `card` is the run's card, which narrows the read.
+    async fn of_run(
+        &mut self,
+        card: uuid::Uuid,
+        run: uuid::Uuid,
         seq: i64,
         limit: i64,
     ) -> Result<Vec<Event>, StoreError>;
@@ -290,6 +300,17 @@ pub trait ProposalsRepo: Send {
     async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError>;
     /// Marks an open proposal decided. `false` when it is gone or was decided already.
     async fn resolve(&mut self, id: i64) -> Result<bool, StoreError>;
+}
+
+/// The repos a card works in besides its issue's, in the order they were added.
+#[async_trait::async_trait]
+pub trait CardReposRepo: Send {
+    /// The card's added repos, first added first.
+    async fn of_card(&mut self, card: uuid::Uuid) -> Result<Vec<String>, StoreError>;
+    /// Adds `repo` after the card's others. `Conflict` when the card has it already.
+    async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError>;
+    /// Drops `repo`. `false` when the card did not have it.
+    async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError>;
 }
 
 /// Where a job stands. A job leaves `Running` once and never returns.
@@ -598,6 +619,8 @@ pub struct OutboxBacklog {
     pub pending: i64,
     /// The pending posts that failed their last attempt.
     pub failed: i64,
+    /// When the oldest pending post was queued.
+    pub oldest: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Posts waiting for the relay. Written in the transaction that changes a run, so a crash

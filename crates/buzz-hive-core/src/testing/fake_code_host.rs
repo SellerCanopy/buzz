@@ -19,6 +19,8 @@ struct Inner {
     /// Errors the next calls fail with, one per call, oldest first.
     failures: VecDeque<HostError>,
     next_comment: CommentId,
+    /// The issues Beehive opened, by the key each was opened under.
+    opened: Vec<(String, RepoRef, u64)>,
     /// The pull requests opened, with the key each was opened under.
     pulls: Vec<(NewPullRequest, String, PullRequest)>,
     /// The checks and labels of the pull requests, by repo and number.
@@ -348,6 +350,53 @@ impl CodeHost for FakeCodeHost {
             .comments
             .push((repo.clone(), number, comment, Some(key.to_owned())));
         Ok(id)
+    }
+
+    async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        title: &str,
+        body: &str,
+        key: &str,
+    ) -> Result<Issue, HostError> {
+        let mut inner = self.enter(format!("create_issue {repo} {key}"))?;
+        let again = inner
+            .opened
+            .iter()
+            .find(|(k, r, _)| k == key && r == repo)
+            .map(|(_, _, number)| *number);
+        if let Some(found) = again.and_then(|number| {
+            inner
+                .issues
+                .iter()
+                .find(|i| i.repo == *repo && i.number == number)
+                .cloned()
+        }) {
+            return Ok(found);
+        }
+        let number = inner
+            .issues
+            .iter()
+            .filter(|i| i.repo == *repo)
+            .map(|i| i.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let issue = Issue {
+            repo: repo.clone(),
+            number,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            author: "beehive".into(),
+            state: IssueState::Open,
+            url: format!("https://github.com/{repo}/issues/{number}"),
+            etag: None,
+        };
+        inner.issues.push(issue.clone());
+        inner.opened.push((key.to_owned(), repo.clone(), number));
+        Ok(issue)
     }
 
     async fn open_pull_request(

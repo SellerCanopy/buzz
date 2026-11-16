@@ -6,6 +6,7 @@ use buzz_hive_core::orchestrator::assistant::{
     assistant_result as record_result, cancel_job as cancel, open_proposals,
     resolve_proposal as resolve, start_job, Draft, JobKind, Reported, Start,
 };
+use buzz_hive_core::orchestrator::diagnose::PROPOSAL_TICKET;
 use buzz_hive_core::orchestrator::save::PROPOSAL_WORKFLOW;
 use buzz_hive_core::ports::store::Proposal;
 use uuid::Uuid;
@@ -17,7 +18,7 @@ use crate::proto::{
     AssistantProposal, AssistantResultRequest, AssistantResultResponse, CancelJobRequest,
     CancelJobResponse, ListProposalsRequest, ListProposalsResponse, OpenProposal,
     ResolveProposalRequest, ResolveProposalResponse, StartAdaptSkillsRequest, StartChatRequest,
-    StartJobResponse, StartProposeWorkflowEditRequest, WorkflowDraft,
+    StartJobResponse, StartProposeWorkflowEditRequest, TicketProposal, WorkflowDraft,
 };
 use crate::unary::Ctx;
 
@@ -166,12 +167,25 @@ pub async fn list_proposals(
     })
 }
 
-/// A stored workflow proposal as the app reads it. A kind this build does not know is left out.
+/// A stored workflow or ticket proposal as the app reads it. A kind this build does not know is
+/// left out.
 fn open_proposal(proposal: Proposal) -> Option<OpenProposal> {
+    let text = |key: &str| proposal.body[key].as_str().unwrap_or_default().to_owned();
+    if proposal.kind == PROPOSAL_TICKET {
+        return Some(OpenProposal {
+            id: proposal.id,
+            ticket: Some(TicketProposal {
+                title: text("title"),
+                body: text("body"),
+                repo: text("repo"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     if proposal.kind != PROPOSAL_WORKFLOW {
         return None;
     }
-    let text = |key: &str| proposal.body[key].as_str().unwrap_or_default().to_owned();
     let files = proposal.body["files"]
         .as_object()
         .map(|files| {
@@ -194,6 +208,7 @@ fn open_proposal(proposal: Proposal) -> Option<OpenProposal> {
         }),
         base_hash: text("baseHash"),
         job_id: text("jobId"),
+        ticket: None,
     })
 }
 
