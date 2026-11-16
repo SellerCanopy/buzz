@@ -20,6 +20,9 @@ pub const SAVED_LABEL: &str = "saved";
 #[derive(Clone, Default)]
 pub struct SavedPackages {
     kept: Arc<RwLock<Vec<KeptVersion>>>,
+    /// Held across a read and the swap that follows it, so a slow read that began before a
+    /// change cannot replace the result of one that began after it.
+    refreshing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SavedPackages {
@@ -33,6 +36,7 @@ impl SavedPackages {
         store: &dyn Store,
         community: CommunityId,
     ) -> Result<(), StoreError> {
+        let _one_at_a_time = self.refreshing.lock().await;
         let mut tx = store.begin(community).await?;
         let kept = tx.workflows().kept_versions().await?;
         drop(tx);
@@ -53,9 +57,12 @@ impl SavedPackages {
                     continue;
                 }
             };
-            let Ok(mut package) = parse(&format!("{SAVED_LABEL}/{}", version.name), files) else {
-                tracing::warn!(name = %version.name, "a stored package does not decode");
-                continue;
+            let mut package = match parse(&format!("{SAVED_LABEL}/{}", version.name), files) {
+                Ok(package) => package,
+                Err(error) => {
+                    tracing::warn!(name = %version.name, %error, "a stored package does not decode");
+                    continue;
+                }
             };
             package.builtin = version.builtin;
             if version.current && !version.builtin {

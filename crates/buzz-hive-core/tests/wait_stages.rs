@@ -476,6 +476,28 @@ async fn an_approval_passes_the_stage_and_a_vanished_pull_request_fails_it() {
 }
 
 #[tokio::test]
+async fn checks_that_cannot_be_read_do_not_hide_the_rest_of_the_pull_request_unless_the_stage_waits_on_them(
+) {
+    // A stage that waits on an approval still sees the approval.
+    let (w, card) = with_pull_request("approval").await;
+    w.host
+        .edit_pull(&repo(), w.number(), |pull| pull.approved = true);
+    w.host
+        .fail_next_checks(HostError::Unauthorized("no Checks:read".into()));
+    let synced = w.sync(card, MINUTE).await;
+    assert!(synced.moved, "the approval was recorded");
+    assert_eq!(w.stage(card).await, "after");
+
+    // A stage that waits on the checks must not take unread checks for none.
+    let (w, card) = with_pull_request("ci").await;
+    w.host
+        .fail_next_checks(HostError::Unauthorized("no Checks:read".into()));
+    let read = sync_card(&w.env(), &w.host, COMMUNITY, card, Utc::now() + MINUTE).await;
+    assert!(read.is_err(), "{read:?}");
+    assert_eq!(w.stage(card).await, "validate");
+}
+
+#[tokio::test]
 async fn a_pull_request_merged_by_hand_passes_the_wait_for_the_merge() {
     let (w, card) = with_pull_request("ci").await;
     w.checks(&[passed("build"), passed("lint")]);

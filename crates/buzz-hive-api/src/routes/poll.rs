@@ -37,8 +37,12 @@ pub async fn poll_events(
             .await?;
         if let Some(last) = events.last() {
             let next_seq = last.seq;
+            let viewer = ctx.op().requester_or_actor();
             return Ok(PollEventsResponse {
-                events: events.into_iter().map(to_proto).collect(),
+                events: events
+                    .into_iter()
+                    .map(|event| to_proto(for_viewer(event, &viewer)))
+                    .collect(),
                 next_seq,
             });
         }
@@ -53,6 +57,17 @@ pub async fn poll_events(
             });
         }
     }
+}
+
+/// The assistant's reply is for the person who asked, and the log is read by everyone who may
+/// read the board, so `job.result` keeps its `message` only for the job's requester.
+fn for_viewer(mut event: Event, viewer: &str) -> Event {
+    if event.kind == "job.result" && event.payload["requester"].as_str() != Some(viewer) {
+        if let Some(payload) = event.payload.as_object_mut() {
+            payload.remove("message");
+        }
+    }
+    event
 }
 
 pub fn timestamp(at: chrono::DateTime<chrono::Utc>) -> pbjson_types::Timestamp {

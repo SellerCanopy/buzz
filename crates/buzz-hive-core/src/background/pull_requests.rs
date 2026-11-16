@@ -69,7 +69,7 @@ pub async fn sync_card(
     card: Uuid,
     now: DateTime<Utc>,
 ) -> Result<Synced, IntakeError> {
-    let (pull, poll) = {
+    let (pull, waiting) = {
         let mut tx = env.store.begin(community).await?;
         let pull = tx.pull_requests().by_card(card).await?;
         let waiting = match tx.runs().active_for_card(card).await? {
@@ -84,8 +84,9 @@ pub async fn sync_card(
                 .and_then(|(stage, _)| waiting_of(stage)),
             _ => None,
         };
-        (pull, waiting.map_or(DEFAULT_POLL, |w| w.poll))
+        (pull, waiting)
     };
+    let poll = waiting.as_ref().map_or(DEFAULT_POLL, |w| w.poll);
     let mut seen = Seen {
         status: None,
         checks: None,
@@ -98,9 +99,22 @@ pub async fn sync_card(
         match host.get_pull_request(&repo, pull.number).await {
             Ok(status) => {
                 if status.pull.state == "open" {
-                    let read = host.list_checks(&repo, pull.number).await?;
-                    seen.checks = Some(read.checks);
-                    seen.head_sha = Some(read.head_sha);
+                    match host.list_checks(&repo, pull.number).await {
+                        Ok(read) => {
+                            seen.checks = Some(read.checks);
+                            seen.head_sha = Some(read.head_sha);
+                        }
+                        // A stage that waits on the checks cannot be decided without them:
+                        // an unread list would look empty, and an empty one passes.
+                        Err(error) if waiting.as_ref().is_some_and(|w| w.ci.is_some()) => {
+                            return Err(error.into());
+                        }
+                        // Otherwise the rest of what was read is still worth keeping, and the
+                        // stored checks stay as they were.
+                        Err(error) => {
+                            tracing::warn!(%error, card = %card, "could not read the checks of a pull request");
+                        }
+                    }
                 }
                 seen.status = Some(status);
             }

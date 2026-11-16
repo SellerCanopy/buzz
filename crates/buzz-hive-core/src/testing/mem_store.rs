@@ -90,6 +90,25 @@ pub struct MemStore {
     state: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
     clock: Arc<dyn Clock>,
+    /// How many reads of the kept workflow versions, and how many commits, still fail, for a
+    /// test of a store that cannot be reached.
+    failures: Arc<Failures>,
+}
+
+#[derive(Default)]
+struct Failures {
+    kept_versions: std::sync::atomic::AtomicUsize,
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl Failures {
+    /// Uses up one failure of `counter`, and says whether there was one.
+    fn take(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        counter
+            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+    }
 }
 
 impl Default for MemStore {
@@ -109,7 +128,22 @@ impl MemStore {
             state: Arc::default(),
             log: Arc::default(),
             clock,
+            failures: Arc::default(),
         }
+    }
+
+    /// Makes the next `times` reads of the kept workflow versions fail as unavailable.
+    pub fn fail_kept_versions(&self, times: usize) {
+        self.failures
+            .kept_versions
+            .store(times, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next `times` commits fail as unavailable, and change nothing.
+    pub fn fail_next_commits(&self, times: usize) {
+        self.failures
+            .commits
+            .store(times, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Puts a card on a community's board, as the newest. Later phases create cards through routes.
@@ -135,6 +169,7 @@ impl Store for MemStore {
             shared: self.state.clone(),
             log: self.log.clone(),
             clock: self.clock.clone(),
+            failures: self.failures.clone(),
         }))
     }
 }
@@ -149,6 +184,7 @@ struct MemTx {
     shared: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
     clock: Arc<dyn Clock>,
+    failures: Arc<Failures>,
 }
 
 #[async_trait::async_trait]
@@ -233,7 +269,11 @@ impl Tx for MemTx {
             shared,
             log,
             clock: _,
+            failures,
         } = *self;
+        if Failures::take(&failures.commits) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
         *shared.lock().unwrap() = work;
         let mut log = log.lock().unwrap();
         let mut committed = Vec::with_capacity(pending.len());
@@ -249,6 +289,12 @@ impl Tx for MemTx {
 
 #[async_trait::async_trait]
 impl EventsRepo for MemTx {
+    /// Transactions here work on a copy and never wait on each other, so there is nothing to
+    /// take. The Postgres tests show the lock holds.
+    async fn lock_log(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     async fn append(&mut self, event: Event) -> Result<(), StoreError> {
         check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
         self.pending.push(event);
@@ -1013,6 +1059,9 @@ impl WorkflowsRepo for MemTx {
     }
 
     async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError> {
+        if Failures::take(&self.failures.kept_versions) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
         let community = self.community;
         let active: Vec<(String, String)> = self
             .work
@@ -1101,6 +1150,16 @@ impl ProposalsRepo for MemTx {
             .iter_mut()
             .find(|(c, p, resolved)| *c == community && p.id == id && !resolved);
         Ok(open.map(|(_, _, resolved)| *resolved = true).is_some())
+    }
+
+    async fn reopen(&mut self, id: i64) -> Result<bool, StoreError> {
+        let community = self.community;
+        let decided = self
+            .work
+            .proposals
+            .iter_mut()
+            .find(|(c, p, resolved)| *c == community && p.id == id && *resolved);
+        Ok(decided.map(|(_, _, resolved)| *resolved = false).is_some())
     }
 }
 

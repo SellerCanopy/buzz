@@ -31,7 +31,11 @@ fn b64(text: &str) -> String {
 
 /// An app whose catalog holds the built-ins and what has been saved.
 async fn saving_app() -> App {
-    let store = MemStore::new();
+    saving_app_over(MemStore::new()).await
+}
+
+/// [`saving_app`] over a store the test keeps a handle to.
+async fn saving_app_over(store: MemStore) -> App {
     let mut tx = store.begin(community()).await.unwrap();
     tx.access()
         .set_level(AGENT, Level::Run, ActorKind::Agent, OWNER)
@@ -687,4 +691,47 @@ async fn a_running_card_keeps_the_version_it_started_with() {
         v2,
         "a new card gets the new one"
     );
+}
+
+#[tokio::test]
+async fn a_refresh_that_fails_once_is_tried_again_and_one_that_keeps_failing_is_reported() {
+    let store = MemStore::new();
+    let app = saving_app_over(store.clone()).await;
+
+    store.fail_kept_versions(1);
+    let (status, body) = save(&app, RUNNER, "mine-flow", "mine", "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one failed read is read again: {body}"
+    );
+    assert_eq!(body["workflow"]["name"], "mine-flow");
+
+    store.fail_kept_versions(10);
+    let (status, body) = save(&app, RUNNER, "other-flow", "mine", "").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be refreshed"),
+        "{body}"
+    );
+    assert!(
+        stored(&app).await.contains(&"other-flow".to_owned()),
+        "the save itself was committed"
+    );
+
+    // The next change reads again and the list catches up with both.
+    store.fail_kept_versions(0);
+    let (status, body) = save(&app, RUNNER, "third-flow", "mine", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, list) = call(&app, "ListWorkflows", MEMBER, json!({})).await;
+    let names: Vec<_> = list["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(names.contains(&"other-flow".to_owned()), "{names:?}");
 }

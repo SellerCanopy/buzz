@@ -116,13 +116,7 @@ async fn create_from_issue(
     issue: crate::proto::IssueRef,
     workflow: &str,
 ) -> Result<Card, HiveError> {
-    if !issue.host.is_empty() && !issue.host.eq_ignore_ascii_case(crate::routes::intake::HOST) {
-        return Err(HiveError::InvalidArgument(format!(
-            "host {:?} is not supported; the only host is {}",
-            issue.host,
-            crate::routes::intake::HOST
-        )));
-    }
+    crate::routes::intake::check_host(&issue.host)?;
     let repo = RepoRef::parse(&format!("{}/{}", issue.owner, issue.repo))
         .map_err(HiveError::InvalidArgument)?;
     let number = u64::try_from(issue.number)

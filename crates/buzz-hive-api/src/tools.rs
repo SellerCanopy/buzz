@@ -20,7 +20,8 @@ use buzz_hive_core::orchestrator::diagnose::{DEFAULT_EVENTS_LIMIT, MAX_EVENTS_LI
 use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
-    ASSISTANT_RESULT, MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
+    ASSISTANT_RESULT, GET_WORKFLOW, MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE,
+    UPDATE_PLAN,
 };
 use serde_json::{json, Value};
 
@@ -143,7 +144,7 @@ pub const TOOLS: &[Tool] = &[
         schema: check_workflow,
     },
     Tool {
-        name: "get_workflow",
+        name: GET_WORKFLOW,
         route: "GetWorkflowDraft",
         needs: Level::Read,
         description: "Read a workflow's files as text, with the hash to pass back as baseHash when you edit it. Pass text true.",
@@ -1201,6 +1202,7 @@ mod tests {
             UPDATE_PLAN,
             MOVE_CARD,
             ASSISTANT_RESULT,
+            GET_WORKFLOW,
         ] {
             assert!(
                 TOOLS.iter().any(|t| t.name == name),

@@ -87,6 +87,21 @@ async fn card(app: &App, title: &str) -> String {
     card["id"].as_str().unwrap().to_owned()
 }
 
+/// Links `repos` to a card, as a person does on the card page, so an agent may name them.
+async fn link(app: &App, repos: &[&str]) {
+    let id = card(app, "Linked repos").await;
+    for repo in repos {
+        let (status, body) = call(
+            app,
+            "AddIssueRepo",
+            OWNER,
+            json!({"cardId": id, "repo": repo}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
 async fn cards(app: &App) -> Vec<Value> {
     let (_, body) = call(app, "ListCards", OWNER, json!({})).await;
     body["cards"].as_array().cloned().unwrap_or_default()
@@ -216,6 +231,7 @@ async fn a_diagnosis_needs_a_quote_and_lands_on_the_runs_card() {
 #[tokio::test]
 async fn an_engine_fault_makes_one_backlog_card_with_its_repos_and_a_repeat_adds_a_note() {
     let (app, host) = world().await;
+    link(&app, &["example-org/api", "example-org/web"]).await;
     let file = json!({
         "kind": "engine", "title": "Stage never starts", "body": "The thread is not recorded.",
         "repos": ["example-org/api", "example-org/web"],
@@ -258,13 +274,18 @@ async fn an_engine_fault_makes_one_backlog_card_with_its_repos_and_a_repeat_adds
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["outcome"], "noted");
     assert_eq!(again["cardId"], id);
-    assert_eq!(cards(&app).await.len(), 1);
+    assert_eq!(
+        cards(&app).await.len(),
+        2,
+        "the linked card and the fault's"
+    );
     assert!(host.written().is_empty(), "nothing went to GitHub");
 }
 
 #[tokio::test]
 async fn a_duplicate_fault_comments_on_the_open_issue_and_makes_no_card() {
     let (app, host) = world().await;
+    link(&app, &["example-org/api"]).await;
     host.put_issue(issue(
         "example-org/api",
         7,
@@ -548,4 +569,160 @@ async fn the_repo_of_the_cards_issue_and_a_repo_with_an_open_pull_request_stay()
         body["message"].as_str().unwrap().contains("pull request"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn an_agent_acting_for_a_person_neither_adds_nor_removes_a_cards_repos() {
+    let (app, _) = world().await;
+    let id = card(&app, "Add export").await;
+    let (status, body) = call_for(
+        &app,
+        "AddIssueRepo",
+        AGENT,
+        OWNER,
+        json!({"cardId": id, "repo": "example-org/api"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, _) = call(
+        &app,
+        "AddIssueRepo",
+        OWNER,
+        json!({"cardId": id, "repo": "example-org/api"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = call_for(
+        &app,
+        "RemoveIssueRepo",
+        AGENT,
+        OWNER,
+        json!({"cardId": id, "repo": "example-org/api"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (_, shown) = call(&app, "GetCard", OWNER, json!({"cardId": id})).await;
+    assert_eq!(shown["repos"].as_array().map(Vec::len), Some(1), "{shown}");
+}
+
+#[tokio::test]
+async fn an_agent_may_name_only_repos_a_person_linked_and_nothing_is_written_otherwise() {
+    let (app, host) = world().await;
+    host.put_issue(issue("example-org/api", 7, "Login fails"));
+    let before = cards(&app).await.len();
+    for kind in ["engine", "ui"] {
+        let (status, body) = call(
+            &app,
+            "FileTicket",
+            AGENT,
+            json!({"kind": kind, "title": "Login fails", "body": "phish", "repos": ["example-org/api"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{kind}: {body}");
+    }
+    assert_eq!(cards(&app).await.len(), before, "no card was made");
+    assert!(
+        host.calls().is_empty(),
+        "GitHub was not asked: {:?}",
+        host.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_fault_in_the_engine_is_filed_when_github_cannot_be_asked_but_a_code_fault_is_not() {
+    let (app, host) = world().await;
+    link(&app, &["example-org/api"]).await;
+    let file =
+        |title: &str| json!({"kind": "engine", "title": title, "repos": ["example-org/api"]});
+
+    host.fail_next(buzz_hive_core::ports::code_host::HostError::Other(
+        "down".into(),
+    ));
+    let (status, body) = call(&app, "FileTicket", AGENT, file("Stage never starts")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "created");
+
+    let without = App {
+        code_host: None,
+        ..app.clone()
+    };
+    let (status, body) = call(&without, "FileTicket", AGENT, file("Run never ends")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "created");
+
+    // A fault in a card's code needs the host.
+    let (_, made) = call(
+        &app,
+        "CreateCard",
+        OWNER,
+        json!({"title": "Add export", "workflow": "demo"}),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap();
+    call(
+        &app,
+        "AddIssueRepo",
+        OWNER,
+        json!({"cardId": id, "repo": "example-org/api"}),
+    )
+    .await;
+    let (status, body) = call(
+        &without,
+        "FileTicket",
+        AGENT,
+        json!({"kind": "code", "title": "Drops a row", "cardId": id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn a_card_takes_ten_repos_and_the_eleventh_is_refused_with_nothing_written() {
+    let (app, host) = world().await;
+    let id = card(&app, "Wide change").await;
+    let names: Vec<String> = (0..11).map(|n| format!("example-org/r{n}")).collect();
+    for name in &names {
+        host.put_repo(&repo(name));
+    }
+    let add = |name: &str| json!({"cardId": id, "repo": name});
+    for name in &names[..10] {
+        let (status, body) = call(&app, "AddIssueRepo", OWNER, add(name)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
+    let held = |shown: &Value| shown["repos"].as_array().map_or(0, Vec::len);
+    let (_, shown) = call(&app, "GetCard", OWNER, json!({"cardId": id})).await;
+    assert_eq!(held(&shown), 10);
+
+    let (status, body) = call(&app, "AddIssueRepo", OWNER, add(&names[10])).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("at most 10"));
+    let (status, _) = call(&app, "AddIssueRepo", OWNER, add(&names[0])).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a duplicate is not a second row"
+    );
+    let (_, shown) = call(&app, "GetCard", OWNER, json!({"cardId": id})).await;
+    assert_eq!(held(&shown), 10, "{shown}");
+
+    // Taking one off makes room, and an absent repo is not found.
+    let (status, _) = call(
+        &app,
+        "RemoveIssueRepo",
+        OWNER,
+        json!({"cardId": id, "repo": names[10]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = call(
+        &app,
+        "RemoveIssueRepo",
+        OWNER,
+        json!({"cardId": id, "repo": names[9]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "AddIssueRepo", OWNER, add(&names[10])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

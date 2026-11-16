@@ -176,15 +176,7 @@ fn package_check(name: &str, path: &str, findings: &[Finding]) -> PackageCheck {
     PackageCheck {
         name: name.to_owned(),
         path: path.to_owned(),
-        findings: findings
-            .iter()
-            .map(|f| crate::proto::Finding {
-                path: f.path.clone(),
-                code: f.code.clone(),
-                severity: f.severity.as_str().to_owned(),
-                message: f.message.clone(),
-            })
-            .collect(),
+        findings: to_findings(findings),
     }
 }
 
@@ -258,7 +250,15 @@ async fn listed(app: &App, ctx: &Ctx, name: &str) -> Result<Workflow, HiveError>
 }
 
 pub(super) fn to_findings(findings: &[Finding]) -> Vec<crate::proto::Finding> {
-    package_check("", "", findings).findings
+    findings
+        .iter()
+        .map(|f| crate::proto::Finding {
+            path: f.path.clone(),
+            code: f.code.clone(),
+            severity: f.severity.as_str().to_owned(),
+            message: f.message.clone(),
+        })
+        .collect()
 }
 
 pub async fn get_workflow_draft(
@@ -325,7 +325,7 @@ pub async fn save_workflow(
         base,
     )
     .await?;
-    app.refresh_saved().await;
+    app.refresh_saved().await?;
     Ok(SaveWorkflowResponse {
         workflow: Some(listed(&app, &ctx, &name).await?),
         hash: saved.hash,
@@ -339,7 +339,7 @@ pub async fn duplicate_workflow(
 ) -> Result<Workflow, HiveError> {
     let op = app.op(false)?;
     duplicate(&op.env(), &ctx.op(), &saver(&ctx), &req.name, &req.new_name).await?;
-    app.refresh_saved().await;
+    app.refresh_saved().await?;
     listed(&app, &ctx, &req.new_name).await
 }
 
@@ -349,7 +349,7 @@ pub async fn delete_workflow(
     req: DeleteWorkflowRequest,
 ) -> Result<DeleteWorkflowResponse, HiveError> {
     delete(&app.op(false)?.env(), &ctx.op(), &req.name).await?;
-    app.refresh_saved().await;
+    app.refresh_saved().await?;
     Ok(DeleteWorkflowResponse {})
 }
 
@@ -481,7 +481,7 @@ pub async fn import_workflow(
         None,
     )
     .await?;
-    app.refresh_saved().await;
+    app.refresh_saved().await?;
     listed(&app, &ctx, &name).await
 }
 
@@ -501,11 +501,12 @@ pub async fn edit_workflow(
     let base = Some(req.base_hash.as_str()).filter(|h| !h.is_empty());
     let op = app.op(false)?;
     let env = op.env();
+    let saver = saver(&ctx);
     // An agent acts at the lower of its own level and its requester's, and one with no claim
     // is held to Read, so it may only propose.
     if allow(ctx.actor.level, ctx.requester, Level::Run).is_ok() {
-        let saved = edit(&env, &ctx.op(), &saver(&ctx), package, base).await?;
-        app.refresh_saved().await;
+        let saved = edit(&env, &ctx.op(), &saver, package, base).await?;
+        app.refresh_saved().await?;
         return Ok(EditWorkflowResponse {
             saved: true,
             hash: saved.hash,
@@ -513,11 +514,7 @@ pub async fn edit_workflow(
             ..Default::default()
         });
     }
-    let requester = ctx
-        .requester_pubkey
-        .clone()
-        .unwrap_or_else(|| ctx.actor.pubkey.clone());
-    let (id, findings) = propose_workflow(&env, &ctx.op(), &requester, package, base).await?;
+    let (id, findings) = propose_workflow(&env, &ctx.op(), &saver.pubkey, package, base).await?;
     Ok(EditWorkflowResponse {
         proposal_id: id,
         findings: to_findings(&findings),

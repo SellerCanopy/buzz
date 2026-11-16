@@ -19,7 +19,7 @@ use crate::domain::events::Event;
 use crate::domain::intake::{IssueFilter, Page, RepoRef};
 use crate::domain::run::RunState;
 use crate::ports::code_host::{CodeHost, HostError};
-use crate::ports::store::Store;
+use crate::ports::store::{Store, StoreError, Tx};
 
 /// `run_events` returns this many events when the caller names no limit.
 pub const DEFAULT_EVENTS_LIMIT: i64 = 100;
@@ -324,6 +324,72 @@ async fn find_issue(
     Ok(None)
 }
 
+/// The open card whose title says the same as `title`.
+async fn open_card_titled(tx: &mut dyn Tx, title: &str) -> Result<Option<Card>, StoreError> {
+    Ok(tx
+        .cards()
+        .list(false)
+        .await?
+        .into_iter()
+        .find(|card| card.state != CardState::Done && same_title(&card.title, title)))
+}
+
+/// Adds the report to the card that already has the fault.
+async fn note_card(
+    store: &dyn Store,
+    ctx: &Ctx,
+    card: Card,
+    title: &str,
+    body: &str,
+) -> Result<(Filed, Vec<Event>), IntakeError> {
+    let event = add_note(
+        store,
+        ctx,
+        card.id,
+        "Reported again",
+        &note_detail(title, body),
+    )
+    .await?;
+    Ok((Filed::Noted(card), vec![event]))
+}
+
+/// Refuses a repo that no card, issue or intake rule of the community names. Beehive reads and
+/// comments on the repos it is given with the team's token, so an agent may name only the ones
+/// a person has already linked.
+async fn check_known(store: &dyn Store, ctx: &Ctx, repos: &[RepoRef]) -> Result<(), OpError> {
+    if repos.is_empty() {
+        return Ok(());
+    }
+    let mut tx = store.begin(ctx.community).await?;
+    let mut known: Vec<String> = tx
+        .intake()
+        .list()
+        .await?
+        .into_iter()
+        .map(|rule| rule.repo.to_string())
+        .collect();
+    known.extend(
+        tx.issues()
+            .attached()
+            .await?
+            .into_iter()
+            .map(|row| row.issue.repo.to_string()),
+    );
+    for card in tx.cards().list(false).await? {
+        known.extend(tx.card_repos().of_card(card.id).await?);
+    }
+    match repos.iter().find(|repo| {
+        !known
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(&repo.to_string()))
+    }) {
+        Some(repo) => Err(OpError::PermissionDenied(format!(
+            "{repo} is not linked to a card or an intake rule; a person links it first"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Files the fault, or adds it to the open card or issue that already has it.
 pub async fn file_ticket(
     store: &dyn Store,
@@ -388,44 +454,62 @@ pub async fn file_ticket(
         };
         repos = vec![RepoRef::parse(&repo).map_err(OpError::InvalidArgument)?];
     }
-    // An open card that says the same.
-    let mut tx = store.begin(ctx.community).await?;
-    let same = tx
-        .cards()
-        .list(false)
-        .await?
-        .into_iter()
-        .find(|card| card.state != CardState::Done && same_title(&card.title, &title));
-    drop(tx);
-    if let Some(card) = same {
-        let detail = note_detail(&title, &ticket.body);
-        let event = add_note(store, ctx, card.id, "Reported again", &detail).await?;
-        return Ok((Filed::Noted(card), vec![event]));
+    if ticket.kind != TicketKind::Code {
+        check_known(store, ctx, &repos).await?;
     }
-    // An open issue that says the same.
-    if !repos.is_empty() {
-        let host = host.ok_or_else(missing_host)?;
-        if let Some((repo, number)) = find_issue(host, &repos, &title).await? {
-            let key = format!(
-                "ticket:{repo}#{number}:{}",
-                hex::encode(Sha256::digest(
-                    format!("{}\n{}", ctx.actor.pubkey, ticket.body).as_bytes()
-                ))
-                .get(..16)
-                .unwrap_or_default()
-            );
-            host.comment(&repo, number, &note_detail(&title, &ticket.body), &key)
-                .await?;
-            return Ok((
-                Filed::Commented {
-                    repo: repo.to_string(),
-                    number,
-                },
-                Vec::new(),
-            ));
+    // An open card that says the same.
+    {
+        let mut tx = store.begin(ctx.community).await?;
+        if let Some(card) = open_card_titled(&mut *tx, &title).await? {
+            drop(tx);
+            return note_card(store, ctx, card, &title, &ticket.body).await;
         }
     }
+    // An open issue that says the same. Asking GitHub is a convenience for a fault in the engine
+    // or the UI, which is reported even when GitHub cannot be asked, and part of the contract for
+    // a fault in a card's code.
+    let found = match (repos.is_empty(), host) {
+        (true, _) => Ok(None),
+        (false, Some(host)) => find_issue(host, &repos, &title).await,
+        (false, None) => Err(missing_host().into()),
+    };
+    let found = match found {
+        Err(error)
+            if ticket.kind != TicketKind::Code
+                && !matches!(error, IntakeError::Op(OpError::NotFound(_))) =>
+        {
+            tracing::warn!(%error, "could not look for an open issue, so the fault is filed without the check");
+            None
+        }
+        other => other?,
+    };
+    if let (Some((repo, number)), Some(host)) = (found, host) {
+        let key = format!(
+            "ticket:{repo}#{number}:{}",
+            hex::encode(Sha256::digest(
+                format!("{}\n{}", ctx.actor.pubkey, ticket.body).as_bytes()
+            ))
+            .get(..16)
+            .unwrap_or_default()
+        );
+        host.comment(&repo, number, &note_detail(&title, &ticket.body), &key)
+            .await?;
+        return Ok((
+            Filed::Commented {
+                repo: repo.to_string(),
+                number,
+            },
+            Vec::new(),
+        ));
+    }
     let mut tx = store.begin(ctx.community).await?;
+    // Another filing of the same fault may have committed since the reads above. The log lock
+    // queues this one behind it, and the lookups below see what it wrote.
+    tx.events().lock_log().await?;
+    if let Some(card) = open_card_titled(&mut *tx, &title).await? {
+        drop(tx);
+        return note_card(store, ctx, card, &title, &ticket.body).await;
+    }
     if ticket.kind == TicketKind::Code {
         let repo = repos[0].to_string();
         let card = ticket.card.map(|id| id.to_string());
@@ -442,10 +526,6 @@ pub async fn file_ticket(
         if let Some(waiting) = waiting {
             return Ok((Filed::Proposed(waiting.id), Vec::new()));
         }
-        let requester = ctx
-            .requester
-            .clone()
-            .unwrap_or_else(|| ctx.actor.pubkey.clone());
         let id = tx
             .proposals()
             .insert(
@@ -457,7 +537,7 @@ pub async fn file_ticket(
                     "cardId": card,
                     "reportedBy": ctx.actor.pubkey,
                 }),
-                &requester,
+                &ctx.requester_or_actor(),
             )
             .await?;
         tx.commit().await?;
@@ -521,13 +601,16 @@ pub async fn accept_ticket(
     body: &str,
     now: DateTime<Utc>,
 ) -> Result<(Accepted, Vec<Event>), IntakeError> {
-    let proposal = {
-        let mut tx = env.store.begin(ctx.community).await?;
-        tx.proposals().open(PROPOSAL_TICKET).await?
-    }
-    .into_iter()
-    .find(|p| p.id == proposal_id)
-    .ok_or_else(|| OpError::NotFound(format!("there is no open ticket proposal {proposal_id}")))?;
+    let mut tx = env.store.begin(ctx.community).await?;
+    let proposal = tx
+        .proposals()
+        .open(PROPOSAL_TICKET)
+        .await?
+        .into_iter()
+        .find(|p| p.id == proposal_id)
+        .ok_or_else(|| {
+            OpError::NotFound(format!("there is no open ticket proposal {proposal_id}"))
+        })?;
     if proposal.requester != ctx.actor.pubkey {
         return Err(OpError::PermissionDenied(
             "only the person a ticket proposal is for may accept it".into(),
@@ -553,18 +636,36 @@ pub async fn accept_ticket(
     }
     let repo_text = text("repo");
     let repo = RepoRef::parse(&repo_text).map_err(OpError::InvalidArgument)?;
-    let issue = host
-        .create_issue(
-            &repo,
-            &title,
-            &body,
-            &format!("ticket-proposal:{proposal_id}"),
-        )
-        .await?;
-    let (card, _, events) = card_from_issue(env, ctx, host, &repo, issue.number, "", now).await?;
-    let mut tx = env.store.begin(ctx.community).await?;
-    tx.proposals().resolve(proposal_id).await?;
+    // Claim the proposal before GitHub is asked, so a double click, a second device or a discard
+    // that lands first cannot open the issue twice or open it for a proposal already decided.
+    // The decision is undone below when the issue cannot be opened.
+    if !tx.proposals().resolve(proposal_id).await? {
+        return Err(
+            OpError::NotFound(format!("there is no open ticket proposal {proposal_id}")).into(),
+        );
+    }
     tx.commit().await?;
+    let opened = async {
+        let issue = host
+            .create_issue(
+                &repo,
+                &title,
+                &body,
+                &format!("ticket-proposal:{proposal_id}"),
+            )
+            .await?;
+        card_from_issue(env, ctx, host, &repo, issue.number, "", now).await
+    }
+    .await;
+    let (card, _, events) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            let mut tx = env.store.begin(ctx.community).await?;
+            tx.proposals().reopen(proposal_id).await?;
+            tx.commit().await?;
+            return Err(error);
+        }
+    };
     Ok((
         Accepted {
             card,

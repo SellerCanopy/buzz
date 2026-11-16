@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::intake::IntakeError;
+use super::run::people_only;
 use super::{Ctx, OpError};
 use crate::domain::card::Card;
 use crate::domain::events::Event;
@@ -106,6 +107,7 @@ pub async fn add_repo(
     repo: &str,
     base: &str,
 ) -> Result<(Card, Vec<Event>), IntakeError> {
+    people_only(ctx, "add a repo to a card")?;
     let repo = RepoRef::parse(repo)
         .map_err(OpError::InvalidArgument)?
         .to_string();
@@ -187,6 +189,7 @@ pub async fn remove_repo(
     card: Uuid,
     repo: &str,
 ) -> Result<(Card, Vec<Event>), OpError> {
+    people_only(ctx, "remove a repo from a card")?;
     let repo = RepoRef::parse(repo)
         .map_err(OpError::InvalidArgument)?
         .to_string();

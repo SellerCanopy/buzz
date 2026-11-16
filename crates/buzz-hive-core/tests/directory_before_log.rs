@@ -140,6 +140,9 @@ impl Tx for SpyTx {
 
 #[async_trait::async_trait]
 impl EventsRepo for SpyTx {
+    async fn lock_log(&mut self) -> Result<(), StoreError> {
+        self.inner.events().lock_log().await
+    }
     async fn append(&mut self, event: Event) -> Result<(), StoreError> {
         self.spy.appended.fetch_add(1, Ordering::SeqCst);
         self.inner.events().append(event).await

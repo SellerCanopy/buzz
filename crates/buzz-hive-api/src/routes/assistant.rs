@@ -117,7 +117,7 @@ pub async fn cancel_job(
     ctx: Ctx,
     req: CancelJobRequest,
 ) -> Result<CancelJobResponse, HiveError> {
-    let op = app.op(false)?;
+    let op = app.op_without_packages();
     cancel(
         &op.env(),
         app.relay.as_deref(),
@@ -137,7 +137,12 @@ pub async fn assistant_result(
         name: req.name,
         files: req.files.into_iter().collect::<BTreeMap<_, _>>(),
     });
-    let op = app.op(false)?;
+    // Only a draft is checked against the packages.
+    let op = if draft.is_some() {
+        app.op(false)?
+    } else {
+        app.op_without_packages()
+    };
     let recorded = record_result(
         &op.env(),
         &ctx.op(),

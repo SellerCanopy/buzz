@@ -490,8 +490,7 @@ fn decode_event(row: EventRow) -> Result<Event, StoreError> {
 
 #[async_trait::async_trait]
 impl EventsRepo for PgTx {
-    async fn append(&mut self, mut event: Event) -> Result<(), StoreError> {
-        check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
+    async fn lock_log(&mut self) -> Result<(), StoreError> {
         if !self.locked_log {
             // `bigserial` hands out seq before commit, so without this a reader could see
             // seq 6 while seq 5 is still uncommitted and move past it for good. Holding
@@ -507,6 +506,12 @@ impl EventsRepo for PgTx {
             .map_err(store_error)?;
             self.locked_log = true;
         }
+        Ok(())
+    }
+
+    async fn append(&mut self, mut event: Event) -> Result<(), StoreError> {
+        check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
+        self.lock_log().await?;
         event.seq = sqlx::query_scalar(
             "INSERT INTO hive.events \
              (community_id, kind, card_id, run_id, actor_pubkey, actor_kind, payload, at) \
@@ -1175,6 +1180,19 @@ impl ProposalsRepo for PgTx {
         .await
         .map_err(store_error)?;
         Ok(resolved.rows_affected() == 1)
+    }
+
+    async fn reopen(&mut self, id: i64) -> Result<bool, StoreError> {
+        let reopened = sqlx::query(
+            "UPDATE hive.proposals SET resolved_at = NULL \
+             WHERE community_id = $1 AND id = $2 AND resolved_at IS NOT NULL",
+        )
+        .bind(self.community)
+        .bind(id)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(reopened.rows_affected() == 1)
     }
 }
 

@@ -42,6 +42,17 @@ pub struct Ctx {
     pub requester: Option<Pubkey>,
 }
 
+impl Ctx {
+    /// The person a job or proposal made by this call is for: the person an agent acts for,
+    /// else the actor. Runs differ on purpose (`routes::requester_of`): a run never records an
+    /// agent as the person it acts for, while a job or proposal is looked up by this key.
+    pub fn requester_or_actor(&self) -> Pubkey {
+        self.requester
+            .clone()
+            .unwrap_or_else(|| self.actor.pubkey.clone())
+    }
+}
+
 /// What the operations that reach past the store need.
 #[derive(Clone, Copy)]
 pub struct Env<'a> {

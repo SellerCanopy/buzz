@@ -16,3 +16,5 @@ pub const UPDATE_PLAN: &str = "update_plan";
 pub const MOVE_CARD: &str = "move_card";
 /// Reports the result of an assistant job.
 pub const ASSISTANT_RESULT: &str = "assistant_result";
+/// Reads a workflow's files as text, with the hash to pass back when editing it.
+pub const GET_WORKFLOW: &str = "get_workflow";

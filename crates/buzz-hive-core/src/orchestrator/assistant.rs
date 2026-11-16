@@ -21,13 +21,14 @@ use crate::access::ActorKind;
 use crate::config::KEY_ASSISTANT_AGENT;
 use crate::domain::events::{Actor, Event};
 use crate::domain::workflow::{Duration as SettingDuration, Finding};
+use crate::orchestrator::run::people_only;
 use crate::orchestrator::save::{check_draft, draft_package, proposal_body, PROPOSAL_WORKFLOW};
 use crate::orchestrator::settings::{check_channel, get_settings, update_channel, Scope};
 use crate::orchestrator::task_message::MAX_POST_BYTES;
 use crate::orchestrator::{Ctx, Env, OpError};
 use crate::ports::relay::{Delivery, Relay, RelayError};
-use crate::ports::store::{CommunityId, Job, JobState, Pubkey, Store, StoreError};
-use crate::tool_names::ASSISTANT_RESULT;
+use crate::ports::store::{CommunityId, Job, JobState, Store, StoreError};
+use crate::tool_names::{ASSISTANT_RESULT, GET_WORKFLOW};
 use crate::workflow::check::has_errors;
 
 /// The most bytes of a person's words in one request.
@@ -35,7 +36,7 @@ pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// The most bytes of an agent's message in a result.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// The most bytes of a draft's files put into the agent's message. A larger draft is named, and
-/// the agent reads it with `get_workflow`.
+/// the agent reads it with [`GET_WORKFLOW`].
 const DRAFT_INLINE_BYTES: usize = 32 * 1024;
 /// The most findings a `job.result` event carries. The rest are in the stored proposal's check.
 const EVENT_FINDINGS: usize = 20;
@@ -109,12 +110,6 @@ pub struct Recorded {
     pub events: Vec<Event>,
 }
 
-fn requester_of(ctx: &Ctx) -> Pubkey {
-    ctx.requester
-        .clone()
-        .unwrap_or_else(|| ctx.actor.pubkey.clone())
-}
-
 fn relay_failed(error: RelayError) -> OpError {
     match error {
         RelayError::Unavailable(cause) => {
@@ -153,7 +148,7 @@ pub async fn start_job(
             "only a chat turn continues a thread".into(),
         ));
     }
-    let requester = requester_of(ctx);
+    let requester = ctx.requester_or_actor();
     let settings = get_settings(env, ctx, &Scope::User, None).await?;
     let timeout = settings
         .value("execution.timeout")
@@ -276,27 +271,92 @@ pub async fn start_job(
         }
     };
     job.root_event_id = Some(root.clone());
-    let mut tx = env.store.begin(ctx.community).await?;
-    if start.root.is_none() {
-        tx.jobs().set_root(job.id, &root).await?;
-    }
-    tx.events()
-        .append(Event::new(
-            "job.started",
-            None,
-            None,
-            ctx.actor.clone(),
-            json!({
-                "job_id": job.id,
-                "kind": job.kind,
-                "requester": job.requester,
-                "root_event_id": root,
-                "agent": job.agent,
-            }),
-        ))
-        .await?;
-    let events = tx.commit().await?;
+    let mut tried = 0;
+    let events = loop {
+        tried += 1;
+        match record_start(env, ctx, &job, &root, start.root.is_none()).await {
+            Ok(events) => break events,
+            Err(_) if tried < RECORD_TRIES => {
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(tried))).await;
+            }
+            Err(error) => {
+                tracing::error!(%error, job = %job.id, %root, "could not record that a job started");
+                give_up(env, relay, ctx, &job, &root).await;
+                return Err(error);
+            }
+        }
+    };
     Ok((job.id, events))
+}
+
+/// How many times the write that follows a post to the relay is tried.
+const RECORD_TRIES: u32 = 3;
+
+/// Stores the thread the agent was asked in and says the job started. The job is held first: a
+/// result or an expiry that got here before the agent's mention was recorded has already ended
+/// it, and `job.started` must not follow its `job.result`. The thread is stored either way, so a
+/// later turn can reply in it.
+async fn record_start(
+    env: &Env<'_>,
+    ctx: &Ctx,
+    job: &Job,
+    root: &str,
+    opened: bool,
+) -> Result<Vec<Event>, OpError> {
+    let mut tx = env.store.begin(ctx.community).await?;
+    let held = tx.jobs().get_for_update(job.id).await?;
+    if opened {
+        tx.jobs().set_root(job.id, root).await?;
+    }
+    if held.is_some_and(|held| held.state == JobState::Running) {
+        tx.events()
+            .append(Event::new(
+                "job.started",
+                None,
+                None,
+                ctx.actor.clone(),
+                json!({
+                    "job_id": job.id,
+                    "kind": job.kind,
+                    "requester": job.requester,
+                    "root_event_id": root,
+                    "agent": job.agent,
+                }),
+            ))
+            .await?;
+    }
+    Ok(tx.commit().await?)
+}
+
+/// The store would not take the record of a job whose agent was already asked. Ends the job, so
+/// the person can ask again and a late result is refused, and tells the agent in the thread. Both
+/// are best effort: the caller is told the start failed either way.
+async fn give_up(env: &Env<'_>, relay: &dyn Relay, ctx: &Ctx, job: &Job, root: &str) {
+    let ended = async {
+        let mut tx = env.store.begin(ctx.community).await?;
+        tx.jobs().finish(job.id, JobState::Failed, None).await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(error) = ended {
+        tracing::error!(%error, job = %job.id, "could not end a job that did not start");
+    }
+    let delivery = Delivery {
+        key: format!("job:{}:cancel", job.id),
+        at: chrono::Utc::now(),
+    };
+    let told = relay
+        .post_reply(
+            job.channel,
+            &root.to_owned(),
+            &job.agent,
+            "Cancelled. Stop working on this request.",
+            &delivery,
+        )
+        .await;
+    if let Err(error) = told {
+        tracing::warn!(%error, job = %job.id, "could not tell the agent a job did not start");
+    }
 }
 
 fn thread_busy() -> OpError {
@@ -320,7 +380,7 @@ fn render(job: &Job, start: &Start) -> String {
             }
         } else {
             out.push_str(&format!(
-                "The workflow {:?} is too long to quote: read it with get_workflow.\n",
+                "The workflow {:?} is too long to quote: read it with {GET_WORKFLOW}.\n",
                 draft.name
             ));
         }
@@ -402,10 +462,14 @@ pub async fn assistant_result(
 
     let mut tx = env.store.begin(ctx.community).await?;
     // Held, so a cancel or an expiry that got here first is seen.
-    let held = tx.jobs().get_for_update(job.id).await?;
-    if held.is_none_or(|held| held.state != JobState::Running) {
+    let Some(held) = tx
+        .jobs()
+        .get_for_update(job.id)
+        .await?
+        .filter(|held| held.state == JobState::Running)
+    else {
         return Err(ended(&job));
-    }
+    };
     let (proposal_id, findings) = match offered {
         None => (None, Vec::new()),
         Some((package, findings)) => {
@@ -420,6 +484,10 @@ pub async fn assistant_result(
     let result = json!({
         "job_id": job.id,
         "kind": job.kind,
+        "requester": job.requester,
+        // The thread, for a client that did not see `job.started` before this: a result can
+        // overtake it when the job is reported as soon as the agent is mentioned.
+        "root_event_id": held.root_event_id,
         "state": JobState::Done.as_str(),
         "message": message,
         "proposal_id": proposal_id,
@@ -487,7 +555,7 @@ pub async fn cancel_job(
         .get_for_update(id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("there is no job {id}")))?;
-    if job.requester != requester_of(ctx) {
+    if job.requester != ctx.requester_or_actor() {
         return Err(OpError::PermissionDenied(
             "only the person a job is for may cancel it".into(),
         ));
@@ -519,7 +587,9 @@ pub async fn cancel_job(
 }
 
 /// Ends the jobs whose deadline has passed as failed, each with one `job.result` event, and
-/// returns the events committed.
+/// returns the events committed. A job that cannot be ended is logged and skipped, so the jobs
+/// that were ended still wake the polls waiting for them; the skipped one is tried on the next
+/// pass.
 pub async fn expire_jobs(
     env: &Env<'_>,
     community: CommunityId,
@@ -532,33 +602,43 @@ pub async fn expire_jobs(
         .jobs()
         .overdue(limit)
         .await?;
+    let mut events = Vec::new();
+    for job in late {
+        match expire(env, community, &job).await {
+            Ok(committed) => events.extend(committed),
+            Err(error) => {
+                tracing::error!(%error, job = %job.id, "could not end an overdue job");
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Ends one overdue job as failed. Nothing happens when a result or a cancel got here first.
+async fn expire(env: &Env<'_>, community: CommunityId, job: &Job) -> Result<Vec<Event>, OpError> {
     let hive = Actor {
         pubkey: env.hive.to_owned(),
         kind: ActorKind::Agent,
     };
-    let mut events = Vec::new();
-    for job in late {
-        let mut tx = env.store.begin(community).await?;
-        // A result or a cancel may have got here first.
-        let held = tx.jobs().get_for_update(job.id).await?;
-        if held.is_none_or(|held| held.state != JobState::Running) {
-            continue;
-        }
-        let result = json!({
-            "job_id": job.id,
-            "kind": job.kind,
-            "state": JobState::Failed.as_str(),
-            "reason": "the assistant's agent did not report in time",
-        });
-        tx.jobs()
-            .finish(job.id, JobState::Failed, Some(result.clone()))
-            .await?;
-        tx.events()
-            .append(Event::new("job.result", None, None, hive.clone(), result))
-            .await?;
-        events.extend(tx.commit().await?);
+    let mut tx = env.store.begin(community).await?;
+    let held = tx.jobs().get_for_update(job.id).await?;
+    if held.is_none_or(|held| held.state != JobState::Running) {
+        return Ok(Vec::new());
     }
-    Ok(events)
+    let result = json!({
+        "job_id": job.id,
+        "kind": job.kind,
+        "requester": job.requester,
+        "state": JobState::Failed.as_str(),
+        "reason": "the assistant's agent did not report in time",
+    });
+    tx.jobs()
+        .finish(job.id, JobState::Failed, Some(result.clone()))
+        .await?;
+    tx.events()
+        .append(Event::new("job.result", None, None, hive, result))
+        .await?;
+    Ok(tx.commit().await?)
 }
 
 /// How long until the soonest deadline of a running job: zero when one has passed, `None` when
@@ -576,9 +656,10 @@ pub async fn open_proposals(
     store: &dyn Store,
     ctx: &Ctx,
 ) -> Result<Vec<crate::ports::store::Proposal>, OpError> {
+    people_only(ctx, "read the proposals made to a person")?;
     let mut tx = store.begin(ctx.community).await?;
     let mut open = tx.proposals().open_all().await?;
-    let who = requester_of(ctx);
+    let who = ctx.requester_or_actor();
     open.retain(|proposal| proposal.requester == who);
     Ok(open)
 }
@@ -586,13 +667,14 @@ pub async fn open_proposals(
 /// Takes a proposal off the person's list once they have decided it. It acts on nothing, and
 /// deciding twice does nothing the second time.
 pub async fn resolve_proposal(store: &dyn Store, ctx: &Ctx, id: i64) -> Result<(), OpError> {
+    people_only(ctx, "decide a proposal")?;
     let mut tx = store.begin(ctx.community).await?;
     let proposal = tx
         .proposals()
         .get(id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("there is no proposal {id}")))?;
-    if proposal.requester != requester_of(ctx) {
+    if proposal.requester != ctx.requester_or_actor() {
         return Err(OpError::PermissionDenied(
             "only the person a proposal is for may decide it".into(),
         ));

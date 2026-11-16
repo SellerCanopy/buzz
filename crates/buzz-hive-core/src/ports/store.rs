@@ -139,6 +139,10 @@ pub trait EventsRepo: Send {
     /// Adds an event to the log. The kind must pass [`crate::domain::events::check_new`].
     /// The seq is assigned by the store and returned by `Tx::commit`.
     async fn append(&mut self, event: Event) -> Result<(), StoreError>;
+    /// Takes the community's log lock until commit, as the first `append` does, so what is read
+    /// after it is not changed by another writer before this transaction commits. Filing a
+    /// fault takes it before it looks for a duplicate.
+    async fn lock_log(&mut self) -> Result<(), StoreError>;
     /// Committed events with seq greater than `seq`, oldest first, at most `limit`.
     async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError>;
     /// The newest committed seq of this community, 0 when there is none.
@@ -300,6 +304,9 @@ pub trait ProposalsRepo: Send {
     async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError>;
     /// Marks an open proposal decided. `false` when it is gone or was decided already.
     async fn resolve(&mut self, id: i64) -> Result<bool, StoreError>;
+    /// Makes a decided proposal open again, for a decision that was claimed and then failed.
+    /// `false` when it is gone or is open already.
+    async fn reopen(&mut self, id: i64) -> Result<bool, StoreError>;
 }
 
 /// The repos a card works in besides its issue's, in the order they were added.

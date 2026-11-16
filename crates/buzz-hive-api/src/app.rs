@@ -18,6 +18,9 @@ use crate::rate::RateLimiter;
 use crate::replay::ReplayGuard;
 use crate::token::TokenMinter;
 
+/// How many times a read of the saved workflows is tried after a change.
+const REFRESH_TRIES: u32 = 3;
+
 pub struct ApiConfig {
     /// The origin clients reach, with no trailing slash. NIP-98 events must name it.
     pub public_url: String,
@@ -90,14 +93,40 @@ impl App {
         Ok(actor)
     }
 
-    /// Reads the saved workflows again after one changed, so the next call sees it. A failure is
-    /// logged and not returned: the change is already committed, and the next change reads again.
-    pub async fn refresh_saved(&self) {
+    /// Reads the saved workflows again after one changed, so the next call sees it. The change is
+    /// already committed, so a read that fails is tried again a few times; when it keeps failing
+    /// the caller is told, because the engine would otherwise serve the old version and refuse
+    /// the person's next save as stale.
+    pub async fn refresh_saved(&self) -> Result<(), HiveError> {
         let Some(saved) = self.catalog.saved() else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = saved.refresh(self.store.as_ref(), self.community).await {
-            tracing::error!(%error, "could not read the saved workflows after a change");
+        let mut wait = std::time::Duration::from_millis(50);
+        for attempt in 1..=REFRESH_TRIES {
+            match saved.refresh(self.store.as_ref(), self.community).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::error!(%error, attempt, "could not read the saved workflows after a change");
+                }
+            }
+            if attempt < REFRESH_TRIES {
+                tokio::time::sleep(wait).await;
+                wait *= 4;
+            }
+        }
+        Err(HiveError::Unavailable(
+            "saved, but the workflow list could not be refreshed; reload".into(),
+        ))
+    }
+
+    /// An operation that never reads a workflow package: it skips the read of every package that
+    /// [`App::op`] does, and wakes nothing.
+    pub fn op_without_packages(&self) -> Op<'_> {
+        Op {
+            app: self,
+            catalog: Catalog::default(),
+            hive: self.hive_pubkey.clone(),
+            queues: false,
         }
     }
 

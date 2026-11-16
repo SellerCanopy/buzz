@@ -101,12 +101,16 @@ impl From<HostError> for HiveError {
                 retry_after.as_secs().max(1)
             )),
             HostError::Unauthorized(message) => {
+                tracing::error!(%message, "GitHub refused the team token");
                 Self::FailedPrecondition(format!("GitHub refused the team token: {message}"))
             }
             HostError::Rejected(message) => {
                 Self::FailedPrecondition(format!("GitHub refused the request: {message}"))
             }
-            HostError::Other(message) => Self::Unavailable(format!("GitHub failed: {message}")),
+            HostError::Other(message) => {
+                tracing::error!(%message, "GitHub request failed");
+                Self::Unavailable(format!("GitHub failed: {message}"))
+            }
         }
     }
 }

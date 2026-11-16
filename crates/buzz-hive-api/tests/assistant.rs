@@ -10,9 +10,15 @@ use axum::http::StatusCode;
 use base64::Engine as _;
 use buzz_hive_api::App;
 use buzz_hive_core::access::{ActorKind, Level};
+use buzz_hive_core::domain::events::{Actor, Event};
 use buzz_hive_core::orchestrator::assistant::expire_jobs;
+use buzz_hive_core::ports::relay::{ChannelId, Delivery, EventId, Relay, RelayError};
+use buzz_hive_core::ports::store::{JobState, Pubkey, Store};
 use buzz_hive_core::testing::{FakeRelay, ManualClock, MemStore};
-use common::{app, call, community, AGENT, HIVE, MEMBER, OWNER};
+use buzz_hive_core::workflow::builtin::builtin_source;
+use buzz_hive_core::workflow::load::Catalog;
+use buzz_hive_core::workflow::source::{CatalogSource, Sources};
+use common::{app, call, call_for, community, AGENT, HIVE, MEMBER, OWNER};
 use serde_json::{json, Value};
 
 const CHANNEL: uuid::Uuid = uuid::Uuid::from_u128(77);
@@ -23,12 +29,14 @@ struct World {
     app: App,
     relay: FakeRelay,
     clock: ManualClock,
+    store: MemStore,
 }
 
 /// An app whose assistant is the agent `helper` (`AGENT`), in a channel Beehive is in.
 async fn world() -> World {
     let clock = ManualClock::new();
-    let base = app(MemStore::with_clock(Arc::new(clock.clone()))).await;
+    let store = MemStore::with_clock(Arc::new(clock.clone()));
+    let base = app(store.clone()).await;
     let mut tx = base.store.begin(community()).await.unwrap();
     tx.access()
         .set_level(OTHER, Level::Run, ActorKind::Agent, OWNER)
@@ -52,7 +60,12 @@ async fn world() -> World {
         relay: Some(Arc::new(relay.clone())),
         ..base
     };
-    World { app, relay, clock }
+    World {
+        app,
+        relay,
+        clock,
+        store,
+    }
 }
 
 fn b64(text: &str) -> String {
@@ -159,6 +172,22 @@ async fn a_result_is_one_job_result_event() {
     assert_eq!(results[0]["job_id"], job);
     assert_eq!(results[0]["state"], "done");
     assert_eq!(results[0]["message"], "hi there");
+
+    // Anyone else who may read the board sees that the job ended, and not what was said to the
+    // person who asked.
+    let (status, reply) = call(&w.app, "PollEvents", OWNER, json!({"afterSeq": "0"})).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let seen: Vec<Value> = reply["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["type"] == "job.result")
+        .map(|e| serde_json::from_str(e["payloadJson"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["job_id"], job);
+    assert_eq!(seen[0]["state"], "done");
+    assert!(seen[0].get("message").is_none(), "{}", seen[0]);
 
     // A second report is refused and adds nothing.
     let (status, body) = report(&w, AGENT, &job, json!({"message": "again"})).await;
@@ -473,4 +502,252 @@ async fn a_workflow_the_agent_offers_is_a_proposal_for_the_person_who_asked() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_agent_acting_for_a_person_neither_lists_nor_decides_their_proposals() {
+    let w = world().await;
+    let mut tx = w.app.store.begin(community()).await.unwrap();
+    let id = tx
+        .proposals()
+        .insert("workflow", json!({"name": "flow", "files": {}}), MEMBER)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let (status, body) = call_for(&w.app, "ListProposals", AGENT, MEMBER, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = call_for(
+        &w.app,
+        "ResolveProposal",
+        AGENT,
+        MEMBER,
+        json!({"proposalId": id.to_string(), "accepted": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The person still sees it, so the agent closed nothing.
+    let (_, listed) = call(&w.app, "ListProposals", MEMBER, json!({})).await;
+    assert_eq!(listed["proposals"].as_array().unwrap().len(), 1, "{listed}");
+}
+
+/// A catalog that counts how often the packages are read.
+struct Counting(Arc<std::sync::atomic::AtomicUsize>, Sources);
+
+impl CatalogSource for Counting {
+    fn load(&self) -> Catalog {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.1.load()
+    }
+}
+
+#[tokio::test]
+async fn cancelling_and_reporting_without_a_draft_do_not_read_the_packages() {
+    use std::sync::atomic::Ordering;
+    let mut w = world().await;
+    let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    w.app.catalog = Arc::new(Counting(loads.clone(), Sources(vec![builtin_source()])));
+    let cancelled = chat(&w).await;
+    let reported = {
+        // A thread has one running job, so the second chat starts after the first ends.
+        let (status, _) = call(&w.app, "CancelJob", MEMBER, json!({"jobId": cancelled})).await;
+        assert_eq!(status, StatusCode::OK);
+        chat(&w).await
+    };
+    let before = loads.load(Ordering::SeqCst);
+    let (status, _) = report(&w, AGENT, &reported, json!({"message": "hi"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let again = chat(&w).await;
+    let after_start = loads.load(Ordering::SeqCst);
+    let (status, _) = call(&w.app, "CancelJob", MEMBER, json!({"jobId": again})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        after_start,
+        "a cancel read no packages"
+    );
+    assert_eq!(
+        after_start - before,
+        1,
+        "a report with no draft read none; only the start did"
+    );
+}
+
+#[tokio::test]
+async fn a_draft_too_long_to_quote_tells_the_agent_to_read_it_with_the_tool() {
+    let w = world().await;
+    let mut long = draft();
+    long["files"]["notes.md"] = json!(b64(&"x".repeat(40 * 1024)));
+    let (status, body) = call(
+        &w.app,
+        "StartProposeWorkflowEdit",
+        MEMBER,
+        json!({"draft": long, "request": "tidy it"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = &w.relay.posts()[0].text;
+    assert!(
+        text.contains("read it with get_workflow") && !text.contains("--- workflow.yaml"),
+        "{text}"
+    );
+}
+
+/// A relay that, right after it takes the agent's mention, does what a test needs the store to
+/// look like by the time the post is recorded.
+struct Then {
+    inner: FakeRelay,
+    store: MemStore,
+    what: Happens,
+}
+
+enum Happens {
+    /// The agent reports as soon as it is mentioned.
+    TheAgentReports,
+    /// The store refuses this many commits.
+    TheStoreFails(usize),
+}
+
+#[async_trait::async_trait]
+impl Relay for Then {
+    async fn post_status(
+        &self,
+        channel: ChannelId,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError> {
+        self.inner.post_status(channel, text, delivery).await
+    }
+
+    async fn post_stage_task(
+        &self,
+        channel: ChannelId,
+        agent: &Pubkey,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError> {
+        let posted = self
+            .inner
+            .post_stage_task(channel, agent, text, delivery)
+            .await?;
+        match self.what {
+            Happens::TheStoreFails(commits) => self.store.fail_next_commits(commits),
+            Happens::TheAgentReports => {
+                let job: uuid::Uuid = delivery.key.strip_prefix("job:").unwrap().parse().unwrap();
+                let mut tx = self.store.begin(community()).await.unwrap();
+                tx.jobs()
+                    .finish(job, JobState::Done, Some(json!({})))
+                    .await
+                    .unwrap();
+                let actor = Actor {
+                    pubkey: AGENT.into(),
+                    kind: ActorKind::Agent,
+                };
+                let result = json!({"job_id": job, "state": "done", "requester": MEMBER});
+                tx.events()
+                    .append(Event::new("job.result", None, None, actor, result))
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            }
+        }
+        Ok(posted)
+    }
+
+    async fn post_reply(
+        &self,
+        channel: ChannelId,
+        root: &EventId,
+        agent: &Pubkey,
+        text: &str,
+        delivery: &Delivery,
+    ) -> Result<EventId, RelayError> {
+        self.inner
+            .post_reply(channel, root, agent, text, delivery)
+            .await
+    }
+}
+
+fn with_happening(w: &mut World, what: Happens) {
+    w.app.relay = Some(Arc::new(Then {
+        inner: w.relay.clone(),
+        store: w.store.clone(),
+        what,
+    }));
+}
+
+#[tokio::test]
+async fn job_started_does_not_follow_a_job_result_that_beat_it() {
+    let mut w = world().await;
+    with_happening(&mut w, Happens::TheAgentReports);
+    let job = chat(&w).await;
+    let (events, _) = poll(&w, "0").await;
+    assert_eq!(of_kind(&events, "job.result").len(), 1);
+    assert!(
+        of_kind(&events, "job.started").is_empty(),
+        "the job had ended before it was recorded as started: {events:?}"
+    );
+    // The thread was still stored, so the person can reply in it.
+    let root = w.relay.posts()[0].event_id.clone();
+    let (status, body) = start_chat(&w, MEMBER, json!({"text": "more", "rootEventId": root})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["jobId"], json!(job));
+}
+
+#[tokio::test]
+async fn a_store_that_fails_once_after_the_post_is_tried_again() {
+    let mut w = world().await;
+    with_happening(&mut w, Happens::TheStoreFails(1));
+    let job = chat(&w).await;
+    let (events, _) = poll(&w, "0").await;
+    let started = of_kind(&events, "job.started");
+    assert_eq!(started.len(), 1, "{events:?}");
+    assert_eq!(started[0]["job_id"], job);
+    assert_eq!(started[0]["root_event_id"], w.relay.posts()[0].event_id);
+}
+
+#[tokio::test]
+async fn a_store_that_keeps_failing_after_the_post_ends_the_job_and_tells_the_agent() {
+    let mut w = world().await;
+    // Three tries to record the start fail, and the write that ends the job goes through.
+    with_happening(&mut w, Happens::TheStoreFails(3));
+    let (status, body) = start_chat(&w, MEMBER, json!({"text": "hello"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let posts = w.relay.posts();
+    assert_eq!(posts.len(), 2, "the agent is told in the thread");
+    assert_eq!(posts[1].root.as_deref(), Some(posts[0].event_id.as_str()));
+    assert!(posts[1].text.starts_with("Cancelled"), "{}", posts[1].text);
+
+    // Nothing is left running, so the person may ask again.
+    let (events, _) = poll(&w, "0").await;
+    assert!(of_kind(&events, "job.started").is_empty());
+    w.app.relay = Some(Arc::new(w.relay.clone()));
+    let (status, body) = start_chat(&w, MEMBER, json!({"text": "hello again"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn an_overdue_job_that_cannot_be_ended_does_not_hide_the_ones_that_were() {
+    let w = world().await;
+    for text in ["first", "second"] {
+        let (status, body) = start_chat(&w, MEMBER, json!({"text": text})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let op = w.app.op(false).unwrap();
+    w.clock.advance(Duration::from_secs(31 * 60));
+
+    // The first commit fails: that job stays running, and the other is still ended and returned.
+    w.store.fail_next_commits(1);
+    let events = expire_jobs(&op.env(), community(), 50).await.unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+
+    // The next sweep ends the one that was skipped.
+    let events = expire_jobs(&op.env(), community(), 50).await.unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(expire_jobs(&op.env(), community(), 50)
+        .await
+        .unwrap()
+        .is_empty());
 }

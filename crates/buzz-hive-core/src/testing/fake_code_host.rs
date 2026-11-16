@@ -18,6 +18,8 @@ struct Inner {
     owners: Vec<String>,
     /// Errors the next calls fail with, one per call, oldest first.
     failures: VecDeque<HostError>,
+    /// Errors the next reads of a pull request's checks fail with, whatever else is called.
+    check_failures: VecDeque<HostError>,
     next_comment: CommentId,
     /// The issues Beehive opened, by the key each was opened under.
     opened: Vec<(String, RepoRef, u64)>,
@@ -97,6 +99,11 @@ impl FakeCodeHost {
 
     pub fn set_owners(&self, owners: &[&str]) {
         self.inner.lock().unwrap().owners = owners.iter().map(|o| (*o).to_owned()).collect();
+    }
+
+    /// The next read of a pull request's checks fails with `error`, and no other call does.
+    pub fn fail_next_checks(&self, error: HostError) {
+        self.inner.lock().unwrap().check_failures.push_back(error);
     }
 
     /// The next call fails with `error`. Calls queue: the one after fails with the next.
@@ -454,6 +461,9 @@ impl CodeHost for FakeCodeHost {
 
     async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<PullChecks, HostError> {
         let mut inner = self.enter(format!("list_checks {repo}#{number}"))?;
+        if let Some(error) = inner.check_failures.pop_front() {
+            return Err(error);
+        }
         let pull = (repo.to_string(), number);
         let read = PullChecks {
             head_sha: inner.head(&pull),
