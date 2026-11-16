@@ -10,6 +10,7 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::orchestrator::workflows::record_builtins;
 use buzz_hive_core::ports::code_host::CodeHost;
 use buzz_hive_core::workflow::builtin::builtin_source;
+use buzz_hive_core::workflow::saved::{Layered, SavedPackages};
 use buzz_hive_core::workflow::source::{CatalogSource, Source, Sources};
 use buzz_hive_store::migrate::PoolConfig;
 use buzz_hive_store::pg::PgStore;
@@ -93,12 +94,20 @@ async fn run() -> Result<(), String> {
             dir_source::DirSource::new(dir),
         ));
     }
-    let catalog = Arc::new(Sources(sources));
+    let catalog = Arc::new(Layered {
+        sources: Sources(sources),
+        saved: SavedPackages::new(),
+    });
     let store = Arc::new(PgStore::new(pool));
     let recorded = record_builtins(store.as_ref(), community, &catalog.load())
         .await
         .map_err(|e| format!("cannot record the built-in workflows: {e}"))?;
     tracing::info!(recorded, "built-in workflows recorded");
+    catalog
+        .saved
+        .refresh(store.as_ref(), community)
+        .await
+        .map_err(|e| format!("cannot read the saved workflows: {e}"))?;
 
     // The Beehive account posts to the update channel. Without a key the service still
     // serves everything else, and a start names the missing variable.
@@ -152,6 +161,9 @@ async fn run() -> Result<(), String> {
         catalog,
         community,
         hive_pubkey: hive_pubkey.clone(),
+        relay: relay_adapter
+            .clone()
+            .map(|relay| relay as Arc<dyn buzz_hive_core::ports::relay::Relay>),
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: code_host.clone(),

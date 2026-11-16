@@ -126,6 +126,9 @@ pub fn valid_path(path: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     by_name: BTreeMap<String, Vec<Package>>,
+    /// Older versions that runs still use, by content hash. They never start a card: a
+    /// name looks up only the packages in `by_name`.
+    history: BTreeMap<String, Package>,
     /// The folders that could not load as a package at all.
     pub findings: Vec<Finding>,
 }
@@ -134,6 +137,22 @@ impl Catalog {
     /// The first package loaded with `name`.
     pub fn get(&self, name: &str) -> Option<&Package> {
         self.by_name.get(name).and_then(|packages| packages.first())
+    }
+
+    /// The package a run started on: the one named `name` when its files still hash to `hash`,
+    /// else the older version kept for that hash. A run whose version is not kept falls back
+    /// to the package now named `name`, as a run did before versions were kept.
+    pub fn pinned(&self, name: &str, hash: &str) -> Option<&Package> {
+        let current = self.get(name);
+        match current {
+            Some(package) if package.hash() == hash => current,
+            _ => self.history.get(hash).or(current),
+        }
+    }
+
+    /// Keeps an older version of a package for the runs that started on it.
+    pub fn remember(&mut self, package: Package) {
+        self.history.insert(package.hash(), package);
     }
 
     /// The refusal for a workflow `name` that is not in the catalog. When a package could not

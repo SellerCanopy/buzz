@@ -18,14 +18,9 @@ service EngineService {
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
   // ListPeople returns everyone in the company who has signed in.
   rpc ListPeople(ListPeopleRequest) returns (ListPeopleResponse);
-  // WatchEvents streams every stored event after after_seq in order, then
-  // live events as they commit, with no gap and no repeat. card_id and
-  // types narrow the stream to matching events.
-  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
   // PollEvents returns events with seq greater than after_seq, up to 500, in
   // order. When there are none it waits up to wait_seconds (at most 25) for
   // one to commit, then returns an empty list with next_seq unchanged.
-  // Beehive: this replaces WatchEvents.
   rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
   // CreateCard puts an issue on the board. With a workflow the card sits
   // idle on the workflow's first stage, in To do. With none it goes to
@@ -175,9 +170,11 @@ service EngineService {
   // loaded workflow or a folder has the name. Otherwise base_hash is the
   // hash GetWorkflowDraft gave, and a package changed since then fails with
   // FailedPrecondition. A built-in or a package in another folder fails
-  // with PermissionDenied. A draft whose checks find an error fails with
-  // FailedPrecondition carrying a CheckWorkflowResponse detail with every
-  // finding. A folder holding an entry the app does not manage, such as a
+  // with PermissionDenied. Beehive keeps packages in its store, not in a
+  // folder. A draft whose checks find an error fails with InvalidArgument,
+  // whose message lists each error with its code (CheckWorkflow gives them
+  // as findings), and an agent the person may not name fails with
+  // PermissionDenied naming it. A folder holding an entry the app does not manage, such as a
   // symlink or a .git folder, fails with FailedPrecondition. A bad draft
   // fails with InvalidArgument, as CheckWorkflow does.
   rpc SaveWorkflow(SaveWorkflowRequest) returns (SaveWorkflowResponse);
@@ -208,6 +205,13 @@ service EngineService {
   // errors are FailedPrecondition with the CheckWorkflowResponse detail
   // SaveWorkflow gives.
   rpc ImportWorkflow(ImportWorkflowRequest) returns (Workflow);
+  // EditWorkflow is the agent's edit_workflow tool: it saves the files as
+  // SaveWorkflow does when the person the agent acts for is at Run or above,
+  // and otherwise stores a proposal for a person to look at and saves nothing.
+  // Beehive addition, because an agent works in text and not in the draft's
+  // bytes. A draft whose checks find an error is InvalidArgument listing them,
+  // whichever happens.
+  rpc EditWorkflow(EditWorkflowRequest) returns (EditWorkflowResponse);
   // ImportPlugin saves the Claude Code plugin folder in a zip as a package
   // with one stage per command. A new package is named name when set, else
   // by the plugin manifest's name; neither is InvalidArgument carrying a
@@ -240,15 +244,14 @@ service EngineService {
   // issue with an unfinished run with FailedPrecondition, and an engine
   // over a local folder, which has no code host, with FailedPrecondition.
   rpc StartTestRun(StartTestRunRequest) returns (Run);
-  // ProposeWorkflowEdit asks an agent to change a draft as the request
-  // says, in a scratch copy, and streams progress, then the proposed draft
-  // and its findings. Nothing is saved. The proposal is always the last
-  // message; findings on it are part of the proposal, not an error. A bad
-  // draft or an empty request fails with InvalidArgument, no agent profile
-  // to run with or a change that cannot be read back with
-  // FailedPrecondition, and an agent that does not finish in time with
-  // DeadlineExceeded. Closing the stream stops the agent.
-  rpc ProposeWorkflowEdit(ProposeWorkflowEditRequest) returns (stream ProposeWorkflowEditUpdate);
+  // StartProposeWorkflowEdit asks the assistant's agent to change a draft as
+  // the request says, and returns the job's id at once. The agent reports
+  // through assistant_result, and one job.result event reaches PollEvents
+  // with its message and the id of the proposal it stored. Nothing is saved:
+  // a person applies the proposal with SaveWorkflow. An empty request or no
+  // draft is InvalidArgument; no assistant agent, or no update channel to
+  // post in, is FailedPrecondition.
+  rpc StartProposeWorkflowEdit(StartProposeWorkflowEditRequest) returns (StartJobResponse);
   // ListSkills returns the stored skill list for the agent profile a draft
   // stage resolves to, in one repo. It starts no agent.
   rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
@@ -266,11 +269,10 @@ service EngineService {
   // name, into the draft and rewrites their calls. It returns the new draft
   // and saves nothing.
   rpc BundleSkills(BundleSkillsRequest) returns (WorkflowDraft);
-  // AdaptSkills runs one agent call that rewrites the chosen bundled skills
-  // to use Kiln's tools. It streams progress lines, then one proposal whose
-  // draft differs from the request's only in those skills' files and the
-  // subagents they name. Closing the stream stops the agent.
-  rpc AdaptSkills(AdaptSkillsRequest) returns (stream AdaptSkillsUpdate);
+  // StartAdaptSkills asks the assistant's agent to rewrite the chosen skills
+  // to use Beehive's tools, and returns the job's id at once. The result
+  // arrives as StartProposeWorkflowEdit's does.
+  rpc StartAdaptSkills(StartAdaptSkillsRequest) returns (StartJobResponse);
   // GetCostReport adds up what the runs and chats of a period cost, grouped by
   // workflow, stage, card, model, day or month. Each row counts the runs
   // that were estimated and the runs with no cost, so an agent that reports
@@ -507,17 +509,24 @@ service EngineService {
   // whether or not reporting is on. It fails with InvalidArgument for
   // UNSPECIFIED or a number the enum does not define.
   rpc ReportUsage(ReportUsageRequest) returns (ReportUsageResponse);
-  // AddIssueRepo adds a repo on the issue's host to the card's issue, after
-  // checking the person's token can read it. A repo name that is not
-  // owner/name, or a base that is not a branch name, is InvalidArgument. A
-  // local issue is FailedPrecondition, a repo already on the issue is
-  // AlreadyExists, a repo that does not exist or cannot be read is NotFound,
-  // and a card with an active run is FailedPrecondition.
+  // AddIssueRepo adds a repo to the card, after checking the team's GitHub token
+  // can read it.
+  //
+  // Beehive: only a person may add one. A repo name that is not owner/name, or
+  // a base that is not a branch name, is InvalidArgument. A card with no issue
+  // is allowed; its first repo is the repo it runs in. A repo already on the
+  // card is AlreadyExists, a repo that does not exist or cannot be read is
+  // NotFound, and a card with an active run, or one already holding 10 repos,
+  // is FailedPrecondition. base is checked and not stored: the card's branch is
+  // made from the repo's default branch.
   rpc AddIssueRepo(AddIssueRepoRequest) returns (Card);
-  // RemoveIssueRepo takes an extra repo off the card's issue and removes
-  // its worktree. It is FailedPrecondition for the main repo, a repo with
-  // an open pull request, a repo the issue's front matter still lists, and
-  // a card with an active run. A repo that is not on the issue is NotFound.
+  // RemoveIssueRepo takes a repo off the card.
+  //
+  // Beehive: only a person may remove one. There is no worktree and no issue
+  // front matter to change. It is FailedPrecondition for a card with an active
+  // run, the repo of the card's issue, the repo the card runs in while others
+  // remain, and a repo with an open pull request. A repo that is not on the
+  // card is NotFound.
   rpc RemoveIssueRepo(RemoveIssueRepoRequest) returns (Card);
   // SetMergeOrder records the order the card's repos merge in. repos must
   // name every repo on the card exactly once, in the new order. It is
@@ -529,11 +538,24 @@ service EngineService {
   // and nothing is stored. A run being active does not refuse it.
   rpc SetMergeOrder(SetMergeOrderRequest) returns (Card);
 
-  // Chat sends one message to the assistant and streams its turn: progress
-  // lines, reply text, then done. Closing the stream stops the turn and
-  // keeps the reply so far. A second Chat while a turn runs is
-  // FailedPrecondition, and so is a Chat with no agent chosen.
-  rpc Chat(ChatRequest) returns (stream ChatUpdate);
+  // StartChat sends one message to the assistant's agent and returns the job's
+  // id at once. The first job's thread is the conversation: a later turn
+  // names that thread's root event in root_event_id. A turn while another
+  // runs in the thread is FailedPrecondition, and so is a chat with no
+  // assistant agent.
+  rpc StartChat(StartChatRequest) returns (StartJobResponse);
+  // CancelJob ends a running job and tells the agent in the thread. The reply
+  // so far stays, and no job.result event follows. A job that already ended
+  // is left as it is. Only the person the job is for may cancel it.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  // ListProposals returns the caller's open proposals, oldest first: the
+  // workflows the assistant, or an agent that could not save, offered.
+  // Beehive: an agent acting for a person is PermissionDenied; only the person
+  // reads their proposals.
+  rpc ListProposals(ListProposalsRequest) returns (ListProposalsResponse);
+  // AssistantResult is the agent's report of a job, for the assistant_result
+  // tool. The job's own agent calls it once.
+  rpc AssistantResult(AssistantResultRequest) returns (AssistantResultResponse);
   // ListConversations lists saved conversations, newest first, and says
   // whether an agent is ready to answer.
   rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
@@ -541,13 +563,35 @@ service EngineService {
   rpc GetConversation(GetConversationRequest) returns (GetConversationResponse);
   // DeleteConversation forgets a conversation, its messages and its folder.
   rpc DeleteConversation(DeleteConversationRequest) returns (DeleteConversationResponse);
-  // ResolveProposal records what the person did with a proposal. It acts on
-  // nothing: the app already ran the action through its own call.
+  // ResolveProposal records what the person did with a proposal, and takes
+  // it off ListProposals. It acts on nothing: the app already ran the action
+  // through its own call. Only the person the proposal is for may resolve it;
+  // an agent acting for them is PermissionDenied.
   rpc ResolveProposal(ResolveProposalRequest) returns (ResolveProposalResponse);
-  // AcceptTicketProposal files a ticket proposal: it opens the issue or
-  // writes the Kiln task, adds the card, and records the card on the
-  // proposal. A repeat returns the same card and opens nothing new.
+  // AcceptTicketProposal files a ticket proposal: it opens the GitHub issue on
+  // the proposal's repo, imports it as a Backlog card, and closes the proposal.
+  //
+  // Beehive: only the person the proposal is for may accept it. A non-empty
+  // title or body replaces the draft's. A proposal that was accepted is not
+  // found again, so a repeat after success is NotFound. When opening the issue
+  // fails the proposal stays open; a retry finds an issue the first try opened
+  // and makes no second.
   rpc AcceptTicketProposal(AcceptTicketProposalRequest) returns (AcceptTicketProposalResponse);
+  // Beehive: GetRunEvents reads one run's events after a seq, oldest first, for an
+  // agent diagnosing the run. A run that does not exist is NotFound.
+  rpc GetRunEvents(GetRunEventsRequest) returns (GetRunEventsResponse);
+  // Beehive: GetHiveHealth reports what an agent needs to say whether the engine itself
+  // is at fault: runs that have sat in a stage too long, the post backlog and how old
+  // its oldest post is.
+  rpc GetHiveHealth(GetHiveHealthRequest) returns (GetHiveHealthResponse);
+  // Beehive: ReportDiagnosis records an agent's diagnosis of a run in the run's card
+  // activity. A diagnosis with no evidence quote is InvalidArgument.
+  rpc ReportDiagnosis(ReportDiagnosisRequest) returns (ReportDiagnosisResponse);
+  // Beehive: FileTicket reports a fault. An engine or UI fault becomes a Backlog card
+  // linked to the repos named. A fault in a card's own code is held as a ticket
+  // proposal until a person accepts it, and then becomes an issue on the card's repo.
+  // A fault an open card or issue already describes gets a note or comment instead.
+  rpc FileTicket(FileTicketRequest) returns (FileTicketResponse);
 }
 
 message GetStatusRequest {}
@@ -615,22 +659,9 @@ message PollEventsResponse {
   int64 next_seq = 2;
 }
 
-message WatchEventsRequest {
-  // Stream events with seq greater than this; 0 streams from the start.
-  int64 after_seq = 1;
-  // When set, only this card's events.
-  int64 card_id = 2;
-  // When set, only events of these types. An unknown type fails with
-  // InvalidArgument.
-  repeated string types = 3;
-  // When set, only this run's events. Pair it with card_id: a run_id without
-  // one fails with InvalidArgument.
-  int64 run_id = 4;
-}
-
 // Event is one row of the engine's event log.
 message Event {
-  // Global order across all events, and the WatchEvents cursor.
+  // Global order across all events, and the PollEvents cursor.
   int64 seq = 1;
   // One of the event types the engine registers, such as "engine.started".
   string type = 2;
@@ -764,9 +795,9 @@ message CardRepo {
   reserved 10;
   reserved "from_front_matter";
   // Why RemoveIssueRepo will refuse to remove the repo now, in plain words,
-  // or empty when nothing the card holds is in the way: the issue's own repo
-  // and an open pull request. The issue's front matter and a running stage
-  // are checked by RemoveIssueRepo itself, which reads the issue again.
+  // or empty when nothing the card holds is in the way: the issue's own repo,
+  // the repo the card runs in while others remain, and an open pull request.
+  // An active run is checked by RemoveIssueRepo itself.
   string remove_refusal = 11;
 }
 
@@ -1139,7 +1170,8 @@ message RestoreCardRequest {
 }
 
 message AddIssueRepoRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
   // owner/name on the issue's host.
   string repo = 2;
   // The branch a new branch starts from. Empty for the repo's default branch.
@@ -1147,7 +1179,8 @@ message AddIssueRepoRequest {
 }
 
 message RemoveIssueRepoRequest {
-  int64 card_id = 1;
+  // Beehive: the card's UUID. The Go engine used an int64.
+  string card_id = 1;
   // owner/name.
   string repo = 2;
 }
@@ -1456,20 +1489,17 @@ message WorkflowDraft {
   map<string, bytes> files = 2;
 }
 
-message ProposeWorkflowEditRequest {
+message StartProposeWorkflowEditRequest {
   // The draft as the builder holds it now.
   WorkflowDraft draft = 1;
   // The change, in the person's words.
   string request = 2;
 }
 
-message ProposeWorkflowEditUpdate {
-  oneof update {
-    // One line of what the agent is doing, to show while it works.
-    string progress = 1;
-    // The proposed draft and its findings; always the last message.
-    Proposal proposal = 2;
-  }
+// StartJobResponse names the job a Start call began. The job's thread and
+// its result arrive on the event log: job.started, then one job.result.
+message StartJobResponse {
+  string job_id = 1;
 }
 
 // ListSkillsRequest names a draft stage and a repo.
@@ -1546,35 +1576,18 @@ message BundleSkillsRequest {
   repeated string skills = 2;
 }
 
-message AdaptSkillsRequest {
+message StartAdaptSkillsRequest {
   WorkflowDraft draft = 1;
-  // skills are the bundled skill folder names to adapt, such as
-  // 02-create-research.
+  // skills are the skill folder names to adapt, such as 02-create-research.
   repeated string skills = 2;
-}
-
-// AdaptSkillsUpdate is one progress line, or the final proposal.
-message AdaptSkillsUpdate {
-  oneof update {
-    string progress = 1;
-    // The adapted draft and its findings; always the last message.
-    Proposal proposal = 2;
-  }
-}
-
-// Proposal is a draft an agent proposed, with the findings the workflow
-// checks give it. It is not saved.
-message Proposal {
-  WorkflowDraft draft = 1;
-  repeated Finding findings = 2;
-  // The agent's own short reply: why it made the change, or why it made
-  // none. Empty when the agent said nothing, and always empty for an
-  // AdaptSkills proposal.
-  string explanation = 3;
 }
 
 message GetWorkflowDraftRequest {
   string name = 1;
+  // Beehive addition, for the get_workflow tool. When set, every file comes
+  // back as text in text_files and draft.files is left empty, because an
+  // agent cannot read the bytes a JSON body carries as base64.
+  bool text = 2;
 }
 
 message GetWorkflowDraftResponse {
@@ -1586,6 +1599,8 @@ message GetWorkflowDraftResponse {
   // What the package's files carry, grouped for the builder's Package
   // contents list.
   PackageContents contents = 4;
+  // Every file as text, by slash path, when the request set text.
+  map<string, string> text_files = 5;
 }
 
 // PackageContents is what a package's files carry. Each list is in file
@@ -1670,6 +1685,27 @@ message StartTestRunRequest {
   // test run's own settings (params.<name>). An undeclared name or a value
   // its type refuses is INVALID_ARGUMENT.
   map<string, string> parameters = 4;
+}
+
+message EditWorkflowRequest {
+  // The package name, the same as the name in kiln-package.yaml.
+  string name = 1;
+  // Every file in the package as text, by slash path. A save replaces the
+  // package, so a file left out is removed.
+  map<string, string> files = 2;
+  // The hash get_workflow gave. Empty makes a new package.
+  string base_hash = 3;
+}
+
+message EditWorkflowResponse {
+  // True when the edit was saved; false when it was stored as a proposal.
+  bool saved = 1;
+  // The hash of the files written, when saved.
+  string hash = 2;
+  // The stored proposal's id, when it was not saved.
+  int64 proposal_id = 3;
+  // Warnings and notes. A draft with an error is refused instead.
+  repeated Finding findings = 4;
 }
 
 message SaveWorkflowResponse {
@@ -1766,46 +1802,16 @@ message Attachment {
   bytes data = 2;
 }
 
-message ChatRequest {
-  // 0 starts a new conversation.
-  int64 conversation_id = 1;
-  string text = 2;
-  ViewContext context = 3;
-  ChatIntent intent = 4;
-  // The run to debug; required when intent is CHAT_INTENT_DEBUG_RUN. The
-  // engine finds the run's conversation, or starts one, and ignores
-  // conversation_id.
-  int64 run_id = 5;
-  // At most 20 files and 10 MiB in total. A zip unpacks to at most 1000
-  // entries and 32 MiB.
-  repeated Attachment attachments = 6;
-  reserved 7;
-  reserved "view_id";
-  // The repos an Explore chat reads, as host/owner/name: at most 5, each
-  // linked to an intake rule or the default repo. Used when intent is
-  // CHAT_INTENT_EXPLORE.
-  repeated string repos = 8;
-  // The workflow an Explore chat files tickets to; empty is Backlog. Used
-  // when intent is CHAT_INTENT_EXPLORE.
-  string workflow = 9;
-}
-
-message ChatUpdate {
-  oneof update {
-    // A short line about what the assistant is doing, such as a tool title.
-    string progress = 1;
-    // The next piece of the reply, already redacted.
-    string text = 2;
-    ChatDone done = 3;
-    // The checked diagnosis of a Debug this turn.
-    Diagnosis diagnosis = 4;
-    // A next step the assistant offers. The person decides.
-    AssistantProposal proposal = 5;
-  }
+message StartChatRequest {
+  // The person's message.
+  string text = 1;
+  // The root event of an earlier job's thread, to continue it. Empty opens a
+  // new thread, whose root the job.started event names.
+  string root_event_id = 2;
 }
 
 // AssistantProposal is something the assistant offers and the person
-// confirms. Named so because Proposal is the plain-words edit's message.
+// confirms.
 message AssistantProposal {
   int64 id = 1;
   // open, accepted or discarded.
@@ -1941,6 +1947,81 @@ message AcceptTicketProposalResponse {
   AssistantProposal proposal = 2;
 }
 
+message GetRunEventsRequest {
+  // Beehive: the run's UUID.
+  string run_id = 1;
+  // Return events with seq greater than this; 0 starts from the beginning.
+  int64 after_seq = 2;
+  // 0 means 100. Over 500 is InvalidArgument.
+  int32 limit = 3;
+}
+
+message GetRunEventsResponse {
+  repeated Event events = 1;
+  // The seq to pass as after_seq on the next call; after_seq when there were none.
+  int64 next_seq = 2;
+}
+
+message GetHiveHealthRequest {}
+
+message StuckRun {
+  string run_id = 1;
+  string card_id = 2;
+  string stage_id = 3;
+  // How long the run has been in the stage.
+  int64 seconds = 4;
+}
+
+message GetHiveHealthResponse {
+  int64 head_seq = 1;
+  // Runs in state running whose stage was entered more than stuck_after_seconds ago.
+  repeated StuckRun stuck_runs = 2;
+  int64 stuck_after_seconds = 3;
+  // Posts to the relay not sent yet, failed ones included.
+  int64 outbox_pending = 4;
+  int64 outbox_failed = 5;
+  // How long the oldest unsent post has waited, 0 when none waits. A post that waits long
+  // means the relay is not taking what Beehive sends it.
+  int64 oldest_pending_seconds = 6;
+  // Whether the relay's allowlist has been applied to this engine's account. Always
+  // "unknown" until Phase 22 reads it.
+  string allowlist_applied = 7;
+}
+
+message ReportDiagnosisRequest {
+  // Beehive: the run's UUID.
+  string run_id = 1;
+  // At least one evidence quote is required.
+  Diagnosis diagnosis = 2;
+}
+
+message ReportDiagnosisResponse {
+  // The seq of the activity.added event on the run's card that holds the diagnosis.
+  int64 event_seq = 1;
+}
+
+message FileTicketRequest {
+  // engine, ui or code.
+  string kind = 1;
+  string title = 2;
+  string body = 3;
+  // owner/name of the repos the ticket concerns. A code fault names one repo, which must
+  // be on the card, or none for the card's first repo.
+  repeated string repos = 4;
+  // Beehive: the card whose own code is at fault. Required for kind code.
+  string card_id = 5;
+}
+
+message FileTicketResponse {
+  // created: a Backlog card was made (card_id). noted: an open card already had the
+  // fault and got a note (card_id). commented: an open issue already had it and got a
+  // comment (issue). proposed: a code fault waits for a person (proposal_id).
+  string outcome = 1;
+  string card_id = 2;
+  IssueRef issue = 3;
+  int64 proposal_id = 4;
+}
+
 message ResolveProposalRequest {
   int64 proposal_id = 1;
   // accepted or discarded.
@@ -1948,7 +2029,55 @@ message ResolveProposalRequest {
 }
 
 message ResolveProposalResponse {
+  // Its id, and its state: accepted or discarded, as the request said.
   AssistantProposal proposal = 1;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {}
+
+message ListProposalsRequest {}
+
+message ListProposalsResponse {
+  repeated OpenProposal proposals = 1;
+}
+
+// OpenProposal is a workflow an agent offered that the person has not
+// decided. Apply it with SaveWorkflow at the person's own level, then
+// ResolveProposal.
+message OpenProposal {
+  int64 id = 1;
+  // The package and its files as text, as the agent offered them.
+  WorkflowDraft draft = 2;
+  // The hash the agent named as the package's base, empty for none.
+  string base_hash = 3;
+  // The assistant job that made it, empty for an edit_workflow proposal.
+  string job_id = 4;
+  // Beehive: set instead of draft for a ticket an agent proposed. Accept it with
+  // AcceptTicketProposal.
+  TicketProposal ticket = 5;
+}
+
+message AssistantResultRequest {
+  string job_id = 1;
+  // What the agent says to the person. Required.
+  string message = 2;
+  // A workflow to offer: its name and every file as text. Required for an edit
+  // or an adaptation, optional for a chat turn.
+  string name = 3;
+  map<string, string> files = 4;
+  // The hash get_workflow gave for the package, empty for a new one.
+  string base_hash = 5;
+}
+
+message AssistantResultResponse {
+  // The stored proposal, 0 when the agent offered no workflow.
+  int64 proposal_id = 1;
+  // Warnings and notes. A draft with an error is refused instead.
+  repeated Finding findings = 2;
 }
 
 // Diagnosis is the first answer of a Debug this turn. Every quote was found
@@ -1966,13 +2095,6 @@ message Evidence {
   // Where the quote came from, such as "run 41 log" or "event 8812".
   string source = 1;
   string quote = 2;
-}
-
-// ChatDone ends a turn. It names the conversation, which is new when the
-// request's conversation_id was 0, and the saved reply.
-message ChatDone {
-  int64 conversation_id = 1;
-  int64 message_id = 2;
 }
 
 message Conversation {

@@ -6,16 +6,20 @@
 pub mod access;
 pub mod activity;
 pub mod artifacts;
+pub mod assistant;
 pub mod auto;
 pub mod cards;
+pub mod diagnose;
 pub mod inbox;
 pub mod intake;
 mod lookup;
 pub mod merge;
 pub mod outbox;
 pub mod pull_request;
+pub mod repos;
 mod routes;
 pub mod run;
+pub mod save;
 pub mod settings;
 pub mod task_message;
 pub mod timers;
@@ -36,6 +40,17 @@ pub struct Ctx {
     /// this pubkey as its requester, so the agents that work it act at that person's level.
     /// `None` for a person, and for an agent with no claim.
     pub requester: Option<Pubkey>,
+}
+
+impl Ctx {
+    /// The person a job or proposal made by this call is for: the person an agent acts for,
+    /// else the actor. Runs differ on purpose (`routes::requester_of`): a run never records an
+    /// agent as the person it acts for, while a job or proposal is looked up by this key.
+    pub fn requester_or_actor(&self) -> Pubkey {
+        self.requester
+            .clone()
+            .unwrap_or_else(|| self.actor.pubkey.clone())
+    }
 }
 
 /// What the operations that reach past the store need.
@@ -60,6 +75,28 @@ pub enum OpError {
     /// The caller is known but may not do this, whatever its access level.
     #[error("{0}")]
     PermissionDenied(String),
+    /// A new thing was given a name that is taken.
+    #[error("{0}")]
+    AlreadyExists(String),
+    /// A workflow draft whose checks found errors. Nothing was written.
+    #[error("{}", describe_findings(.0))]
+    InvalidWorkflow(Vec<crate::domain::workflow::Finding>),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// The refusal text for a draft with errors: each error with its code and where it is.
+fn describe_findings(findings: &[crate::domain::workflow::Finding]) -> String {
+    use crate::domain::workflow::Severity;
+    let errors: Vec<String> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .map(|f| format!("{} [{}] {}", f.path, f.code, f.message))
+        .collect();
+    format!(
+        "the workflow has {} {}, so it was not saved: {}",
+        errors.len(),
+        if errors.len() == 1 { "error" } else { "errors" },
+        errors.join("; ")
+    )
 }

@@ -8,11 +8,14 @@ mod access;
 mod activity;
 mod agents;
 mod artifacts;
+mod assistant;
 mod cards;
+mod diagnose;
 mod inbox;
 pub mod intake;
 mod merge;
 pub mod poll;
+mod repos;
 mod runs;
 mod settings;
 mod stages;
@@ -43,6 +46,14 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("CheckWorkflow", Level::Read),
     ("ListTemplateVariables", Level::Read),
     ("ListStageTemplates", Level::Read),
+    ("GetWorkflowDraft", Level::Read),
+    ("EditWorkflow", Level::Read),
+    ("SaveWorkflow", Level::Run),
+    ("DuplicateWorkflow", Level::Run),
+    ("DeleteWorkflow", Level::Run),
+    ("SetWorkflowOptions", Level::Run),
+    ("ExportWorkflow", Level::Run),
+    ("ImportWorkflow", Level::Run),
     ("StartStage", Level::Run),
     ("StageDone", Level::Run),
     ("GetRun", Level::Read),
@@ -97,6 +108,25 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListIssueComments", Level::Read),
     ("MergeCard", Level::Run),
     ("SetMergeOrder", Level::Run),
+    // The assistant's calls only start work and read what it offered: a result is a proposal,
+    // and a person applies it with SaveWorkflow at their own level. The agent reports with
+    // AssistantResult, which the handler holds to the job's own agent.
+    ("StartChat", Level::Read),
+    ("StartProposeWorkflowEdit", Level::Read),
+    ("StartAdaptSkills", Level::Read),
+    ("CancelJob", Level::Read),
+    ("ListProposals", Level::Read),
+    ("ResolveProposal", Level::Read),
+    ("AssistantResult", Level::Read),
+    // An agent diagnoses a run at Read and reports at Run. The repo calls change what a card
+    // works in, so they are Run; accepting a ticket is checked to be a person in the handler.
+    ("GetRunEvents", Level::Read),
+    ("GetHiveHealth", Level::Read),
+    ("ReportDiagnosis", Level::Run),
+    ("FileTicket", Level::Run),
+    ("AddIssueRepo", Level::Run),
+    ("RemoveIssueRepo", Level::Run),
+    ("AcceptTicketProposal", Level::Run),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -122,7 +152,18 @@ pub const DROPPED: &[(&str, &str)] = &[
     ("SignOut", "team token secret"),
     ("GetCardFilePath", "no local files"),
     ("ReportUsage", "no usage reporter"),
-    ("WatchEvents", "replaced by PollEvents"),
+    (
+        "ListConversations",
+        "the assistant's thread in Buzz is the conversation",
+    ),
+    (
+        "GetConversation",
+        "the assistant's thread in Buzz is the conversation",
+    ),
+    (
+        "DeleteConversation",
+        "the assistant's thread in Buzz is the conversation",
+    ),
 ];
 
 /// The URL path of a procedure.
@@ -177,6 +218,14 @@ pub fn router() -> Router<App> {
         workflows::list_template_variables,
     );
     let r = route(r, "ListStageTemplates", workflows::list_stage_templates);
+    let r = route(r, "GetWorkflowDraft", workflows::get_workflow_draft);
+    let r = route(r, "SaveWorkflow", workflows::save_workflow);
+    let r = route(r, "DuplicateWorkflow", workflows::duplicate_workflow);
+    let r = route(r, "DeleteWorkflow", workflows::delete_workflow);
+    let r = route(r, "SetWorkflowOptions", workflows::set_workflow_options);
+    let r = route(r, "ExportWorkflow", workflows::export_workflow);
+    let r = route(r, "ImportWorkflow", workflows::import_workflow);
+    let r = route(r, "EditWorkflow", workflows::edit_workflow);
     let r = route(r, "StartStage", runs::start_stage);
     let r = route(r, "StageDone", stages::stage_done);
     let r = route(r, "GetRun", runs::get_run);
@@ -228,5 +277,23 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListIssueComments", intake::list_issue_comments);
     let r = route(r, "MergeCard", merge::merge_card);
     let r = route(r, "SetMergeOrder", merge::set_merge_order);
+    let r = route(r, "StartChat", assistant::start_chat);
+    let r = route(
+        r,
+        "StartProposeWorkflowEdit",
+        assistant::start_propose_workflow_edit,
+    );
+    let r = route(r, "StartAdaptSkills", assistant::start_adapt_skills);
+    let r = route(r, "CancelJob", assistant::cancel_job);
+    let r = route(r, "ListProposals", assistant::list_proposals);
+    let r = route(r, "ResolveProposal", assistant::resolve_proposal);
+    let r = route(r, "AssistantResult", assistant::assistant_result);
+    let r = route(r, "GetRunEvents", diagnose::get_run_events);
+    let r = route(r, "GetHiveHealth", diagnose::get_hive_health);
+    let r = route(r, "ReportDiagnosis", diagnose::report_diagnosis);
+    let r = route(r, "FileTicket", diagnose::file_ticket);
+    let r = route(r, "AcceptTicketProposal", diagnose::accept_ticket_proposal);
+    let r = route(r, "AddIssueRepo", repos::add_issue_repo);
+    let r = route(r, "RemoveIssueRepo", repos::remove_issue_repo);
     route(r, "GetUsage", status::get_usage)
 }

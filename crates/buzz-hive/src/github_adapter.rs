@@ -38,6 +38,9 @@ const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMMENT_PAGES: u32 = 10;
 /// Comments per page, the most GitHub allows.
 const COMMENT_PAGE: u32 = 100;
+/// Pages read of a list that decides a merge or a stage: a pull request's reviews, check runs and
+/// commit statuses. A list longer than this is an error, never a partial answer.
+const MAX_LIST_PAGES: u32 = 10;
 /// How long a limit with no stated end is waited out.
 const UNSTATED_LIMIT: Duration = Duration::from_secs(60);
 /// The line a comment Beehive wrote ends with, so it is known again. The key is made safe
@@ -183,24 +186,93 @@ impl GitHub {
         Ok(self.get(url).await?.0)
     }
 
+    /// Every entry of a list GitHub pages, 100 to a page: the list itself, or the array under
+    /// `field` when the reply is an object with a `total_count`. A list that runs past
+    /// [`MAX_LIST_PAGES`] is an error, so a caller never takes a part for the whole.
+    async fn all_pages(
+        &self,
+        segments: &[&str],
+        field: Option<&str>,
+    ) -> Result<Vec<Value>, HostError> {
+        let mut all = Vec::new();
+        for page in 1..=MAX_LIST_PAGES {
+            let url = self.url(
+                segments,
+                &[("per_page", "100".to_owned()), ("page", page.to_string())],
+            );
+            let (body, _) = self.get(url).await?;
+            let found = match field {
+                Some(field) => body.get(field).map(items).unwrap_or_default(),
+                None => items(&body),
+            };
+            let full = found.len() >= 100;
+            all.extend(found);
+            let total = body.get("total_count").and_then(Value::as_u64);
+            if !full || total.is_some_and(|total| all.len() as u64 >= total) {
+                return Ok(all);
+            }
+        }
+        Err(HostError::Other(format!(
+            "GitHub lists more than {} entries at {}",
+            MAX_LIST_PAGES * 100,
+            segments.join("/")
+        )))
+    }
+
+    /// The repos of the list at `segments`, newest push first, those of `owner` when it is not
+    /// empty, up to [`MAX_REPOS`].
+    async fn repo_pages(
+        &self,
+        segments: &[&str],
+        query: &[(&str, String)],
+        owner: &str,
+    ) -> Result<Vec<RepoRef>, HostError> {
+        let mut repos = Vec::new();
+        let pages = MAX_REPOS.div_ceil(100) as u32;
+        for page in 1..=pages {
+            let mut query = query.to_vec();
+            query.extend([
+                ("per_page", "100".to_owned()),
+                ("page", page.to_string()),
+                ("sort", "pushed".to_owned()),
+                ("direction", "desc".to_owned()),
+            ]);
+            let (body, _) = self.get(self.url(segments, &query)).await?;
+            let found = items(&body);
+            repos.extend(
+                found
+                    .iter()
+                    .filter_map(|r| r.get("full_name").and_then(Value::as_str))
+                    .filter_map(|name| RepoRef::parse(name).ok())
+                    .filter(|r| owner.is_empty() || r.owner.eq_ignore_ascii_case(owner)),
+            );
+            if found.len() < 100 || repos.len() >= MAX_REPOS {
+                break;
+            }
+        }
+        repos.truncate(MAX_REPOS);
+        Ok(repos)
+    }
+
     /// Whether a reviewer approved the pull request and none still asks for changes. Only a
     /// reviewer's latest verdict counts, and a dismissed review counts for nothing.
     async fn approved(&self, repo: &RepoRef, number: u64) -> Result<bool, HostError> {
         let number = number.to_string();
-        let url = self.url(
-            &[
-                "repos",
-                &repo.owner,
-                &repo.name,
-                "pulls",
-                &number,
-                "reviews",
-            ],
-            &[("per_page", "100".to_owned())],
-        );
-        let (body, _) = self.get(url).await?;
+        let reviews = self
+            .all_pages(
+                &[
+                    "repos",
+                    &repo.owner,
+                    &repo.name,
+                    "pulls",
+                    &number,
+                    "reviews",
+                ],
+                None,
+            )
+            .await?;
         let mut verdicts: HashMap<String, String> = HashMap::new();
-        for review in items(&body) {
+        for review in reviews {
             let who = review
                 .get("user")
                 .map(|u| text(u, "login"))
@@ -415,6 +487,38 @@ impl CodeHost for GitHub {
             .ok_or_else(|| HostError::Other("GitHub's reply to a comment has no id".into()))
     }
 
+    async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        title: &str,
+        body: &str,
+        key: &str,
+    ) -> Result<Issue, HostError> {
+        let marker = marker(key);
+        // A repeat after a failure finds the issue the first try opened, which is among the
+        // most recently updated. Anyone can type the marker into an issue, so only the token's
+        // own issue counts, as with a comment.
+        let me = self.login().await?;
+        let recent = self
+            .list_issues(repo, &IssueFilter::default(), Page::first(30))
+            .await?;
+        if let Some(found) = recent.into_iter().find(|issue| {
+            issue.author.eq_ignore_ascii_case(me)
+                && issue.body.lines().any(|line| line.trim() == marker)
+        }) {
+            return Ok(found);
+        }
+        let url = self.url(&["repos", &repo.owner, &repo.name, "issues"], &[]);
+        let made = self
+            .post(
+                url,
+                &json!({ "title": title, "body": format!("{body}\n\n{marker}") }),
+            )
+            .await?;
+        issue_from(&made, Some(repo), None)
+            .ok_or_else(|| HostError::Other("GitHub's reply to a new issue is not an issue".into()))
+    }
+
     async fn open_pull_request(
         &self,
         request: &NewPullRequest,
@@ -490,26 +594,26 @@ impl CodeHost for GitHub {
             .ok_or_else(|| {
                 HostError::Other("GitHub's reply for the pull request has no head".into())
             })?;
-        let runs = self.url(
-            &[
-                "repos",
-                &repo.owner,
-                &repo.name,
-                "commits",
-                &sha,
-                "check-runs",
-            ],
-            &[("per_page", "100".to_owned())],
-        );
-        let statuses = self.url(
-            &["repos", &repo.owner, &repo.name, "commits", &sha, "status"],
-            &[("per_page", "100".to_owned())],
-        );
-        let (runs, _) = self.get(runs).await?;
-        let (statuses, _) = self.get(statuses).await?;
+        let run_items = self
+            .all_pages(
+                &[
+                    "repos",
+                    &repo.owner,
+                    &repo.name,
+                    "commits",
+                    &sha,
+                    "check-runs",
+                ],
+                Some("check_runs"),
+            )
+            .await?;
+        let status_items = self
+            .all_pages(
+                &["repos", &repo.owner, &repo.name, "commits", &sha, "status"],
+                Some("statuses"),
+            )
+            .await?;
         let mut checks: Vec<Check> = Vec::new();
-        let run_items = runs.get("check_runs").map(items).unwrap_or_default();
-        let status_items = statuses.get("statuses").map(items).unwrap_or_default();
         let found = run_items
             .iter()
             .map(|run| {
@@ -616,37 +720,29 @@ impl CodeHost for GitHub {
     }
 
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {
-        let mut repos = Vec::new();
-        let pages = MAX_REPOS.div_ceil(100) as u32;
-        for page in 1..=pages {
-            let url = self.url(
-                &["user", "repos"],
-                &[
-                    ("per_page", "100".to_owned()),
-                    ("page", page.to_string()),
-                    ("sort", "pushed".to_owned()),
-                    ("direction", "desc".to_owned()),
-                    (
-                        "affiliation",
-                        "owner,collaborator,organization_member".to_owned(),
-                    ),
-                ],
-            );
-            let (body, _) = self.get(url).await?;
-            let found = items(&body);
-            repos.extend(
-                found
-                    .iter()
-                    .filter_map(|r| r.get("full_name").and_then(Value::as_str))
-                    .filter_map(|name| RepoRef::parse(name).ok())
-                    .filter(|r| owner.is_empty() || r.owner.eq_ignore_ascii_case(owner)),
-            );
-            if found.len() < 100 || repos.len() >= MAX_REPOS {
-                break;
+        // An organisation's repos come from its own list. An owner that is no organisation is
+        // the token's user, whose repos are in the user's list.
+        if !owner.is_empty() {
+            let found = self
+                .repo_pages(
+                    &["orgs", owner, "repos"],
+                    &[("type", "all".to_owned())],
+                    owner,
+                )
+                .await;
+            if !matches!(found, Err(HostError::NotFound(_))) {
+                return found;
             }
         }
-        repos.truncate(MAX_REPOS);
-        Ok(repos)
+        self.repo_pages(
+            &["user", "repos"],
+            &[(
+                "affiliation",
+                "owner,collaborator,organization_member".to_owned(),
+            )],
+            owner,
+        )
+        .await
     }
 
     async fn list_owners(&self) -> Result<Vec<String>, HostError> {
@@ -673,19 +769,24 @@ fn transport(error: reqwest::Error) -> HostError {
     HostError::Other(format!("cannot reach GitHub: {}", error.without_url()))
 }
 
-/// The body of `response`, refused when it is over [`MAX_BODY_BYTES`].
-async fn read_body(response: reqwest::Response) -> Result<Vec<u8>, HostError> {
+/// The body of `response`, refused when it is over [`MAX_BODY_BYTES`]. A reply with no length
+/// is read chunk by chunk and dropped as soon as it passes the limit.
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, HostError> {
+    let too_large = || HostError::Other("GitHub's reply is too large".into());
     if response
         .content_length()
         .is_some_and(|len| len > MAX_BODY_BYTES as u64)
     {
-        return Err(HostError::Other("GitHub's reply is too large".into()));
+        return Err(too_large());
     }
-    let bytes = response.bytes().await.map_err(transport)?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(HostError::Other("GitHub's reply is too large".into()));
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(body)
 }
 
 /// The reason GitHub gave for a refusal, cut short.

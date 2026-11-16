@@ -9,26 +9,34 @@ use buzz_hive_core::access::Level;
 use buzz_hive_core::access::{ActorKind, RelayRole};
 use buzz_hive_core::domain::artifact::ArtifactContent;
 use buzz_hive_core::domain::card::CardState;
+use buzz_hive_core::domain::card::PullRequest;
 use buzz_hive_core::domain::events::EVENT_KINDS;
+use buzz_hive_core::domain::intake::RepoRef;
 use buzz_hive_core::orchestrator::access::set_level;
 use buzz_hive_core::orchestrator::activity::log_work;
 use buzz_hive_core::orchestrator::artifacts::{save_artifact, set_handoff};
+use buzz_hive_core::orchestrator::assistant::{
+    assistant_result, expire_jobs, start_job, JobKind, Reported, Start,
+};
 use buzz_hive_core::orchestrator::cards::{
     add_note, archive_cards, create_card, delete_card, restore_card, update_card, CardPatch,
     NewCard,
 };
 use buzz_hive_core::orchestrator::inbox::{approve, send_back};
+use buzz_hive_core::orchestrator::repos::{add_repo, remove_repo};
 use buzz_hive_core::orchestrator::run::{resume_card, skip_stage, start_run};
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::timers;
+use buzz_hive_core::orchestrator::wait::{record, Seen};
 use buzz_hive_core::orchestrator::Env;
+use buzz_hive_core::ports::code_host::PullStatus;
 use buzz_hive_core::ports::store::Store;
-use buzz_hive_core::testing::ManualClock;
+use buzz_hive_core::testing::{FakeCodeHost, ManualClock};
 use buzz_hive_core::testing::{FakeDirectory, MemStore};
 use common::{ctx_for, person, Fixture, BUILDER, CHANNEL, COMMUNITY};
 use std::time::Duration;
 
-const CURRENT_PHASE: u8 = 16;
+const CURRENT_PHASE: u8 = 21;
 
 async fn card_scenarios(store: &MemStore) {
     let ctx = person();
@@ -349,6 +357,106 @@ async fn intake_scenarios(f: &Fixture) {
     .unwrap();
 }
 
+/// Phase 18: the host reports a pull request that is different from the one the card has.
+async fn pull_request_scenarios(f: &Fixture) {
+    let (card, _) = create_card(
+        &f.store,
+        &person(),
+        NewCard {
+            title: "pull request".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let pull = PullRequest {
+        repo: "example-org/api".into(),
+        number: 3,
+        state: "open".into(),
+        ..Default::default()
+    };
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    tx.pull_requests().put(card.id, &pull).await.unwrap();
+    tx.commit().await.unwrap();
+    let seen = Seen {
+        status: Some(PullStatus {
+            pull: PullRequest {
+                approved: true,
+                ..pull
+            },
+            labels: Vec::new(),
+        }),
+        checks: None,
+        head_sha: None,
+        gone: false,
+        now: chrono::Utc::now(),
+    };
+    record(&f.env(), COMMUNITY, card.id, &seen).await.unwrap();
+}
+
+/// Phase 20: the assistant is asked twice. One agent reports, and the other never does and
+/// runs out of time.
+async fn assistant_scenarios(f: &Fixture, clock: &ManualClock) {
+    set_setting(
+        &f.env(),
+        &person(),
+        &Scope::User,
+        "assistant_agent",
+        Some(serde_json::json!("builder")),
+    )
+    .await
+    .unwrap();
+    let ask = |text: &str| Start {
+        kind: JobKind::Chat,
+        text: text.into(),
+        draft: None,
+        skills: Vec::new(),
+        root: None,
+    };
+    let (answered, _) = start_job(&f.env(), &f.relay, &person(), ask("one"))
+        .await
+        .unwrap();
+    assistant_result(
+        &f.env(),
+        &ctx_for(BUILDER, ActorKind::Agent),
+        Reported {
+            job_id: answered,
+            message: "hello".into(),
+            draft: None,
+            base_hash: None,
+        },
+    )
+    .await
+    .unwrap();
+    start_job(&f.env(), &f.relay, &person(), ask("two"))
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(31 * 60));
+    expire_jobs(&f.env(), COMMUNITY, 10).await.unwrap();
+}
+
+/// Phase 21: a repo is added to a card and taken off it.
+async fn repo_scenarios(f: &Fixture) {
+    let (card, _) = create_card(
+        &f.store,
+        &person(),
+        NewCard {
+            title: "repos".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let host = FakeCodeHost::new();
+    host.put_repo(&RepoRef::parse("example-org/api").unwrap());
+    add_repo(&f.store, &host, &person(), card.id, "example-org/api", "")
+        .await
+        .unwrap();
+    remove_repo(&f.store, &person(), card.id, "example-org/api")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     let (f, clock) = Fixture::timed();
@@ -362,6 +470,9 @@ async fn every_kind_introduced_so_far_is_appended_by_some_scenario() {
     approval_scenarios(&f).await;
     access_scenarios(&f).await;
     intake_scenarios(&f).await;
+    pull_request_scenarios(&f).await;
+    assistant_scenarios(&f, &clock).await;
+    repo_scenarios(&f).await;
 
     let committed = store.committed_kinds();
     let missing: Vec<_> = EVENT_KINDS

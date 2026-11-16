@@ -151,6 +151,7 @@ fn in_process(world: &World, address: SocketAddr) -> App {
         catalog: Arc::new(Sources(vec![Source::new("e2e", false, MemSource::new())])),
         community: world.community,
         hive_pubkey: world.hive.public_key().to_hex(),
+        relay: None,
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,

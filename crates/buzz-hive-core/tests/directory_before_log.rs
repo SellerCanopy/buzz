@@ -115,6 +115,15 @@ impl Tx for SpyTx {
     fn pull_requests(&mut self) -> &mut dyn buzz_hive_core::ports::store::PullRequestsRepo {
         self.inner.pull_requests()
     }
+    fn proposals(&mut self) -> &mut dyn buzz_hive_core::ports::store::ProposalsRepo {
+        self.inner.proposals()
+    }
+    fn card_repos(&mut self) -> &mut dyn buzz_hive_core::ports::store::CardReposRepo {
+        self.inner.card_repos()
+    }
+    fn jobs(&mut self) -> &mut dyn buzz_hive_core::ports::store::JobsRepo {
+        self.inner.jobs()
+    }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
         self.inner.savepoint().await
     }
@@ -131,6 +140,9 @@ impl Tx for SpyTx {
 
 #[async_trait::async_trait]
 impl EventsRepo for SpyTx {
+    async fn lock_log(&mut self) -> Result<(), StoreError> {
+        self.inner.events().lock_log().await
+    }
     async fn append(&mut self, event: Event) -> Result<(), StoreError> {
         self.spy.appended.fetch_add(1, Ordering::SeqCst);
         self.inner.events().append(event).await
@@ -149,6 +161,15 @@ impl EventsRepo for SpyTx {
         limit: i64,
     ) -> Result<Vec<Event>, StoreError> {
         self.inner.events().of_card(card, kind, seq, limit).await
+    }
+    async fn of_run(
+        &mut self,
+        card: Uuid,
+        run: Uuid,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        self.inner.events().of_run(card, run, seq, limit).await
     }
 }
 

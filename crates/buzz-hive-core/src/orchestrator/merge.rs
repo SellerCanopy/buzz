@@ -62,7 +62,11 @@ pub async fn merge_card(
                     && !run
                         .current_stage
                         .as_deref()
-                        .and_then(|id| env.catalog.get(&run.workflow)?.stage(id))
+                        .and_then(|id| {
+                            env.catalog
+                                .pinned(&run.workflow, &run.workflow_hash)?
+                                .stage(id)
+                        })
                         .is_some_and(|(stage, _)| waiting_of(stage).is_some())
             }
             None => false,
@@ -148,7 +152,7 @@ async fn start_held(
     }
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     let facts = facts(tx, card, package, run.current_stage.as_deref()).await?;
     let stepped = step(&run, package, &facts, Input::Resume);
@@ -160,8 +164,8 @@ fn precondition(message: &str) -> IntakeError {
     OpError::FailedPrecondition(message.to_owned()).into()
 }
 
-/// Checks `repos` is the card's one repo, which is the only order a card with one repo has.
-/// Returns the card.
+/// Checks `repos` names every repo on the card once. Nothing is stored: the card has one pull
+/// request, in its first repo, so no order changes what merges. Returns the card.
 pub async fn set_merge_order(
     env: &Env<'_>,
     ctx: &Ctx,
@@ -175,8 +179,8 @@ pub async fn set_merge_order(
         .get(card_id)
         .await?
         .ok_or_else(|| OpError::NotFound(format!("card {card_id} does not exist")))?;
-    let issue = tx.issues().by_card(card_id).await?;
-    let own: Vec<String> = issue.iter().map(|row| row.issue.repo.to_string()).collect();
+    let mut own = super::repos::repos_of(&mut *tx, card_id).await?;
+    own.sort();
     let mut want = repos.to_vec();
     want.sort();
     if want != own {

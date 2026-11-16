@@ -89,6 +89,12 @@ impl PackageSource for BrokenSource {
 /// the next call.
 pub trait CatalogSource: Send + Sync {
     fn load(&self) -> crate::workflow::load::Catalog;
+
+    /// The packages people saved in the store, when this source reads them. Saving a
+    /// workflow refreshes them, so the next `load` sees it.
+    fn saved(&self) -> Option<&crate::workflow::saved::SavedPackages> {
+        None
+    }
 }
 
 /// A [`CatalogSource`] over a list of sources.

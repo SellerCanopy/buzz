@@ -65,6 +65,16 @@ pub trait CodeHost: Send + Sync {
         key: &str,
     ) -> Result<CommentId, HostError>;
 
+    /// Opens an issue carrying `key`. An open issue already carrying `key` is returned instead
+    /// of a second one, so a repeat after a failure files one issue.
+    async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        title: &str,
+        body: &str,
+        key: &str,
+    ) -> Result<Issue, HostError>;
+
     /// Opens a pull request, or returns the open one that already has `request.head` as its
     /// head, so a repeat after a failure opens one pull request. `key` names the call for
     /// an adapter that can remember it. `Rejected` means the host refused the request itself,

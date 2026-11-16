@@ -12,13 +12,16 @@ use buzz_hive_core::orchestrator::activity::{
     MAX_REJECTED_REASON_CHARS, MAX_SUMMARY_CHARS, MAX_WHY_CHARS,
 };
 use buzz_hive_core::orchestrator::artifacts::MAX_PLAN_ITEM_BYTES;
+use buzz_hive_core::orchestrator::assistant::MAX_MESSAGE_BYTES;
 use buzz_hive_core::orchestrator::cards::{
     MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
 };
+use buzz_hive_core::orchestrator::diagnose::{DEFAULT_EVENTS_LIMIT, MAX_EVENTS_LIMIT};
 use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
-    MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
+    ASSISTANT_RESULT, GET_WORKFLOW, MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE,
+    UPDATE_PLAN,
 };
 use serde_json::{json, Value};
 
@@ -141,6 +144,20 @@ pub const TOOLS: &[Tool] = &[
         schema: check_workflow,
     },
     Tool {
+        name: GET_WORKFLOW,
+        route: "GetWorkflowDraft",
+        needs: Level::Read,
+        description: "Read a workflow's files as text, with the hash to pass back as baseHash when you edit it. Pass text true.",
+        schema: get_workflow,
+    },
+    Tool {
+        name: "edit_workflow",
+        route: "EditWorkflow",
+        needs: Level::Read,
+        description: "Change a workflow, or make a new one. Give every file of the package as text: kiln-package.yaml and workflow.yaml, and any prompt files. Pass the baseHash get_workflow gave, or none for a new workflow. When the person you act for may run workflows, it is saved and the workflow changes for the cards that start next, and a card already running keeps the version it started with. Otherwise it is stored as a proposal for a person to save. A draft with an error is refused with the errors listed.",
+        schema: edit_workflow,
+    },
+    Tool {
         name: "list_agents",
         route: "ListAgents",
         needs: Level::Read,
@@ -253,16 +270,60 @@ pub const TOOLS: &[Tool] = &[
         schema: get_inbox,
     },
     Tool {
-        name: "get_hive_health",
-        route: "GetStatus",
+        name: ASSISTANT_RESULT,
+        route: "AssistantResult",
         needs: Level::Read,
-        description: "Read Beehive's version, the newest event number, the running card count and how many posts to the relay are waiting or have failed.",
+        description: "Report the result of an assistant job you were asked to do, once. Pass the jobId from the message that asked you, and a message for the person. For a workflow edit or a skill adaptation also give the whole package: name and every file as text. The package is stored as a proposal for the person to apply at their own level, and nothing is saved by this call. A package with an error is refused with the errors listed, so fix it and call again. Only the agent the job was given to may call it.",
+        schema: assistant_result,
+    },
+    Tool {
+        name: "get_hive_health",
+        route: "GetHiveHealth",
+        needs: Level::Read,
+        description: "Read whether Beehive itself looks well: runs that have sat in one stage too long, how many posts to the relay are waiting or have failed, and how long the oldest has waited. allowlistApplied is always \"unknown\" for now: do not treat it as a fault.",
         schema: no_arguments,
+    },
+    Tool {
+        name: "get_run_events",
+        route: "GetRunEvents",
+        needs: Level::Read,
+        description: "Read one run's events, oldest first, to find out what happened to it. Give nextSeq of the last reply as afterSeq to read on.",
+        schema: get_run_events,
+    },
+    Tool {
+        name: "report_diagnosis",
+        route: "ReportDiagnosis",
+        needs: Level::Run,
+        description: "Record your diagnosis of a run in its card's activity. Name the likely cause and quote what you read that shows it: at least one evidence quote is required, and a diagnosis without one is refused. List in gaps what you could not see.",
+        schema: report_diagnosis,
+    },
+    Tool {
+        name: "file_ticket",
+        route: "FileTicket",
+        needs: Level::Run,
+        description: "Report a fault. kind engine (Beehive) or ui (the app's screens) makes a Backlog card linked to the repos you name. kind code (the card's own code) holds a ticket for a person to accept, which then opens a GitHub issue on the card's repo, so give cardId. An open card or issue that already says the same gets your report as a note or comment instead of a second one.",
+        schema: file_ticket,
     },
 ];
 
 /// Routes that are deliberately not tools, each with the reason.
 pub const NOT_TOOLS: &[(&str, &str)] = &[
+    (
+        "GetStatus",
+        "the page's header counts; get_hive_health reports what an agent needs",
+    ),
+    (
+        "AddIssueRepo",
+        "a person links a repo to a card on the card page; an agent names repos in file_ticket",
+    ),
+    (
+        "RemoveIssueRepo",
+        "a person unlinks a repo on the card page",
+    ),
+    (
+        "AcceptTicketProposal",
+        "a person decides a ticket an agent proposed, so an agent never accepts its own",
+    ),
     (
         "PollEvents",
         "the board's live feed for a client; an agent reads get_card and list_runs",
@@ -277,11 +338,35 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "ListTemplateVariables",
-        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+        "an authoring aid for the workflow editor; an agent that edits a workflow reads get_workflow and checks with check_workflow",
     ),
     (
         "ListStageTemplates",
-        "an authoring aid for the workflow editor; the editing tools arrive with workflow saving",
+        "an authoring aid for the workflow editor; an agent that edits a workflow reads get_workflow and checks with check_workflow",
+    ),
+    (
+        "SaveWorkflow",
+        "a person's call from the editor; the engine refuses an agent, which uses edit_workflow and is held to a proposal unless its requester may run workflows",
+    ),
+    (
+        "DuplicateWorkflow",
+        "a person's call from the editor; the engine refuses an agent, which uses edit_workflow with the files of get_workflow under a new name",
+    ),
+    (
+        "DeleteWorkflow",
+        "a person's call from the editor; the engine refuses an agent, because a deleted workflow cannot be asked for again",
+    ),
+    (
+        "SetWorkflowOptions",
+        "a person's call from the editor; the engine refuses an agent, so a card's pauses and hand-offs stay a person's choice",
+    ),
+    (
+        "ExportWorkflow",
+        "a person's download from the editor; an agent reads get_workflow",
+    ),
+    (
+        "ImportWorkflow",
+        "a person's upload from the editor, a zip; an agent makes a workflow with edit_workflow",
     ),
     (
         "GetBrief",
@@ -402,6 +487,30 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
+    ),
+    (
+        "StartChat",
+        "a person's message from the assistant panel; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "StartProposeWorkflowEdit",
+        "a person's request from the workflow editor; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "StartAdaptSkills",
+        "a person's request from the workflow editor; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "CancelJob",
+        "a person's button on the assistant panel; the agent is told in the job's thread",
+    ),
+    (
+        "ListProposals",
+        "the person's own inbox of offers; an agent that proposes reads the reply of edit_workflow or assistant_result",
+    ),
+    (
+        "ResolveProposal",
+        "a person's decision on a proposal; an agent never decides for the person it proposed to",
     ),
 ];
 
@@ -797,6 +906,78 @@ fn record_decision() -> Value {
     )
 }
 
+fn get_run_events() -> Value {
+    object(
+        vec![
+            ("runId", string("The run's id.")),
+            (
+                "afterSeq",
+                json!({ "type": "integer", "description": "Read events after this seq. 0 reads from the start." }),
+            ),
+            (
+                "limit",
+                json!({ "type": "integer", "description": format!("At most this many, up to {MAX_EVENTS_LIMIT}. 0 means {DEFAULT_EVENTS_LIMIT}.") }),
+            ),
+        ],
+        &["runId"],
+    )
+}
+
+fn report_diagnosis() -> Value {
+    let evidence = json!({
+        "type": "object",
+        "properties": {
+            "source": { "type": "string", "description": "Where you read it, such as \"event 8812\"." },
+            "quote": { "type": "string", "description": "The words you read, copied exactly." },
+        },
+        "required": ["quote"],
+    });
+    object(
+        vec![
+            ("runId", string("The run's id.")),
+            (
+                "diagnosis",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "cause": string("One sentence naming the likely cause."),
+                        "stageId": string("The stage the fault is in. Empty if you cannot say."),
+                        "evidence": { "type": "array", "items": evidence, "description": "At least one quote." },
+                        "gaps": { "type": "array", "items": { "type": "string" }, "description": "What you could not see." },
+                    },
+                    "required": ["cause", "evidence"],
+                }),
+            ),
+        ],
+        &["runId", "diagnosis"],
+    )
+}
+
+fn file_ticket() -> Value {
+    object(
+        vec![
+            (
+                "kind",
+                json!({ "type": "string", "enum": ["engine", "ui", "code"], "description": "engine: Beehive is at fault. ui: the app's screens are. code: the card's own code is." }),
+            ),
+            ("title", string("One line naming the fault.")),
+            (
+                "body",
+                string("What happened, what you expected, and the evidence."),
+            ),
+            (
+                "repos",
+                json!({ "type": "array", "items": { "type": "string" }, "description": "owner/name of the repos it concerns. For code, the one repo of the card; empty means the card's first repo." }),
+            ),
+            (
+                "cardId",
+                string("The card whose code is at fault. Required for kind code."),
+            ),
+        ],
+        &["kind", "title", "body"],
+    )
+}
+
 fn read_history() -> Value {
     object(
         vec![
@@ -821,6 +1002,74 @@ fn check_workflow() -> Value {
             string("The workflow's name. Empty checks every workflow."),
         )],
         &[],
+    )
+}
+
+fn get_workflow() -> Value {
+    object(
+        vec![
+            ("name", string("The workflow's name.")),
+            (
+                "text",
+                json!({ "type": "boolean", "description": "Pass true: every file comes back as text in textFiles." }),
+            ),
+        ],
+        &["name", "text"],
+    )
+}
+
+fn edit_workflow() -> Value {
+    object(
+        vec![
+            (
+                "name",
+                string("The package name: 1 to 32 lower-case letters, digits, - and _. The same as the name in kiln-package.yaml."),
+            ),
+            (
+                "files",
+                json!({
+                    "type": "object",
+                    "description": "Every file of the package by path, as text. A file left out is removed.",
+                    "additionalProperties": { "type": "string" },
+                }),
+            ),
+            (
+                "baseHash",
+                string("The hash get_workflow gave. Empty makes a new workflow."),
+            ),
+        ],
+        &["name", "files"],
+    )
+}
+
+fn assistant_result() -> Value {
+    object(
+        vec![
+            ("jobId", string("The job id the message that asked you named.")),
+            (
+                "message",
+                string(&format!(
+                    "What you say to the person, at most {MAX_MESSAGE_BYTES} bytes."
+                )),
+            ),
+            (
+                "name",
+                string("The package name, when you offer a workflow: the same as the name in kiln-package.yaml."),
+            ),
+            (
+                "files",
+                json!({
+                    "type": "object",
+                    "description": "Every file of the offered package by path, as text.",
+                    "additionalProperties": { "type": "string" },
+                }),
+            ),
+            (
+                "baseHash",
+                string("The hash get_workflow gave for the package. Empty for a new one."),
+            ),
+        ],
+        &["jobId", "message"],
     )
 }
 
@@ -941,6 +1190,7 @@ mod tests {
         has("read_history", &MAX_HISTORY_LIMIT);
         has("read_history", &DEFAULT_HISTORY_LIMIT);
         has("ask_gate", &MAX_TEXT_CHARS);
+        has("assistant_result", &MAX_MESSAGE_BYTES);
     }
 
     #[test]
@@ -951,6 +1201,8 @@ mod tests {
             SAVE_ARTIFACT,
             UPDATE_PLAN,
             MOVE_CARD,
+            ASSISTANT_RESULT,
+            GET_WORKFLOW,
         ] {
             assert!(
                 TOOLS.iter().any(|t| t.name == name),

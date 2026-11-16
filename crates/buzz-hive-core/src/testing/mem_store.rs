@@ -12,11 +12,12 @@ use crate::domain::timer::{Timer, TimerKind};
 use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
-    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, OutboxBacklog,
-    OutboxRepo, OutboxRow, PersonInfo, Posting, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo,
-    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
-    WorkflowsRepo, MESSAGE_KINDS,
+    AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardReposRepo,
+    CardsRepo, CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job,
+    JobState, JobsRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting,
+    Proposal, ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo,
+    StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -48,6 +49,13 @@ struct State {
     issue_seen:
         std::collections::BTreeMap<(CommunityId, String, u64), chrono::DateTime<chrono::Utc>>,
     pulls: std::collections::BTreeMap<(CommunityId, uuid::Uuid), PullRequest>,
+    /// Proposals in creation order, with the time each was resolved.
+    proposals: Vec<(CommunityId, Proposal, bool)>,
+    next_proposal_id: i64,
+    /// In the order added.
+    card_repos: Vec<(CommunityId, uuid::Uuid, String)>,
+    /// In creation order, each with when it ends as failed.
+    jobs: Vec<(CommunityId, Job, Option<chrono::DateTime<chrono::Utc>>)>,
 }
 
 #[derive(Clone)]
@@ -82,6 +90,25 @@ pub struct MemStore {
     state: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
     clock: Arc<dyn Clock>,
+    /// How many reads of the kept workflow versions, and how many commits, still fail, for a
+    /// test of a store that cannot be reached.
+    failures: Arc<Failures>,
+}
+
+#[derive(Default)]
+struct Failures {
+    kept_versions: std::sync::atomic::AtomicUsize,
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl Failures {
+    /// Uses up one failure of `counter`, and says whether there was one.
+    fn take(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        counter
+            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+    }
 }
 
 impl Default for MemStore {
@@ -101,7 +128,22 @@ impl MemStore {
             state: Arc::default(),
             log: Arc::default(),
             clock,
+            failures: Arc::default(),
         }
+    }
+
+    /// Makes the next `times` reads of the kept workflow versions fail as unavailable.
+    pub fn fail_kept_versions(&self, times: usize) {
+        self.failures
+            .kept_versions
+            .store(times, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next `times` commits fail as unavailable, and change nothing.
+    pub fn fail_next_commits(&self, times: usize) {
+        self.failures
+            .commits
+            .store(times, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Puts a card on a community's board, as the newest. Later phases create cards through routes.
@@ -127,6 +169,7 @@ impl Store for MemStore {
             shared: self.state.clone(),
             log: self.log.clone(),
             clock: self.clock.clone(),
+            failures: self.failures.clone(),
         }))
     }
 }
@@ -141,6 +184,7 @@ struct MemTx {
     shared: Arc<Mutex<State>>,
     log: Arc<Mutex<Log>>,
     clock: Arc<dyn Clock>,
+    failures: Arc<Failures>,
 }
 
 #[async_trait::async_trait]
@@ -187,6 +231,15 @@ impl Tx for MemTx {
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo {
         self
     }
+    fn proposals(&mut self) -> &mut dyn ProposalsRepo {
+        self
+    }
+    fn card_repos(&mut self) -> &mut dyn CardReposRepo {
+        self
+    }
+    fn jobs(&mut self) -> &mut dyn JobsRepo {
+        self
+    }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
         self.savepoints
             .push((self.work.clone(), self.pending.len()));
@@ -216,7 +269,11 @@ impl Tx for MemTx {
             shared,
             log,
             clock: _,
+            failures,
         } = *self;
+        if Failures::take(&failures.commits) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
         *shared.lock().unwrap() = work;
         let mut log = log.lock().unwrap();
         let mut committed = Vec::with_capacity(pending.len());
@@ -232,6 +289,12 @@ impl Tx for MemTx {
 
 #[async_trait::async_trait]
 impl EventsRepo for MemTx {
+    /// Transactions here work on a copy and never wait on each other, so there is nothing to
+    /// take. The Postgres tests show the lock holds.
+    async fn lock_log(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     async fn append(&mut self, event: Event) -> Result<(), StoreError> {
         check_new(&event.kind, &event.payload).map_err(|e| StoreError::Conflict(e.to_string()))?;
         self.pending.push(event);
@@ -275,6 +338,28 @@ impl EventsRepo for MemTx {
                     && event.seq > seq
                     && event.kind == kind
                     && event.card_id == Some(card)
+            })
+            .take(limit.max(0) as usize)
+            .map(|(_, event)| event.clone())
+            .collect())
+    }
+
+    async fn of_run(
+        &mut self,
+        card: uuid::Uuid,
+        run: uuid::Uuid,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let log = self.log.lock().unwrap();
+        Ok(log
+            .events
+            .iter()
+            .filter(|(community, event)| {
+                *community == self.community
+                    && event.seq > seq
+                    && event.card_id == Some(card)
+                    && event.run_id == Some(run)
             })
             .take(limit.max(0) as usize)
             .map(|(_, event)| event.clone())
@@ -776,14 +861,19 @@ impl OutboxRepo for MemTx {
             .outbox
             .iter()
             .filter(|(c, row)| *c == self.community && row.done_at.is_none());
-        let (mut pending, mut failed) = (0, 0);
+        let (mut pending, mut failed, mut oldest) = (0, 0, None);
         for (_, row) in waiting {
             pending += 1;
             if row.attempts > 0 {
                 failed += 1;
             }
+            oldest = oldest.min(Some(row.created_at)).or(Some(row.created_at));
         }
-        Ok(OutboxBacklog { pending, failed })
+        Ok(OutboxBacklog {
+            pending,
+            failed,
+            oldest,
+        })
     }
 
     async fn by_key(&mut self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
@@ -855,6 +945,9 @@ impl CardsRepo for MemTx {
             .inbox
             .retain(|(c, i)| !(*c == community && i.card_id == id));
         self.work.pulls.remove(&(community, id));
+        self.work
+            .card_repos
+            .retain(|(c, card, _)| !(*c == community && *card == id));
         Ok(())
     }
 }
@@ -927,6 +1020,316 @@ impl WorkflowsRepo for MemTx {
             .options
             .insert((self.community, name.to_owned()), options.clone());
         Ok(())
+    }
+
+    async fn save_version(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        hash: &str,
+        body: serde_json::Value,
+        _created_by: &str,
+    ) -> Result<(), StoreError> {
+        let key = (self.community, name.to_owned());
+        match (self.work.packages.get(&key), base) {
+            (None, None) => {}
+            (Some((false, current)), Some(base)) if current == base => {}
+            _ => {
+                return Err(StoreError::Conflict(
+                    "the workflow changed since you opened it; reload and try again".into(),
+                ))
+            }
+        }
+        self.work
+            .versions
+            .entry((self.community, name.to_owned(), hash.to_owned()))
+            .or_insert(body);
+        self.work.packages.insert(key, (false, hash.to_owned()));
+        Ok(())
+    }
+
+    async fn delete_package(&mut self, name: &str) -> Result<(), StoreError> {
+        let key = (self.community, name.to_owned());
+        self.work.options.remove(&key);
+        self.work
+            .packages
+            .remove(&key)
+            .map(|_| ())
+            .ok_or_else(|| StoreError::NotFound(format!("workflow {name} is not stored")))
+    }
+
+    async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError> {
+        if Failures::take(&self.failures.kept_versions) {
+            return Err(StoreError::Unavailable("the store is down".into()));
+        }
+        let community = self.community;
+        let active: Vec<(String, String)> = self
+            .work
+            .runs
+            .iter()
+            .filter(|(c, run)| *c == community && run.state != RunState::Ended)
+            .map(|(_, run)| (run.workflow.clone(), run.workflow_hash.clone()))
+            .collect();
+        let mut kept = Vec::new();
+        for ((c, name, hash), body) in &self.work.versions {
+            if *c != community {
+                continue;
+            }
+            let package = self.work.packages.get(&(community, name.clone()));
+            let current = package.is_some_and(|(_, current)| current == hash);
+            let builtin = package.is_some_and(|(builtin, _)| *builtin);
+            let used = active.iter().any(|(n, h)| n == name && h == hash);
+            if (current && !builtin) || used {
+                kept.push(KeptVersion {
+                    name: name.clone(),
+                    hash: hash.clone(),
+                    body: body.clone(),
+                    current,
+                    builtin,
+                });
+            }
+        }
+        Ok(kept)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProposalsRepo for MemTx {
+    async fn insert(
+        &mut self,
+        kind: &str,
+        body: serde_json::Value,
+        requester: &str,
+    ) -> Result<i64, StoreError> {
+        self.work.next_proposal_id += 1;
+        let id = self.work.next_proposal_id;
+        let proposal = Proposal {
+            id,
+            kind: kind.to_owned(),
+            body,
+            requester: requester.to_owned(),
+        };
+        self.work.proposals.push((self.community, proposal, false));
+        Ok(id)
+    }
+
+    async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .filter(|(c, p, resolved)| *c == self.community && p.kind == kind && !resolved)
+            .map(|(_, p, _)| p.clone())
+            .collect())
+    }
+
+    async fn open_all(&mut self) -> Result<Vec<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .filter(|(c, _, resolved)| *c == self.community && !resolved)
+            .map(|(_, p, _)| p.clone())
+            .collect())
+    }
+
+    async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .find(|(c, p, _)| *c == self.community && p.id == id)
+            .map(|(_, p, _)| p.clone()))
+    }
+
+    async fn resolve(&mut self, id: i64) -> Result<bool, StoreError> {
+        let community = self.community;
+        let open = self
+            .work
+            .proposals
+            .iter_mut()
+            .find(|(c, p, resolved)| *c == community && p.id == id && !resolved);
+        Ok(open.map(|(_, _, resolved)| *resolved = true).is_some())
+    }
+
+    async fn reopen(&mut self, id: i64) -> Result<bool, StoreError> {
+        let community = self.community;
+        let decided = self
+            .work
+            .proposals
+            .iter_mut()
+            .find(|(c, p, resolved)| *c == community && p.id == id && *resolved);
+        Ok(decided.map(|(_, _, resolved)| *resolved = false).is_some())
+    }
+}
+
+#[async_trait::async_trait]
+impl CardReposRepo for MemTx {
+    async fn of_card(&mut self, card: uuid::Uuid) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .work
+            .card_repos
+            .iter()
+            .filter(|(c, id, _)| *c == self.community && *id == card)
+            .map(|(_, _, repo)| repo.clone())
+            .collect())
+    }
+
+    async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError> {
+        let community = self.community;
+        if self.find(card).is_none() {
+            return Err(StoreError::NotFound(format!("card {card}")));
+        }
+        if self
+            .work
+            .card_repos
+            .iter()
+            .any(|(c, id, have)| *c == community && *id == card && have == repo)
+        {
+            return Err(StoreError::Conflict(format!(
+                "{repo} is already on the card"
+            )));
+        }
+        self.work
+            .card_repos
+            .push((community, card, repo.to_owned()));
+        Ok(())
+    }
+
+    async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError> {
+        let community = self.community;
+        let before = self.work.card_repos.len();
+        self.work
+            .card_repos
+            .retain(|(c, id, have)| !(*c == community && *id == card && have == repo));
+        Ok(self.work.card_repos.len() < before)
+    }
+}
+
+impl MemTx {
+    /// `Conflict` when a running job other than `id` works in the thread `root`.
+    fn check_thread_free(&self, id: uuid::Uuid, root: Option<&String>) -> Result<(), StoreError> {
+        let taken = root.is_some_and(|root| {
+            self.work.jobs.iter().any(|(c, j, _)| {
+                *c == self.community
+                    && j.id != id
+                    && j.state == JobState::Running
+                    && j.root_event_id.as_ref() == Some(root)
+            })
+        });
+        if taken {
+            return Err(StoreError::Conflict("that already exists".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl JobsRepo for MemTx {
+    async fn insert(
+        &mut self,
+        job: &Job,
+        deadline_in: Option<std::time::Duration>,
+    ) -> Result<(), StoreError> {
+        let taken = self
+            .work
+            .jobs
+            .iter()
+            .any(|(c, j, _)| *c == self.community && j.id == job.id);
+        if taken {
+            return Err(StoreError::Conflict("that already exists".into()));
+        }
+        if job.state == JobState::Running {
+            self.check_thread_free(job.id, job.root_event_id.as_ref())?;
+        }
+        let deadline = deadline_in.map(|after| {
+            self.clock.now() + chrono::Duration::from_std(after).expect("a duration that fits")
+        });
+        self.work.jobs.push((self.community, job.clone(), deadline));
+        Ok(())
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Job>, StoreError> {
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .find(|(c, j, _)| *c == self.community && j.id == id)
+            .map(|(_, j, _)| j.clone()))
+    }
+
+    async fn latest_in_thread(&mut self, root: &str) -> Result<Option<Job>, StoreError> {
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .rev()
+            .find(|(c, j, _)| *c == self.community && j.root_event_id.as_deref() == Some(root))
+            .map(|(_, j, _)| j.clone()))
+    }
+
+    async fn set_root(&mut self, id: uuid::Uuid, root: &str) -> Result<(), StoreError> {
+        self.check_thread_free(id, Some(&root.to_owned()))?;
+        let community = self.community;
+        if let Some((_, job, _)) = self
+            .work
+            .jobs
+            .iter_mut()
+            .find(|(c, j, _)| *c == community && j.id == id)
+        {
+            job.root_event_id = Some(root.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        id: uuid::Uuid,
+        state: JobState,
+        _result: Option<serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        if let Some((_, job, _)) = self
+            .work
+            .jobs
+            .iter_mut()
+            .find(|(c, j, _)| *c == community && j.id == id && j.state == JobState::Running)
+        {
+            job.state = state;
+        }
+        Ok(())
+    }
+
+    async fn overdue(&mut self, limit: i64) -> Result<Vec<Job>, StoreError> {
+        let now = self.clock.now();
+        let mut late: Vec<_> = self
+            .work
+            .jobs
+            .iter()
+            .filter(|(c, j, at)| {
+                *c == self.community
+                    && j.state == JobState::Running
+                    && at.is_some_and(|at| at <= now)
+            })
+            .collect();
+        late.sort_by_key(|(_, j, at)| (*at, j.id));
+        Ok(late
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(0))
+            .map(|(_, j, _)| j.clone())
+            .collect())
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let now = self.clock.now();
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .filter(|(c, j, _)| *c == self.community && j.state == JobState::Running)
+            .filter_map(|(_, _, at)| *at)
+            .min()
+            .map(|at| (at - now).to_std().unwrap_or_default()))
     }
 }
 

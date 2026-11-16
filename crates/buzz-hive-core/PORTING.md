@@ -68,7 +68,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `api` | 23 | pending | unassigned |
 | `cmd/carrier-runner` | 1 | dropped (local runner) | 1 |
 | `cmd/kiln-engine` | 88 | pending | unassigned |
-| `core/assistant` | 15 | pending | 20 |
+| `core/assistant` | 15 | changed (Phase 20: the assistant is a Buzz agent. `StartChat`, `StartProposeWorkflowEdit` and `StartAdaptSkills` open a job in `orchestrator/assistant.rs`, mention the agent named by the `assistant_agent` setting in the update channel, and return a job id. The agent reports once with the `assistant_result` tool, and the result reaches the client as one `job.result` event on `PollEvents`. A workflow it offers is a `hive.proposals` row for the requester, applied with `SaveWorkflow`. The Go prompt building, streaming and conversation store are not ported) | 20 |
 | `core/background` | 9 | changed (Phase 18: `background/pull_requests.rs` decides which cards are read and when, and `buzz-hive/src/intake.rs` runs it beside the comment loop. The rest of the Go background jobs are not ported) | 18 |
 | `core/config` | 1 | ported | 6 |
 | `core/domain` | 12 | pending | unassigned |
@@ -107,7 +107,7 @@ spec's title and are confirmed when that phase starts.
 | `answers` | changed (Phase 12 answers an approval with Approve or Reject and a reason, a `needs_input` result with a reply, and the other items with retry, skip, stop or dismiss, in `tests/inbox.rs`, `buzz-hive-api/tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`. The Go spec's permission requests and its field and multi-question forms are not ported: `AnswerInbox` refuses `values_json` and `answers`) | 12 |
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
 | `artifacts` | changed (Phase 9 ports the contract: save, versions, read, hand-off, the stage-declared outputs rule and the task message naming inputs, in `tests/artifacts.rs` and `buzz-hive-api/tests/artifacts.rs`. The Go spec's approval and image-review screens are not ported; buzz-app `e2e` carries the Files tab) | 9 |
-| `assistant` | pending | 20 |
+| `assistant` | changed (Phase 20: the contract is ported in `buzz-hive-api/tests/assistant.rs`, `buzz-hive-core/tests/event_coverage.rs`, `buzz-hive/tests/timer_loop.rs` and `buzz-hive-store/tests/postgres_jobs.rs`: a job result is one event, a dropped poll resumes, a cancelled job ends with none, a result from another agent is refused, a stale job ends failed and a thread runs one job. The Go spec's streamed answer, attachments and conversation list are not ported, and a script-agent end to end run is deferred) | 20 |
 | `auto-mode` | changed (Phase 13 ports the contract: a card in auto mode has its approval gates approved when every listed artifact has a saved version, a failed run started again twice and a stage with no result asked to carry on twice, each with its reason in Activity, and a loop that is never unbounded. The Go spec's cost-cap cases, its Ask recommendations and forms and its paused-turn reply are dropped, see the Phase 13 deliverables. The Switch and the Activity entry are covered in buzz-app `ActivityTab.test.tsx` and `BeehivePage.test.tsx`) | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
 | `boot` | pending | 3 |
@@ -132,12 +132,12 @@ spec's title and are confirmed when that phase starts.
 | `parameters` | changed (Phase 8: `StartStage` accepts the parameters a stage declares, refuses an undeclared one, and keeps them on the run. The spec's card form that saves and reads parameters back is not ported: a card made from an issue starts with no parameters) | 16 |
 | `paused-turn` | changed (a result of `needs_input`, or a stage that ends with no result, now sets the card waiting with the reason in a `card.state` event, Phase 8; Phase 12 opens the Needs you item that a reply finishes, in `tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`) | 12 |
 | `permissions` | changed (Phase 14 ports the contract against Beehive levels: an admin sets a person's or an agent's level, the engine then allows and refuses to match, and Settings lists the same levels. Kiln's permission asks are dropped, Buzz owns permissions. Covered by buzz-app `e2e/permissions.spec.mjs`) | 14 |
-| `pick-repo` | pending | 21 |
+| `pick-repo` | changed (Phase 21: a card with no repo gets its first with `AddIssueRepo`, which makes it the repo the card runs in; the spec's start-the-stage-and-close-the-item flow is the existing `StartStage` and the Needs you answer, and the Repos tab itself is in buzz-app) | 21 |
 | `plugin-command` | dropped (plugins) | 1 |
 | `plugin-contents` | dropped (plugins) | 1 |
 | `prompt-skill` | dropped (prompt skills) | 1 |
 | `remove` | pending | 4 |
-| `repos` | pending | 21 |
+| `repos` | changed (Phase 21: `AddIssueRepo` and `RemoveIssueRepo` in `buzz-hive-api/tests/diagnose.rs`, over `FakeCodeHost`. The spec's reorder is not ported: the merge order is the order added, see the Phase 21 section) | 21 |
 | `reset` | pending | 17 |
 | `runners` | dropped (runner pairing, stages run on Buzz agents) | 1 |
 | `select` | pending | 5 |
@@ -604,3 +604,88 @@ spec's title and are confirmed when that phase starts.
   pause and skip of a wait, the rpi workflow resolving), `rules/wait.rs` units; api
   `tests/merge.rs`; store `tests/postgres_pull_requests.rs` and `postgres_runs.rs`; binary
   `tests/github_adapter.rs` and `tests/intake_loop.rs` (paused time).
+
+## Phase 20: the assistant's jobs
+
+- Migration `0018_assistant_jobs.sql` makes `hive.jobs`. A job has a kind, a requester, the
+  agent that may report it, the thread (`root_event_id`) and a `deadline`. A partial unique
+  index allows one running job per thread.
+- No conversation id: the first job's `root_event_id` names the thread, and a later chat turn
+  is a new job whose request names that root.
+- Beehive posts the mention and the reply straight through the `Relay` port, not the outbox,
+  because `hive.outbox.card_id` is not null.
+- Served: `StartChat`, `StartProposeWorkflowEdit`, `StartAdaptSkills`, `CancelJob`,
+  `ListProposals`, `ResolveProposal` and the tool `assistant_result`. All are Read: every
+  result is only a proposal, and `SaveWorkflow` checks the person's own level.
+- Dropped: `WatchEvents`, `ProposeWorkflowEdit`, `AdaptSkills` and `Chat` (the streaming
+  calls), and `ListConversations`, `GetConversation` and `DeleteConversation` (the thread in
+  Buzz is the conversation).
+- Events: `job.started` and `job.result`. A job that runs out of time ends `failed` with one
+  `job.result`, from the timer loop's sweep.
+
+## Phase 21: agents diagnose failed runs, and a card's repos
+
+- Migration `0019_card_repos.sql` makes `hive.card_repos (community_id, card_id, repo, seq)`. A
+  card's repos are its issue's repo first, then these in the order added. `seq` is an identity
+  column, so a repo added after a middle one was removed goes last and never takes a place.
+- **A card with several repos still runs in the first repo** (design question 12, followed as
+  the plan says). The first repo is the issue's, or for a card with no issue the first added.
+  `Facts.repo` drives the pull request, so one pull request opens, in that repo. The other repos
+  are linked context: the stage task names them as "context to read, not a place to change".
+- Served: `AddIssueRepo`, `RemoveIssueRepo` and `AcceptTicketProposal` (Run), and the tools
+  `get_run_events` (Read), `get_hive_health` (Read), `report_diagnosis` (Run) and `file_ticket`
+  (Run). `AddIssueRepo` and `RemoveIssueRepo` take the card id as a UUID string, since Beehive
+  ids are not integers. The three routes are not tools: an agent does not widen what a card
+  works on, and a ticket is accepted by a person.
+- A new event kind `card.repos` (Phase 21) tells the UI the card's repos changed.
+- `file_ticket` kinds: `engine` and `ui` faults become a Backlog card linked to the named repos,
+  with no GitHub issue. A `code` fault names a card and one of its repos and becomes a
+  proposal; a person's `AcceptTicketProposal` opens the issue and imports it. Both first look
+  for the same fault: an open card with the same title gets a note, an open issue on the
+  repos gets a comment, and no second card is made.
+- `base` on `AddIssueRepo` is checked as a branch name and not stored: a card's branch is made
+  from the repo's default branch (Phase 17), so a per-repo base has nothing to feed.
+
+### Multirepo tests from `scenario_multirepo_test.go`
+
+Ported (Beehive tests in `buzz-hive-api/tests/diagnose.rs` and
+`buzz-hive-store/tests/postgres_card_repos.rs`): a missing or forbidden repo writes no row (the
+host answers not found for both); adding a repo already there or a malformed one is refused
+(`web`, empty, `a/b/c`, `a/..`, `../web`, `a/b?x`); removing the main repo while others remain,
+or a repo the card lacks, is refused; repos are frozen while a run is active; adding after
+removing a middle repo keeps the order unique; a card with no issue takes its first repo as
+main and the second after it; a bare name and an unknown repo are refused; removing the last
+repo returns the card to none; a bad base is refused before the host is asked; remove is
+refused while the issue lists the repo, and while the repo has an open pull request.
+
+Not ported, each with its decision:
+
+| Go test | decision |
+|---|---|
+| `AddingARepoPreparesAWorktreeInEach`, `AStartFailureInTheSecondRepoFailsTheStage`, `ARefusedRemovalLeavesTheWorktreeAlone` | dropped: a card has no folder on the engine, so no worktree is prepared (Phase 17) |
+| `AgentNarrowsTheRepos`, `AReportNamingAnUnknownRepoChangesNothing`, `AReportCanWidenTheRepos`, `ANarrowedReportKeepsTheMainRepo`, `AOneRepoCardIgnoresTheReposField` | dropped: a stage report does not carry a repo list, since only the first repo is worked in |
+| `OpenPullRequestOpensOnePerRepoAndLinksThem`, `ARepoWithNoCommitsGetsNoPullRequest`, the `OpenPullRequest*Retry*` pair, `OpenPullRequestFailsWhenNoRepoHasCommits`, `OpenPullRequestSkipsADroppedRepo`, `ADroppedRepoWithAPullRequestStillGetsMarkReady`, `PullRequestActionsNameEveryFailingRepo` | dropped: one pull request, in the first repo (question 12) |
+| `CopyArtifactAndRunCommandTakeARepo` | dropped: both act in the card's one repo |
+| `WaitForCIChecksEveryPullRequest`, `WaitForCIStaysPendingWhileOneRepoIsPending`, `PullRequestWaitReadsEveryPullRequest` | dropped: one pull request is waited on |
+| `MergeFollowsTheOrderAndStopsAtTheFirstFailure`, the `SetMergeOrder*` tests, `TheClosesLinkFollowsTheMergeOrder` | dropped: one pull request merges, and the merge order is the order added. `SetMergeOrder` still accepts the card's repos in any order and stores nothing (Phase 18); it now compares with all the card's repos, so a card with several repos is no longer refused |
+| `SyncBaseNamesEveryConflictingRepo`, `SyncBaseStillSyncsTheCleanRepo`, `ASyncWaitsForAnActiveRun` | dropped: no worktree to sync |
+| `CleanupKeepsReposWithUnpushedCommitsAndRetryRemovesTheRest`, `CleanupKeepsTheBranchWhereAPullRequestIsOpen` | dropped: no worktree to clean (Phase 17) |
+| `ReviewCommentsOnEveryRepoReachTheAgentWithTheirRepo`, the `Reply*` tests, `BannerLinksTheFirstPullRequestWhenTheMainRepoHasNone` | dropped: review comments and the banner belong to the one pull request |
+| `IntakeAddsTheReposAnIssueListsBeforeAnyStage`, the `FrontMatter*` tests, `StageStartAddsNoRepoTheIssueFrontMatterLists` | dropped: Beehive does not read repos from an issue's front matter; a person or the intake rule names them |
+| The `LocalIssue` tests | ported as the card with no issue, which is Beehive's only local card |
+| `ARepoWithItsOwnBaseBranchesFromItAndOpensItsPullRequestAgainstIt` | dropped: `base` is checked and not stored |
+| Go `repos_test.go`: `SyncIssueRepos*`, `DropWorktree`, `RepoFailures`, `RemovalAndAWorktreeStartTakeTheIssueLockInTurn` | dropped: the sync and the worktree lock go with the worktrees. `ParseRepo`, `ParseCardRepoMatchesTheRepoACardHas` and `RemovalRefusalOnAKilnTask` are covered by `RepoRef::parse` and the removal refusals |
+
+### Deviations
+
+- Duplicate search is a normalized title match (lowercase, whitespace collapsed) over the open
+  cards and the first 100 open issues of each named repo, not the host's search syntax.
+- The plan's "listener lag" in `get_hive_health` is the age of the oldest unsent outbox post,
+  since the relay listener was dropped in Phase 12. `allowlist_applied` is `"unknown"` until
+  Phase 22.
+- `AcceptTicketProposal` reads the open proposals, so a proposal that was accepted is not
+  found again.
+- `set_merge_order` compared against the issue's repo only, which a card with a second repo
+  could never satisfy. It now compares against all the card's repos.
+- `OpenProposal` gained a `ticket` field so `ListProposals` shows the tickets waiting.
+

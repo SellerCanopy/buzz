@@ -33,7 +33,7 @@ pub const HOST: &str = "github.com";
 const MAX_COMMENTS: usize = 100;
 
 /// Refuses a host the service does not read. An empty host means [`HOST`].
-fn check_host(host: &str) -> Result<(), HiveError> {
+pub(super) fn check_host(host: &str) -> Result<(), HiveError> {
     if host.is_empty() || host.eq_ignore_ascii_case(HOST) {
         return Ok(());
     }
@@ -145,7 +145,7 @@ fn rule_to_proto(rule: IntakeRule) -> ProtoRule {
     }
 }
 
-fn issue_ref(repo: &RepoRef, number: u64) -> IssueRef {
+pub(super) fn issue_ref(repo: &RepoRef, number: u64) -> IssueRef {
     IssueRef {
         host: HOST.to_owned(),
         owner: repo.owner.clone(),

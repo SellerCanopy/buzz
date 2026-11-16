@@ -63,6 +63,9 @@ pub trait Tx: Send {
     fn intake(&mut self) -> &mut dyn IntakeRepo;
     fn issues(&mut self) -> &mut dyn IssuesRepo;
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
+    fn proposals(&mut self) -> &mut dyn ProposalsRepo;
+    fn card_repos(&mut self) -> &mut dyn CardReposRepo;
+    fn jobs(&mut self) -> &mut dyn JobsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -136,6 +139,10 @@ pub trait EventsRepo: Send {
     /// Adds an event to the log. The kind must pass [`crate::domain::events::check_new`].
     /// The seq is assigned by the store and returned by `Tx::commit`.
     async fn append(&mut self, event: Event) -> Result<(), StoreError>;
+    /// Takes the community's log lock until commit, as the first `append` does, so what is read
+    /// after it is not changed by another writer before this transaction commits. Filing a
+    /// fault takes it before it looks for a duplicate.
+    async fn lock_log(&mut self) -> Result<(), StoreError>;
     /// Committed events with seq greater than `seq`, oldest first, at most `limit`.
     async fn after(&mut self, seq: i64, limit: i64) -> Result<Vec<Event>, StoreError>;
     /// The newest committed seq of this community, 0 when there is none.
@@ -146,6 +153,15 @@ pub trait EventsRepo: Send {
         &mut self,
         card: uuid::Uuid,
         kind: &str,
+        seq: i64,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError>;
+    /// A run's committed events with seq greater than `seq`, oldest first, at most `limit`.
+    /// `card` is the run's card, which narrows the read.
+    async fn of_run(
+        &mut self,
+        card: uuid::Uuid,
+        run: uuid::Uuid,
         seq: i64,
         limit: i64,
     ) -> Result<Vec<Event>, StoreError>;
@@ -237,6 +253,158 @@ pub trait WorkflowsRepo: Send {
         name: &str,
         options: &WorkflowOptions,
     ) -> Result<(), StoreError>;
+    /// Stores a person's version of a package and makes it current, when the package is
+    /// still at `base`. `None` makes a new package, which fails when the name has one.
+    /// `Conflict` when the package is not at `base`, or is a built-in.
+    async fn save_version(
+        &mut self,
+        name: &str,
+        base: Option<&str>,
+        hash: &str,
+        body: serde_json::Value,
+        created_by: &str,
+    ) -> Result<(), StoreError>;
+    /// Removes a package and its options. Its versions stay, so a run that started on one
+    /// keeps it. `NotFound` when there is no such package.
+    async fn delete_package(&mut self, name: &str) -> Result<(), StoreError>;
+    /// The versions the engine must be able to load without reading the store again: each
+    /// person's current package, and every version a run that has not ended started on.
+    async fn kept_versions(&mut self) -> Result<Vec<KeptVersion>, StoreError>;
+}
+
+/// One stored package version the catalog keeps loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptVersion {
+    pub name: String,
+    pub hash: String,
+    /// The package's files by path.
+    pub body: serde_json::Value,
+    /// This is the package's current version.
+    pub current: bool,
+    /// The package ships with the build.
+    pub builtin: bool,
+}
+
+/// What an agent offered that a person has not decided yet, such as a workflow edit the
+/// agent's requester was not allowed to save.
+#[async_trait::async_trait]
+pub trait ProposalsRepo: Send {
+    /// Stores an open proposal and returns its id.
+    async fn insert(
+        &mut self,
+        kind: &str,
+        body: serde_json::Value,
+        requester: &str,
+    ) -> Result<i64, StoreError>;
+    /// Every proposal of `kind` that is still open, oldest first.
+    async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError>;
+    /// Every open proposal, whatever its kind, oldest first.
+    async fn open_all(&mut self) -> Result<Vec<Proposal>, StoreError>;
+    /// The proposal, open or resolved.
+    async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError>;
+    /// Marks an open proposal decided. `false` when it is gone or was decided already.
+    async fn resolve(&mut self, id: i64) -> Result<bool, StoreError>;
+    /// Makes a decided proposal open again, for a decision that was claimed and then failed.
+    /// `false` when it is gone or is open already.
+    async fn reopen(&mut self, id: i64) -> Result<bool, StoreError>;
+}
+
+/// The repos a card works in besides its issue's, in the order they were added.
+#[async_trait::async_trait]
+pub trait CardReposRepo: Send {
+    /// The card's added repos, first added first.
+    async fn of_card(&mut self, card: uuid::Uuid) -> Result<Vec<String>, StoreError>;
+    /// Adds `repo` after the card's others. `Conflict` when the card has it already.
+    async fn add(&mut self, card: uuid::Uuid, repo: &str) -> Result<(), StoreError>;
+    /// Drops `repo`. `false` when the card did not have it.
+    async fn remove(&mut self, card: uuid::Uuid, repo: &str) -> Result<bool, StoreError>;
+}
+
+/// Where a job stands. A job leaves `Running` once and never returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Done,
+    Cancelled,
+    Failed,
+}
+
+impl JobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "cancelled" => Self::Cancelled,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// One piece of work the assistant agent does for a person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: uuid::Uuid,
+    /// `chat`, `propose_workflow_edit` or `adapt_skills`.
+    pub kind: String,
+    /// The person the job is for, who may read its result and apply what it proposes.
+    pub requester: Pubkey,
+    pub state: JobState,
+    pub channel: uuid::Uuid,
+    /// The thread the agent works in. Empty until the post that opens it is made.
+    pub root_event_id: Option<String>,
+    /// The only account that may report the job's result.
+    pub agent: Pubkey,
+}
+
+/// The assistant's jobs.
+#[async_trait::async_trait]
+pub trait JobsRepo: Send {
+    /// Stores a running job. It ends as failed once `deadline_in` has passed, or never when
+    /// that is `None`. `Conflict` when a job already runs in the job's thread.
+    async fn insert(
+        &mut self,
+        job: &Job,
+        deadline_in: Option<std::time::Duration>,
+    ) -> Result<(), StoreError>;
+    /// The job, held until the transaction ends so a result, a cancel and an expiry queue.
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Job>, StoreError>;
+    /// The newest job that worked in the thread `root`, whatever its state.
+    async fn latest_in_thread(&mut self, root: &str) -> Result<Option<Job>, StoreError>;
+    /// Records the thread a job's first post opened.
+    async fn set_root(&mut self, id: uuid::Uuid, root: &str) -> Result<(), StoreError>;
+    /// Ends a running job with the result it reported, or `None` when it has none. Nothing
+    /// happens to a job that already ended.
+    async fn finish(
+        &mut self,
+        id: uuid::Uuid,
+        state: JobState,
+        result: Option<serde_json::Value>,
+    ) -> Result<(), StoreError>;
+    /// Running jobs whose deadline has passed, soonest first, at most `limit`.
+    async fn overdue(&mut self, limit: i64) -> Result<Vec<Job>, StoreError>;
+    /// How long until the soonest deadline of a running job: zero when one is past,
+    /// `None` when no running job has one.
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError>;
+}
+
+/// A stored proposal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proposal {
+    pub id: i64,
+    pub kind: String,
+    pub body: serde_json::Value,
+    /// The pubkey the proposal was made for, who may decide it.
+    pub requester: String,
 }
 
 /// Runs and the stage threads they open.
@@ -458,6 +626,8 @@ pub struct OutboxBacklog {
     pub pending: i64,
     /// The pending posts that failed their last attempt.
     pub failed: i64,
+    /// When the oldest pending post was queued.
+    pub oldest: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Posts waiting for the relay. Written in the transaction that changes a run, so a crash

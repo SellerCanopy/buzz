@@ -7,6 +7,7 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::code_host::CodeHost;
+use buzz_hive_core::ports::relay::Relay;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::resolve::{resolve_actor, Actor};
 use buzz_hive_core::workflow::load::Catalog;
@@ -16,6 +17,9 @@ use crate::error::HiveError;
 use crate::rate::RateLimiter;
 use crate::replay::ReplayGuard;
 use crate::token::TokenMinter;
+
+/// How many times a read of the saved workflows is tried after a change.
+const REFRESH_TRIES: u32 = 3;
 
 pub struct ApiConfig {
     /// The origin clients reach, with no trailing slash. NIP-98 events must name it.
@@ -43,6 +47,9 @@ pub struct App {
     /// The Beehive account's pubkey, hex, empty when the service has no key. It posts to
     /// the update channel, so it must be a member of it.
     pub hive_pubkey: String,
+    /// Posts that belong to no card, such as the assistant's. `None` when the service has no
+    /// relay account. Posts a card makes go through the outbox instead.
+    pub relay: Option<Arc<dyn Relay>>,
     /// Wakes the outbox drain after a commit that queued a post.
     pub outbox: Arc<tokio::sync::Notify>,
     /// Wakes the timer loop after a commit that may have set a timer.
@@ -84,6 +91,43 @@ impl App {
         )
         .await?;
         Ok(actor)
+    }
+
+    /// Reads the saved workflows again after one changed, so the next call sees it. The change is
+    /// already committed, so a read that fails is tried again a few times; when it keeps failing
+    /// the caller is told, because the engine would otherwise serve the old version and refuse
+    /// the person's next save as stale.
+    pub async fn refresh_saved(&self) -> Result<(), HiveError> {
+        let Some(saved) = self.catalog.saved() else {
+            return Ok(());
+        };
+        let mut wait = std::time::Duration::from_millis(50);
+        for attempt in 1..=REFRESH_TRIES {
+            match saved.refresh(self.store.as_ref(), self.community).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::error!(%error, attempt, "could not read the saved workflows after a change");
+                }
+            }
+            if attempt < REFRESH_TRIES {
+                tokio::time::sleep(wait).await;
+                wait *= 4;
+            }
+        }
+        Err(HiveError::Unavailable(
+            "saved, but the workflow list could not be refreshed; reload".into(),
+        ))
+    }
+
+    /// An operation that never reads a workflow package: it skips the read of every package that
+    /// [`App::op`] does, and wakes nothing.
+    pub fn op_without_packages(&self) -> Op<'_> {
+        Op {
+            app: self,
+            catalog: Catalog::default(),
+            hive: self.hive_pubkey.clone(),
+            queues: false,
+        }
     }
 
     /// What an engine operation needs, and the one place that finishes it.

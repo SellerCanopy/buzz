@@ -14,6 +14,8 @@ use chrono::{TimeZone, Utc};
 use support::github_replay::{Exchange, Replay};
 
 const TOKEN: &str = "example-token";
+/// The login `fixtures/github/user.json` gives the token.
+const TOKEN_LOGIN: &str = "hive-bot";
 
 fn repo() -> RepoRef {
     RepoRef::parse("example-org/api").unwrap()
@@ -540,6 +542,14 @@ async fn repos_are_listed_for_the_token_or_for_one_owner_and_owners_start_with_t
             .any_order(),
         Exchange::get("/user").fixture("user.json").any_order(),
         Exchange::get("/user/orgs").fixture("orgs.json").any_order(),
+        // An organisation has its own list. A person's login is no organisation.
+        Exchange::get("/orgs/Example-Org/repos")
+            .query("type", "all")
+            .body(r#"[{"full_name":"example-org/api"},{"full_name":"example-org/web"}]"#)
+            .any_order(),
+        Exchange::get("/orgs/hive-bot/repos")
+            .status(404)
+            .any_order(),
     ])
     .await;
     let github = github(&replay).await;
@@ -553,6 +563,23 @@ async fn repos_are_listed_for_the_token_or_for_one_owner_and_owners_start_with_t
         .map(ToString::to_string)
         .collect();
     assert_eq!(only, ["example-org/api", "example-org/web"]);
+    let mine: Vec<String> = github
+        .list_repos("hive-bot")
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(mine, ["hive-bot/notes"]);
+    let user_lists = replay
+        .requests()
+        .iter()
+        .filter(|r| r.path == "/user/repos")
+        .count();
+    assert_eq!(
+        user_lists, 2,
+        "the organisation's repos did not walk the user's list"
+    );
     assert_eq!(
         github.list_owners().await.unwrap(),
         ["hive-bot", "example-org", "example-labs"]
@@ -813,4 +840,244 @@ async fn a_request_nobody_planned_fails_the_test_and_is_named() {
 async fn an_exchange_nobody_asked_for_fails_the_test_too() {
     let replay = Replay::start(vec![Exchange::get("/user/orgs").fixture("orgs.json")]).await;
     replay.finish();
+}
+
+/// An issue as GitHub lists it, written by `author`.
+fn issue_json(number: u64, body: &str, author: &str) -> String {
+    serde_json::json!({
+        "number": number,
+        "title": "Export drops the last row",
+        "body": body,
+        "state": "open",
+        "labels": [],
+        "assignees": [],
+        "user": {"login": author},
+        "html_url": format!("https://github.example.org/example-org/api/issues/{number}"),
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn an_issue_is_opened_with_a_marker_for_its_key() {
+    let replay = Replay::start(vec![
+        // Nothing carries the key yet.
+        open_issues().body("[]"),
+        Exchange::get("/user").fixture("user.json").any_order(),
+        Exchange::post("/repos/example-org/api/issues")
+            .status(201)
+            .body(&issue_json(9, "Off by one.", TOKEN_LOGIN)),
+    ])
+    .await;
+    let made = github(&replay)
+        .await
+        .create_issue(
+            &repo(),
+            "Export drops the last row",
+            "Off by one.",
+            "ticket-proposal:4",
+        )
+        .await
+        .unwrap();
+    assert_eq!(made.number, 9);
+    assert_eq!(made.repo, repo());
+    let post = replay
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST")
+        .unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(sent["title"], "Export drops the last row");
+    let body = sent["body"].as_str().unwrap();
+    assert!(body.starts_with("Off by one."), "{body}");
+    assert!(
+        body.contains("<!-- buzz-hive:ticket-proposal:4 -->"),
+        "the key is in the body: {body}"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_repeated_key_finds_the_issue_it_opened_and_posts_nothing() {
+    let marked = "Off by one.\n\n<!-- buzz-hive:ticket-proposal:4 -->";
+    let replay = Replay::start(vec![
+        Exchange::get("/user").fixture("user.json").any_order(),
+        open_issues().body(&format!("[{}]", issue_json(9, marked, TOKEN_LOGIN))),
+    ])
+    .await;
+    let found = github(&replay)
+        .await
+        .create_issue(
+            &repo(),
+            "Export drops the last row",
+            "Off by one.",
+            "ticket-proposal:4",
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.number, 9);
+    assert!(replay.requests().iter().all(|r| r.method != "POST"));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn an_issue_someone_else_wrote_with_the_marker_is_not_the_one_the_key_opened() {
+    // Anyone can type the marker of a key they can guess into an issue of their own.
+    let marked = "Phishing.\n\n<!-- buzz-hive:ticket-proposal:4 -->";
+    let replay = Replay::start(vec![
+        Exchange::get("/user").fixture("user.json").any_order(),
+        open_issues().body(&format!("[{}]", issue_json(8, marked, "someone-else"))),
+        Exchange::post("/repos/example-org/api/issues")
+            .status(201)
+            .body(&issue_json(9, "Off by one.", TOKEN_LOGIN)),
+    ])
+    .await;
+    let made = github(&replay)
+        .await
+        .create_issue(
+            &repo(),
+            "Export drops the last row",
+            "Off by one.",
+            "ticket-proposal:4",
+        )
+        .await
+        .unwrap();
+    assert_eq!(made.number, 9, "the attacker's issue is not imported");
+    assert_eq!(made.author, TOKEN_LOGIN);
+    replay.finish();
+}
+
+fn reviews_page(first: usize, count: usize, state: &str) -> String {
+    let reviews: Vec<_> = (first..first + count)
+        .map(|n| serde_json::json!({"user": {"login": format!("reviewer-{n}")}, "state": state}))
+        .collect();
+    serde_json::to_string(&reviews).unwrap()
+}
+
+#[tokio::test]
+async fn a_review_past_the_first_page_still_counts_toward_approval() {
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::get("/repos/example-org/api/pulls/12/reviews")
+            .query("page", "1")
+            .body(&reviews_page(0, 100, "APPROVED")),
+        Exchange::get("/repos/example-org/api/pulls/12/reviews")
+            .query("page", "2")
+            .body(&reviews_page(100, 1, "CHANGES_REQUESTED")),
+    ])
+    .await;
+    let status = github(&replay)
+        .await
+        .get_pull_request(&repo(), 12)
+        .await
+        .unwrap();
+    assert!(
+        !status.pull.approved,
+        "a reviewer on page two asks for changes"
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_list_that_never_ends_is_an_error_not_a_partial_answer() {
+    let mut exchanges = vec![Exchange::get(PULL_12).fixture("pull_12.json")];
+    for page in 1..=10 {
+        exchanges.push(
+            Exchange::get("/repos/example-org/api/pulls/12/reviews")
+                .query("page", &page.to_string())
+                .body(&reviews_page(page * 100, 100, "APPROVED")),
+        );
+    }
+    let replay = Replay::start(exchanges).await;
+    let read = github(&replay).await.get_pull_request(&repo(), 12).await;
+    assert!(matches!(read, Err(HostError::Other(_))), "{read:?}");
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_failed_check_past_the_first_page_is_found() {
+    let runs = |first: usize, count: usize, conclusion: &str| {
+        let runs: Vec<_> = (first..first + count)
+            .map(|n| {
+                serde_json::json!({
+                    "name": format!("job-{n}"), "status": "completed", "conclusion": conclusion
+                })
+            })
+            .collect();
+        serde_json::json!({"total_count": 101, "check_runs": runs}).to_string()
+    };
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::get("/repos/example-org/api/commits/abc123/check-runs")
+            .query("page", "1")
+            .body(&runs(0, 100, "success")),
+        Exchange::get("/repos/example-org/api/commits/abc123/check-runs")
+            .query("page", "2")
+            .body(&runs(100, 1, "failure")),
+        Exchange::get("/repos/example-org/api/commits/abc123/status")
+            .body(r#"{"total_count":0,"statuses":[]}"#),
+    ])
+    .await;
+    let read = github(&replay)
+        .await
+        .list_checks(&repo(), 12)
+        .await
+        .unwrap();
+    assert_eq!(read.checks.len(), 101);
+    assert_eq!(
+        read.checks
+            .iter()
+            .filter(|c| c.state == CheckState::Failed)
+            .count(),
+        1
+    );
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_reply_with_no_length_is_dropped_once_it_passes_the_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let sent = sent.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            let chunk = vec![b'a'; 1 << 20];
+            for _ in 0..64 {
+                let written = async {
+                    socket
+                        .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                        .await?;
+                    socket.write_all(&chunk).await?;
+                    socket.write_all(b"\r\n").await
+                }
+                .await;
+                if written.is_err() {
+                    break;
+                }
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    let github = GitHub::new(&format!("http://{address}"), TOKEN).unwrap();
+    let read = github.get_issue(&repo(), 1).await;
+    assert!(
+        matches!(&read, Err(HostError::Other(m)) if m.contains("too large")),
+        "{read:?}"
+    );
+    server.await.unwrap();
+    // 16 MiB is the limit: the reader hung up soon after it, not after all 64 MiB.
+    assert!(
+        sent.load(Ordering::SeqCst) < 40,
+        "{}",
+        sent.load(Ordering::SeqCst)
+    );
 }

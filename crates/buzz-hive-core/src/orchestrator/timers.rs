@@ -80,7 +80,7 @@ pub async fn fire(
     }
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     let facts = facts(&mut *tx, &card, package, run.current_stage.as_deref()).await?;
     let input = match timer.kind {

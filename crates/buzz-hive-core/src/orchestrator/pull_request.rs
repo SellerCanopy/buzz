@@ -235,7 +235,7 @@ async fn settle(
     }
     let package = env
         .catalog
-        .get(&run.workflow)
+        .pinned(&run.workflow, &run.workflow_hash)
         .ok_or_else(|| OpError::FailedPrecondition(env.catalog.absent(&run.workflow)))?;
     let facts = facts(&mut *tx, &card, package, Some(stage)).await?;
     let stepped = step(

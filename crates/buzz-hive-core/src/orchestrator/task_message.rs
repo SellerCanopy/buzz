@@ -94,6 +94,8 @@ pub struct Handoff {
     /// The card's issue, when it has one. The card's work is on its branch in that repo, so a
     /// stage that edits code is told to push it.
     pub issue: Option<IssueText>,
+    /// The card's repos, first repo first. The card runs in the first; the others are context.
+    pub repos: Vec<String>,
 }
 
 /// The id buzz-app registers Beehive under (`PLUGIN_ID` in `src/features/beehive/routes.ts`).
@@ -221,7 +223,8 @@ fn render_with(
     parts.push(handoff.brief.clone());
     parts.push(inputs_section(&handoff.inputs));
     parts.push(outputs_section(stage, card.id, handoff.channel));
-    if handoff.issue.is_some() && edits_code(stage) {
+    parts.push(repos_section(&handoff.repos, handoff.issue.is_some()));
+    if (handoff.issue.is_some() || !handoff.repos.is_empty()) && edits_code(stage) {
         parts.push(push_line(&card_branch(card.id, card.title)));
     }
     parts.push(done_line(card.id, &stage.id, handoff.visit, &results));
@@ -257,6 +260,26 @@ pub fn base_values(
         values.insert(format!("params.{name}"), value.clone());
     }
     values
+}
+
+/// Which repo the card's work is in, and which others are context. Empty for a card whose one
+/// repo is its issue's, which the other lines already name.
+fn repos_section(repos: &[String], has_issue: bool) -> String {
+    let Some((first, rest)) = repos.split_first() else {
+        return String::new();
+    };
+    if rest.is_empty() && has_issue {
+        return String::new();
+    }
+    let mut text = format!("Work in the repo `{first}`.");
+    if !rest.is_empty() {
+        let linked: Vec<String> = rest.iter().map(|repo| format!("`{repo}`")).collect();
+        text.push_str(&format!(
+            " The card also links {}, which is context to read, not a place to change.",
+            linked.join(", ")
+        ));
+    }
+    text
 }
 
 /// Whether the stage's agent works in the card's checkout: a prompt stage whose workspace is
@@ -823,6 +846,27 @@ mod tests {
         assert_eq!(
             got,
             "Task text.\n\nOpen the card in Beehive: buzz://plugin?id=buzz.beehive&page=beehive&route.card=00000000-0000-0000-0000-00000000002a"
+        );
+    }
+
+    #[test]
+    fn the_agent_is_told_the_repo_it_works_in_and_which_are_context() {
+        let repos = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        assert_eq!(repos_section(&[], false), "");
+        // The issue names its own repo already.
+        assert_eq!(repos_section(&repos(&["example-org/api"]), true), "");
+        assert_eq!(
+            repos_section(&repos(&["example-org/api"]), false),
+            "Work in the repo `example-org/api`."
+        );
+        let text = repos_section(&repos(&["example-org/api", "example-org/web"]), true);
+        assert!(
+            text.starts_with("Work in the repo `example-org/api`."),
+            "{text}"
+        );
+        assert!(
+            text.contains("`example-org/web`, which is context"),
+            "{text}"
         );
     }
 }
