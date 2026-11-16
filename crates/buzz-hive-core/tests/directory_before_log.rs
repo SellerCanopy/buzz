@@ -118,6 +118,9 @@ impl Tx for SpyTx {
     fn proposals(&mut self) -> &mut dyn buzz_hive_core::ports::store::ProposalsRepo {
         self.inner.proposals()
     }
+    fn jobs(&mut self) -> &mut dyn buzz_hive_core::ports::store::JobsRepo {
+        self.inner.jobs()
+    }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
         self.inner.savepoint().await
     }

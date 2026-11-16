@@ -466,18 +466,31 @@ pub async fn propose_workflow(
     if has_errors(&findings) {
         return Err(OpError::InvalidWorkflow(findings));
     }
-    let body = serde_json::json!({
-        "name": draft.meta.name,
-        "files": draft.files,
-        "baseHash": base,
-    });
     let mut tx = env.store.begin(ctx.community).await?;
     let id = tx
         .proposals()
-        .insert(PROPOSAL_WORKFLOW, body, requester)
+        .insert(
+            PROPOSAL_WORKFLOW,
+            proposal_body(&draft, base, None),
+            requester,
+        )
         .await?;
     tx.commit().await?;
     Ok((id, findings))
+}
+
+/// What a stored workflow proposal holds. `job` is the assistant job that made it.
+pub fn proposal_body(
+    draft: &Package,
+    base: Option<&str>,
+    job: Option<uuid::Uuid>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": draft.meta.name,
+        "files": draft.files,
+        "baseHash": base,
+        "jobId": job,
+    })
 }
 
 /// The `kind` of a stored proposal that holds a workflow edit.

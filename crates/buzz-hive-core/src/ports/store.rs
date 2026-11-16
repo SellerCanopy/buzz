@@ -64,6 +64,7 @@ pub trait Tx: Send {
     fn issues(&mut self) -> &mut dyn IssuesRepo;
     fn pull_requests(&mut self) -> &mut dyn PullRequestsRepo;
     fn proposals(&mut self) -> &mut dyn ProposalsRepo;
+    fn jobs(&mut self) -> &mut dyn JobsRepo;
     /// Opens a savepoint. Savepoints nest: [`Tx::rollback_savepoint`] and
     /// [`Tx::release_savepoint`] close the newest one still open.
     async fn savepoint(&mut self) -> Result<(), StoreError>;
@@ -283,6 +284,89 @@ pub trait ProposalsRepo: Send {
     ) -> Result<i64, StoreError>;
     /// Every proposal of `kind` that is still open, oldest first.
     async fn open(&mut self, kind: &str) -> Result<Vec<Proposal>, StoreError>;
+    /// Every open proposal, whatever its kind, oldest first.
+    async fn open_all(&mut self) -> Result<Vec<Proposal>, StoreError>;
+    /// The proposal, open or resolved.
+    async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError>;
+    /// Marks an open proposal decided. `false` when it is gone or was decided already.
+    async fn resolve(&mut self, id: i64) -> Result<bool, StoreError>;
+}
+
+/// Where a job stands. A job leaves `Running` once and never returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Done,
+    Cancelled,
+    Failed,
+}
+
+impl JobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "cancelled" => Self::Cancelled,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// One piece of work the assistant agent does for a person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: uuid::Uuid,
+    /// `chat`, `propose_workflow_edit` or `adapt_skills`.
+    pub kind: String,
+    /// The person the job is for, who may read its result and apply what it proposes.
+    pub requester: Pubkey,
+    pub state: JobState,
+    pub channel: uuid::Uuid,
+    /// The thread the agent works in. Empty until the post that opens it is made.
+    pub root_event_id: Option<String>,
+    /// The only account that may report the job's result.
+    pub agent: Pubkey,
+}
+
+/// The assistant's jobs.
+#[async_trait::async_trait]
+pub trait JobsRepo: Send {
+    /// Stores a running job. It ends as failed once `deadline_in` has passed, or never when
+    /// that is `None`. `Conflict` when a job already runs in the job's thread.
+    async fn insert(
+        &mut self,
+        job: &Job,
+        deadline_in: Option<std::time::Duration>,
+    ) -> Result<(), StoreError>;
+    /// The job, held until the transaction ends so a result, a cancel and an expiry queue.
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Job>, StoreError>;
+    /// The newest job that worked in the thread `root`, whatever its state.
+    async fn latest_in_thread(&mut self, root: &str) -> Result<Option<Job>, StoreError>;
+    /// Records the thread a job's first post opened.
+    async fn set_root(&mut self, id: uuid::Uuid, root: &str) -> Result<(), StoreError>;
+    /// Ends a running job with the result it reported, or `None` when it has none. Nothing
+    /// happens to a job that already ended.
+    async fn finish(
+        &mut self,
+        id: uuid::Uuid,
+        state: JobState,
+        result: Option<serde_json::Value>,
+    ) -> Result<(), StoreError>;
+    /// Running jobs whose deadline has passed, soonest first, at most `limit`.
+    async fn overdue(&mut self, limit: i64) -> Result<Vec<Job>, StoreError>;
+    /// How long until the soonest deadline of a running job: zero when one is past,
+    /// `None` when no running job has one.
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError>;
 }
 
 /// A stored proposal.

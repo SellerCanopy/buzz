@@ -13,10 +13,10 @@ use crate::domain::usage::{week_start, Usage, UsageWeek};
 use crate::ports::clock::{Clock, SystemClock};
 use crate::ports::store::{
     AccessRepo, AccessRow, AgentInfo, AgentLink, ArtifactSave, ArtifactsRepo, CardsRepo,
-    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, KeptVersion,
-    OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting, Proposal, ProposalsRepo, Pubkey,
-    PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo, StageThread, Store, StoreError,
-    StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
+    CommunityId, Directory, EventsRepo, InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo,
+    KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, PersonInfo, Posting, Proposal,
+    ProposalsRepo, Pubkey, PullRequestsRepo, RelayEvent, RunsRepo, SettingsRepo, StageThread,
+    Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo, MESSAGE_KINDS,
 };
 use crate::workflow::options::WorkflowOptions;
 
@@ -51,6 +51,8 @@ struct State {
     /// Proposals in creation order, with the time each was resolved.
     proposals: Vec<(CommunityId, Proposal, bool)>,
     next_proposal_id: i64,
+    /// In creation order, each with when it ends as failed.
+    jobs: Vec<(CommunityId, Job, Option<chrono::DateTime<chrono::Utc>>)>,
 }
 
 #[derive(Clone)]
@@ -191,6 +193,9 @@ impl Tx for MemTx {
         self
     }
     fn proposals(&mut self) -> &mut dyn ProposalsRepo {
+        self
+    }
+    fn jobs(&mut self) -> &mut dyn JobsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -1031,6 +1036,162 @@ impl ProposalsRepo for MemTx {
             .filter(|(c, p, resolved)| *c == self.community && p.kind == kind && !resolved)
             .map(|(_, p, _)| p.clone())
             .collect())
+    }
+
+    async fn open_all(&mut self) -> Result<Vec<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .filter(|(c, _, resolved)| *c == self.community && !resolved)
+            .map(|(_, p, _)| p.clone())
+            .collect())
+    }
+
+    async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError> {
+        Ok(self
+            .work
+            .proposals
+            .iter()
+            .find(|(c, p, _)| *c == self.community && p.id == id)
+            .map(|(_, p, _)| p.clone()))
+    }
+
+    async fn resolve(&mut self, id: i64) -> Result<bool, StoreError> {
+        let community = self.community;
+        let open = self
+            .work
+            .proposals
+            .iter_mut()
+            .find(|(c, p, resolved)| *c == community && p.id == id && !resolved);
+        Ok(open.map(|(_, _, resolved)| *resolved = true).is_some())
+    }
+}
+
+impl MemTx {
+    /// `Conflict` when a running job other than `id` works in the thread `root`.
+    fn check_thread_free(&self, id: uuid::Uuid, root: Option<&String>) -> Result<(), StoreError> {
+        let taken = root.is_some_and(|root| {
+            self.work.jobs.iter().any(|(c, j, _)| {
+                *c == self.community
+                    && j.id != id
+                    && j.state == JobState::Running
+                    && j.root_event_id.as_ref() == Some(root)
+            })
+        });
+        if taken {
+            return Err(StoreError::Conflict("that already exists".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl JobsRepo for MemTx {
+    async fn insert(
+        &mut self,
+        job: &Job,
+        deadline_in: Option<std::time::Duration>,
+    ) -> Result<(), StoreError> {
+        let taken = self
+            .work
+            .jobs
+            .iter()
+            .any(|(c, j, _)| *c == self.community && j.id == job.id);
+        if taken {
+            return Err(StoreError::Conflict("that already exists".into()));
+        }
+        if job.state == JobState::Running {
+            self.check_thread_free(job.id, job.root_event_id.as_ref())?;
+        }
+        let deadline = deadline_in.map(|after| {
+            self.clock.now() + chrono::Duration::from_std(after).expect("a duration that fits")
+        });
+        self.work.jobs.push((self.community, job.clone(), deadline));
+        Ok(())
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Job>, StoreError> {
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .find(|(c, j, _)| *c == self.community && j.id == id)
+            .map(|(_, j, _)| j.clone()))
+    }
+
+    async fn latest_in_thread(&mut self, root: &str) -> Result<Option<Job>, StoreError> {
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .rev()
+            .find(|(c, j, _)| *c == self.community && j.root_event_id.as_deref() == Some(root))
+            .map(|(_, j, _)| j.clone()))
+    }
+
+    async fn set_root(&mut self, id: uuid::Uuid, root: &str) -> Result<(), StoreError> {
+        self.check_thread_free(id, Some(&root.to_owned()))?;
+        let community = self.community;
+        if let Some((_, job, _)) = self
+            .work
+            .jobs
+            .iter_mut()
+            .find(|(c, j, _)| *c == community && j.id == id)
+        {
+            job.root_event_id = Some(root.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        id: uuid::Uuid,
+        state: JobState,
+        _result: Option<serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let community = self.community;
+        if let Some((_, job, _)) = self
+            .work
+            .jobs
+            .iter_mut()
+            .find(|(c, j, _)| *c == community && j.id == id && j.state == JobState::Running)
+        {
+            job.state = state;
+        }
+        Ok(())
+    }
+
+    async fn overdue(&mut self, limit: i64) -> Result<Vec<Job>, StoreError> {
+        let now = self.clock.now();
+        let mut late: Vec<_> = self
+            .work
+            .jobs
+            .iter()
+            .filter(|(c, j, at)| {
+                *c == self.community
+                    && j.state == JobState::Running
+                    && at.is_some_and(|at| at <= now)
+            })
+            .collect();
+        late.sort_by_key(|(_, j, at)| (*at, j.id));
+        Ok(late
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(0))
+            .map(|(_, j, _)| j.clone())
+            .collect())
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let now = self.clock.now();
+        Ok(self
+            .work
+            .jobs
+            .iter()
+            .filter(|(c, j, _)| *c == self.community && j.state == JobState::Running)
+            .filter_map(|(_, _, at)| *at)
+            .min()
+            .map(|at| (at - now).to_std().unwrap_or_default()))
     }
 }
 

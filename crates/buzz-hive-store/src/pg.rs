@@ -15,9 +15,10 @@ use buzz_hive_core::domain::timer::{Timer, TimerKind};
 use buzz_hive_core::domain::usage::{Usage, UsageWeek};
 use buzz_hive_core::ports::store::{
     AccessRepo, AccessRow, ArtifactSave, ArtifactsRepo, CardsRepo, CommunityId, EventsRepo,
-    InboxRepo, IntakeRepo, IssuesRepo, KeptVersion, OutboxBacklog, OutboxRepo, OutboxRow, Posting,
-    Proposal, ProposalsRepo, PullRequestsRepo, RunsRepo, SettingsRepo, StageThread, Store,
-    StoreError, StoredPackage, TimersRepo, Tx, UsageRepo, WorkflowsRepo,
+    InboxRepo, IntakeRepo, IssuesRepo, Job, JobState, JobsRepo, KeptVersion, OutboxBacklog,
+    OutboxRepo, OutboxRow, Posting, Proposal, ProposalsRepo, PullRequestsRepo, RunsRepo,
+    SettingsRepo, StageThread, Store, StoreError, StoredPackage, TimersRepo, Tx, UsageRepo,
+    WorkflowsRepo,
 };
 use buzz_hive_core::workflow::options::WorkflowOptions;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -107,6 +108,9 @@ impl Tx for PgTx {
         self
     }
     fn proposals(&mut self) -> &mut dyn ProposalsRepo {
+        self
+    }
+    fn jobs(&mut self) -> &mut dyn JobsRepo {
         self
     }
     async fn savepoint(&mut self) -> Result<(), StoreError> {
@@ -1065,15 +1069,199 @@ impl ProposalsRepo for PgTx {
         .fetch_all(&mut *self.tx)
         .await
         .map_err(store_error)?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, kind, body, requester)| Proposal {
-                id,
-                kind,
-                body,
-                requester,
-            })
-            .collect())
+        Ok(rows.into_iter().map(proposal).collect())
+    }
+
+    async fn open_all(&mut self) -> Result<Vec<Proposal>, StoreError> {
+        let rows: Vec<ProposalRow> = sqlx::query_as(
+            "SELECT id, kind, body, requester FROM hive.proposals \
+             WHERE community_id = $1 AND resolved_at IS NULL ORDER BY id",
+        )
+        .bind(self.community)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(rows.into_iter().map(proposal).collect())
+    }
+
+    async fn get(&mut self, id: i64) -> Result<Option<Proposal>, StoreError> {
+        let row: Option<ProposalRow> = sqlx::query_as(
+            "SELECT id, kind, body, requester FROM hive.proposals \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(row.map(proposal))
+    }
+
+    async fn resolve(&mut self, id: i64) -> Result<bool, StoreError> {
+        let resolved = sqlx::query(
+            "UPDATE hive.proposals SET resolved_at = now() \
+             WHERE community_id = $1 AND id = $2 AND resolved_at IS NULL",
+        )
+        .bind(self.community)
+        .bind(id)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(resolved.rows_affected() == 1)
+    }
+}
+
+type ProposalRow = (i64, String, serde_json::Value, String);
+
+fn proposal((id, kind, body, requester): ProposalRow) -> Proposal {
+    Proposal {
+        id,
+        kind,
+        body,
+        requester,
+    }
+}
+
+type JobRow = (
+    uuid::Uuid,
+    String,
+    String,
+    String,
+    uuid::Uuid,
+    Option<String>,
+    String,
+);
+
+/// `SELECT` for [`JobRow`] followed by `$tail`, as one literal so sqlx sees a static string.
+macro_rules! select_job {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, kind, requester, state, channel_id, root_event_id, agent_pubkey \
+             FROM hive.jobs ",
+            $tail
+        )
+    };
+}
+
+fn decode_job(
+    (id, kind, requester, state, channel, root_event_id, agent): JobRow,
+) -> Result<Job, StoreError> {
+    let state = JobState::parse(&state)
+        .ok_or_else(|| StoreError::Internal(format!("job {id} has the state {state:?}")))?;
+    Ok(Job {
+        id,
+        kind,
+        requester,
+        state,
+        channel,
+        root_event_id,
+        agent,
+    })
+}
+
+#[async_trait::async_trait]
+impl JobsRepo for PgTx {
+    async fn insert(
+        &mut self,
+        job: &Job,
+        deadline_in: Option<std::time::Duration>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO hive.jobs \
+             (community_id, id, kind, requester, state, channel_id, root_event_id, agent_pubkey, \
+              deadline) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     CASE WHEN $9::float8 IS NULL THEN NULL \
+                          ELSE now() + make_interval(secs => $9) END)",
+        )
+        .bind(self.community)
+        .bind(job.id)
+        .bind(&job.kind)
+        .bind(&job.requester)
+        .bind(job.state.as_str())
+        .bind(job.channel)
+        .bind(&job.root_event_id)
+        .bind(&job.agent)
+        .bind(deadline_in.map(|d| d.as_secs_f64()))
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn get_for_update(&mut self, id: uuid::Uuid) -> Result<Option<Job>, StoreError> {
+        let row: Option<JobRow> = sqlx::query_as(select_job!(
+            "WHERE community_id = $1 AND id = $2 FOR UPDATE"
+        ))
+        .bind(self.community)
+        .bind(id)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_job).transpose()
+    }
+
+    async fn latest_in_thread(&mut self, root: &str) -> Result<Option<Job>, StoreError> {
+        let row: Option<JobRow> = sqlx::query_as(select_job!("WHERE community_id = $1 AND root_event_id = $2 ORDER BY created_at DESC, id DESC LIMIT 1"))
+        .bind(self.community)
+        .bind(root)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_job).transpose()
+    }
+
+    async fn set_root(&mut self, id: uuid::Uuid, root: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE hive.jobs SET root_event_id = $3 WHERE community_id = $1 AND id = $2")
+            .bind(self.community)
+            .bind(id)
+            .bind(root)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        id: uuid::Uuid,
+        state: JobState,
+        result: Option<serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE hive.jobs SET state = $3, result = $4, ended_at = now() \
+             WHERE community_id = $1 AND id = $2 AND state = 'running'",
+        )
+        .bind(self.community)
+        .bind(id)
+        .bind(state.as_str())
+        .bind(result)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn overdue(&mut self, limit: i64) -> Result<Vec<Job>, StoreError> {
+        let rows: Vec<JobRow> = sqlx::query_as(select_job!("WHERE community_id = $1 AND state = 'running' AND deadline <= now() ORDER BY deadline, id LIMIT $2"))
+        .bind(self.community)
+        .bind(limit)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        rows.into_iter().map(decode_job).collect()
+    }
+
+    async fn next_in(&mut self) -> Result<Option<std::time::Duration>, StoreError> {
+        let secs: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (min(deadline) - now()))::float8 \
+             FROM hive.jobs WHERE community_id = $1 AND state = 'running'",
+        )
+        .bind(self.community)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        Ok(secs.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))))
     }
 }
 

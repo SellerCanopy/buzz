@@ -6,6 +6,7 @@
 pub mod access;
 pub mod activity;
 pub mod artifacts;
+pub mod assistant;
 pub mod auto;
 pub mod cards;
 pub mod inbox;

@@ -71,6 +71,7 @@ async fn stack(store: Arc<MemStore>, replay: &Replay) -> Stack {
         catalog: catalog.clone(),
         community: community(),
         hive_pubkey: HIVE.into(),
+        relay: None,
         outbox: Arc::new(Notify::new()),
         timers: Arc::new(Notify::new()),
         code_host: Some(host.clone()),

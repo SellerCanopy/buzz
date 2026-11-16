@@ -12,13 +12,14 @@ use buzz_hive_core::orchestrator::activity::{
     MAX_REJECTED_REASON_CHARS, MAX_SUMMARY_CHARS, MAX_WHY_CHARS,
 };
 use buzz_hive_core::orchestrator::artifacts::MAX_PLAN_ITEM_BYTES;
+use buzz_hive_core::orchestrator::assistant::MAX_MESSAGE_BYTES;
 use buzz_hive_core::orchestrator::cards::{
     MAX_DESCRIPTION_CHARS, MAX_NOTE_DETAIL_CHARS, MAX_NOTE_SUMMARY_CHARS, MAX_TITLE_CHARS,
 };
 use buzz_hive_core::orchestrator::inbox::MAX_TEXT_CHARS;
 use buzz_hive_core::orchestrator::run::MAX_SUMMARY_CHARS as MAX_RESULT_SUMMARY_CHARS;
 use buzz_hive_core::tool_names::{
-    MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
+    ASSISTANT_RESULT, MOVE_CARD, READ_ARTIFACT, SAVE_ARTIFACT, STAGE_DONE, UPDATE_PLAN,
 };
 use serde_json::{json, Value};
 
@@ -267,6 +268,13 @@ pub const TOOLS: &[Tool] = &[
         schema: get_inbox,
     },
     Tool {
+        name: ASSISTANT_RESULT,
+        route: "AssistantResult",
+        needs: Level::Read,
+        description: "Report the result of an assistant job you were asked to do, once. Pass the jobId from the message that asked you, and a message for the person. For a workflow edit or a skill adaptation also give the whole package: name and every file as text. The package is stored as a proposal for the person to apply at their own level, and nothing is saved by this call. A package with an error is refused with the errors listed, so fix it and call again. Only the agent the job was given to may call it.",
+        schema: assistant_result,
+    },
+    Tool {
         name: "get_hive_health",
         route: "GetStatus",
         needs: Level::Read,
@@ -440,6 +448,30 @@ pub const NOT_TOOLS: &[(&str, &str)] = &[
     (
         "SetHandoff",
         "a person's choice on the Files tab; an agent saves the artifact and the workflow sets its default",
+    ),
+    (
+        "StartChat",
+        "a person's message from the assistant panel; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "StartProposeWorkflowEdit",
+        "a person's request from the workflow editor; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "StartAdaptSkills",
+        "a person's request from the workflow editor; the assistant's agent answers with assistant_result",
+    ),
+    (
+        "CancelJob",
+        "a person's button on the assistant panel; the agent is told in the job's thread",
+    ),
+    (
+        "ListProposals",
+        "the person's own inbox of offers; an agent that proposes reads the reply of edit_workflow or assistant_result",
+    ),
+    (
+        "ResolveProposal",
+        "a person's decision on a proposal; an agent never decides for the person it proposed to",
     ),
 ];
 
@@ -899,6 +931,37 @@ fn edit_workflow() -> Value {
     )
 }
 
+fn assistant_result() -> Value {
+    object(
+        vec![
+            ("jobId", string("The job id the message that asked you named.")),
+            (
+                "message",
+                string(&format!(
+                    "What you say to the person, at most {MAX_MESSAGE_BYTES} bytes."
+                )),
+            ),
+            (
+                "name",
+                string("The package name, when you offer a workflow: the same as the name in kiln-package.yaml."),
+            ),
+            (
+                "files",
+                json!({
+                    "type": "object",
+                    "description": "Every file of the offered package by path, as text.",
+                    "additionalProperties": { "type": "string" },
+                }),
+            ),
+            (
+                "baseHash",
+                string("The hash get_workflow gave for the package. Empty for a new one."),
+            ),
+        ],
+        &["jobId", "message"],
+    )
+}
+
 fn get_settings() -> Value {
     object(
         vec![
@@ -1016,6 +1079,7 @@ mod tests {
         has("read_history", &MAX_HISTORY_LIMIT);
         has("read_history", &DEFAULT_HISTORY_LIMIT);
         has("ask_gate", &MAX_TEXT_CHARS);
+        has("assistant_result", &MAX_MESSAGE_BYTES);
     }
 
     #[test]
@@ -1026,6 +1090,7 @@ mod tests {
             SAVE_ARTIFACT,
             UPDATE_PLAN,
             MOVE_CARD,
+            ASSISTANT_RESULT,
         ] {
             assert!(
                 TOOLS.iter().any(|t| t.name == name),

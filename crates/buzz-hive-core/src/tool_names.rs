@@ -14,3 +14,5 @@ pub const SAVE_ARTIFACT: &str = "save_artifact";
 pub const UPDATE_PLAN: &str = "update_plan";
 /// Moves the card to another stage in place of the route its result gives.
 pub const MOVE_CARD: &str = "move_card";
+/// Reports the result of an assistant job.
+pub const ASSISTANT_RESULT: &str = "assistant_result";

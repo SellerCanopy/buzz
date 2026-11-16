@@ -195,6 +195,7 @@ async fn a_started_run_posts_the_status_and_the_task_and_the_relay_returns_both(
         catalog: Arc::new(Sources(vec![Source::new("e2e", false, files)])),
         community,
         hive_pubkey: adapter.pubkey(),
+        relay: None,
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,

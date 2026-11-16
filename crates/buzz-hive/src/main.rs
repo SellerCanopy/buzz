@@ -161,6 +161,9 @@ async fn run() -> Result<(), String> {
         catalog,
         community,
         hive_pubkey: hive_pubkey.clone(),
+        relay: relay_adapter
+            .clone()
+            .map(|relay| relay as Arc<dyn buzz_hive_core::ports::relay::Relay>),
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: code_host.clone(),

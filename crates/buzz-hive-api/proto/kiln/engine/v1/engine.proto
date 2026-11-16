@@ -18,14 +18,9 @@ service EngineService {
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
   // ListPeople returns everyone in the company who has signed in.
   rpc ListPeople(ListPeopleRequest) returns (ListPeopleResponse);
-  // WatchEvents streams every stored event after after_seq in order, then
-  // live events as they commit, with no gap and no repeat. card_id and
-  // types narrow the stream to matching events.
-  rpc WatchEvents(WatchEventsRequest) returns (stream Event);
   // PollEvents returns events with seq greater than after_seq, up to 500, in
   // order. When there are none it waits up to wait_seconds (at most 25) for
   // one to commit, then returns an empty list with next_seq unchanged.
-  // Beehive: this replaces WatchEvents.
   rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
   // CreateCard puts an issue on the board. With a workflow the card sits
   // idle on the workflow's first stage, in To do. With none it goes to
@@ -249,15 +244,14 @@ service EngineService {
   // issue with an unfinished run with FailedPrecondition, and an engine
   // over a local folder, which has no code host, with FailedPrecondition.
   rpc StartTestRun(StartTestRunRequest) returns (Run);
-  // ProposeWorkflowEdit asks an agent to change a draft as the request
-  // says, in a scratch copy, and streams progress, then the proposed draft
-  // and its findings. Nothing is saved. The proposal is always the last
-  // message; findings on it are part of the proposal, not an error. A bad
-  // draft or an empty request fails with InvalidArgument, no agent profile
-  // to run with or a change that cannot be read back with
-  // FailedPrecondition, and an agent that does not finish in time with
-  // DeadlineExceeded. Closing the stream stops the agent.
-  rpc ProposeWorkflowEdit(ProposeWorkflowEditRequest) returns (stream ProposeWorkflowEditUpdate);
+  // StartProposeWorkflowEdit asks the assistant's agent to change a draft as
+  // the request says, and returns the job's id at once. The agent reports
+  // through assistant_result, and one job.result event reaches PollEvents
+  // with its message and the id of the proposal it stored. Nothing is saved:
+  // a person applies the proposal with SaveWorkflow. An empty request or no
+  // draft is InvalidArgument; no assistant agent, or no update channel to
+  // post in, is FailedPrecondition.
+  rpc StartProposeWorkflowEdit(StartProposeWorkflowEditRequest) returns (StartJobResponse);
   // ListSkills returns the stored skill list for the agent profile a draft
   // stage resolves to, in one repo. It starts no agent.
   rpc ListSkills(ListSkillsRequest) returns (ListSkillsResponse);
@@ -275,11 +269,10 @@ service EngineService {
   // name, into the draft and rewrites their calls. It returns the new draft
   // and saves nothing.
   rpc BundleSkills(BundleSkillsRequest) returns (WorkflowDraft);
-  // AdaptSkills runs one agent call that rewrites the chosen bundled skills
-  // to use Kiln's tools. It streams progress lines, then one proposal whose
-  // draft differs from the request's only in those skills' files and the
-  // subagents they name. Closing the stream stops the agent.
-  rpc AdaptSkills(AdaptSkillsRequest) returns (stream AdaptSkillsUpdate);
+  // StartAdaptSkills asks the assistant's agent to rewrite the chosen skills
+  // to use Beehive's tools, and returns the job's id at once. The result
+  // arrives as StartProposeWorkflowEdit's does.
+  rpc StartAdaptSkills(StartAdaptSkillsRequest) returns (StartJobResponse);
   // GetCostReport adds up what the runs and chats of a period cost, grouped by
   // workflow, stage, card, model, day or month. Each row counts the runs
   // that were estimated and the runs with no cost, so an agent that reports
@@ -538,11 +531,22 @@ service EngineService {
   // and nothing is stored. A run being active does not refuse it.
   rpc SetMergeOrder(SetMergeOrderRequest) returns (Card);
 
-  // Chat sends one message to the assistant and streams its turn: progress
-  // lines, reply text, then done. Closing the stream stops the turn and
-  // keeps the reply so far. A second Chat while a turn runs is
-  // FailedPrecondition, and so is a Chat with no agent chosen.
-  rpc Chat(ChatRequest) returns (stream ChatUpdate);
+  // StartChat sends one message to the assistant's agent and returns the job's
+  // id at once. The first job's thread is the conversation: a later turn
+  // names that thread's root event in root_event_id. A turn while another
+  // runs in the thread is FailedPrecondition, and so is a chat with no
+  // assistant agent.
+  rpc StartChat(StartChatRequest) returns (StartJobResponse);
+  // CancelJob ends a running job and tells the agent in the thread. The reply
+  // so far stays, and no job.result event follows. A job that already ended
+  // is left as it is. Only the person the job is for may cancel it.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  // ListProposals returns the caller's open proposals, oldest first: the
+  // workflows the assistant, or an agent that could not save, offered.
+  rpc ListProposals(ListProposalsRequest) returns (ListProposalsResponse);
+  // AssistantResult is the agent's report of a job, for the assistant_result
+  // tool. The job's own agent calls it once.
+  rpc AssistantResult(AssistantResultRequest) returns (AssistantResultResponse);
   // ListConversations lists saved conversations, newest first, and says
   // whether an agent is ready to answer.
   rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
@@ -550,8 +554,9 @@ service EngineService {
   rpc GetConversation(GetConversationRequest) returns (GetConversationResponse);
   // DeleteConversation forgets a conversation, its messages and its folder.
   rpc DeleteConversation(DeleteConversationRequest) returns (DeleteConversationResponse);
-  // ResolveProposal records what the person did with a proposal. It acts on
-  // nothing: the app already ran the action through its own call.
+  // ResolveProposal records what the person did with a proposal, and takes
+  // it off ListProposals. It acts on nothing: the app already ran the action
+  // through its own call. Only the person the proposal is for may resolve it.
   rpc ResolveProposal(ResolveProposalRequest) returns (ResolveProposalResponse);
   // AcceptTicketProposal files a ticket proposal: it opens the issue or
   // writes the Kiln task, adds the card, and records the card on the
@@ -624,22 +629,9 @@ message PollEventsResponse {
   int64 next_seq = 2;
 }
 
-message WatchEventsRequest {
-  // Stream events with seq greater than this; 0 streams from the start.
-  int64 after_seq = 1;
-  // When set, only this card's events.
-  int64 card_id = 2;
-  // When set, only events of these types. An unknown type fails with
-  // InvalidArgument.
-  repeated string types = 3;
-  // When set, only this run's events. Pair it with card_id: a run_id without
-  // one fails with InvalidArgument.
-  int64 run_id = 4;
-}
-
 // Event is one row of the engine's event log.
 message Event {
-  // Global order across all events, and the WatchEvents cursor.
+  // Global order across all events, and the PollEvents cursor.
   int64 seq = 1;
   // One of the event types the engine registers, such as "engine.started".
   string type = 2;
@@ -1465,20 +1457,17 @@ message WorkflowDraft {
   map<string, bytes> files = 2;
 }
 
-message ProposeWorkflowEditRequest {
+message StartProposeWorkflowEditRequest {
   // The draft as the builder holds it now.
   WorkflowDraft draft = 1;
   // The change, in the person's words.
   string request = 2;
 }
 
-message ProposeWorkflowEditUpdate {
-  oneof update {
-    // One line of what the agent is doing, to show while it works.
-    string progress = 1;
-    // The proposed draft and its findings; always the last message.
-    Proposal proposal = 2;
-  }
+// StartJobResponse names the job a Start call began. The job's thread and
+// its result arrive on the event log: job.started, then one job.result.
+message StartJobResponse {
+  string job_id = 1;
 }
 
 // ListSkillsRequest names a draft stage and a repo.
@@ -1555,31 +1544,10 @@ message BundleSkillsRequest {
   repeated string skills = 2;
 }
 
-message AdaptSkillsRequest {
+message StartAdaptSkillsRequest {
   WorkflowDraft draft = 1;
-  // skills are the bundled skill folder names to adapt, such as
-  // 02-create-research.
+  // skills are the skill folder names to adapt, such as 02-create-research.
   repeated string skills = 2;
-}
-
-// AdaptSkillsUpdate is one progress line, or the final proposal.
-message AdaptSkillsUpdate {
-  oneof update {
-    string progress = 1;
-    // The adapted draft and its findings; always the last message.
-    Proposal proposal = 2;
-  }
-}
-
-// Proposal is a draft an agent proposed, with the findings the workflow
-// checks give it. It is not saved.
-message Proposal {
-  WorkflowDraft draft = 1;
-  repeated Finding findings = 2;
-  // The agent's own short reply: why it made the change, or why it made
-  // none. Empty when the agent said nothing, and always empty for an
-  // AdaptSkills proposal.
-  string explanation = 3;
 }
 
 message GetWorkflowDraftRequest {
@@ -1802,46 +1770,16 @@ message Attachment {
   bytes data = 2;
 }
 
-message ChatRequest {
-  // 0 starts a new conversation.
-  int64 conversation_id = 1;
-  string text = 2;
-  ViewContext context = 3;
-  ChatIntent intent = 4;
-  // The run to debug; required when intent is CHAT_INTENT_DEBUG_RUN. The
-  // engine finds the run's conversation, or starts one, and ignores
-  // conversation_id.
-  int64 run_id = 5;
-  // At most 20 files and 10 MiB in total. A zip unpacks to at most 1000
-  // entries and 32 MiB.
-  repeated Attachment attachments = 6;
-  reserved 7;
-  reserved "view_id";
-  // The repos an Explore chat reads, as host/owner/name: at most 5, each
-  // linked to an intake rule or the default repo. Used when intent is
-  // CHAT_INTENT_EXPLORE.
-  repeated string repos = 8;
-  // The workflow an Explore chat files tickets to; empty is Backlog. Used
-  // when intent is CHAT_INTENT_EXPLORE.
-  string workflow = 9;
-}
-
-message ChatUpdate {
-  oneof update {
-    // A short line about what the assistant is doing, such as a tool title.
-    string progress = 1;
-    // The next piece of the reply, already redacted.
-    string text = 2;
-    ChatDone done = 3;
-    // The checked diagnosis of a Debug this turn.
-    Diagnosis diagnosis = 4;
-    // A next step the assistant offers. The person decides.
-    AssistantProposal proposal = 5;
-  }
+message StartChatRequest {
+  // The person's message.
+  string text = 1;
+  // The root event of an earlier job's thread, to continue it. Empty opens a
+  // new thread, whose root the job.started event names.
+  string root_event_id = 2;
 }
 
 // AssistantProposal is something the assistant offers and the person
-// confirms. Named so because Proposal is the plain-words edit's message.
+// confirms.
 message AssistantProposal {
   int64 id = 1;
   // open, accepted or discarded.
@@ -1984,7 +1922,52 @@ message ResolveProposalRequest {
 }
 
 message ResolveProposalResponse {
+  // Its id, and its state: accepted or discarded, as the request said.
   AssistantProposal proposal = 1;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message CancelJobResponse {}
+
+message ListProposalsRequest {}
+
+message ListProposalsResponse {
+  repeated OpenProposal proposals = 1;
+}
+
+// OpenProposal is a workflow an agent offered that the person has not
+// decided. Apply it with SaveWorkflow at the person's own level, then
+// ResolveProposal.
+message OpenProposal {
+  int64 id = 1;
+  // The package and its files as text, as the agent offered them.
+  WorkflowDraft draft = 2;
+  // The hash the agent named as the package's base, empty for none.
+  string base_hash = 3;
+  // The assistant job that made it, empty for an edit_workflow proposal.
+  string job_id = 4;
+}
+
+message AssistantResultRequest {
+  string job_id = 1;
+  // What the agent says to the person. Required.
+  string message = 2;
+  // A workflow to offer: its name and every file as text. Required for an edit
+  // or an adaptation, optional for a chat turn.
+  string name = 3;
+  map<string, string> files = 4;
+  // The hash get_workflow gave for the package, empty for a new one.
+  string base_hash = 5;
+}
+
+message AssistantResultResponse {
+  // The stored proposal, 0 when the agent offered no workflow.
+  int64 proposal_id = 1;
+  // Warnings and notes. A draft with an error is refused instead.
+  repeated Finding findings = 2;
 }
 
 // Diagnosis is the first answer of a Debug this turn. Every quote was found
@@ -2002,13 +1985,6 @@ message Evidence {
   // Where the quote came from, such as "run 41 log" or "event 8812".
   string source = 1;
   string quote = 2;
-}
-
-// ChatDone ends a turn. It names the conversation, which is new when the
-// request's conversation_id was 0, and the saved reply.
-message ChatDone {
-  int64 conversation_id = 1;
-  int64 message_id = 2;
 }
 
 message Conversation {

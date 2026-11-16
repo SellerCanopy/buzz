@@ -135,6 +135,7 @@ async fn run(world: &World, outsider: &Keys) {
         catalog: Arc::new(Sources(vec![Source::new("e2e", false, files)])),
         community: world.community,
         hive_pubkey: adapter.pubkey(),
+        relay: None,
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,

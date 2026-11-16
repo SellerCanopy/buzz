@@ -7,6 +7,7 @@ use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::events::Event;
 use buzz_hive_core::orchestrator::Env;
 use buzz_hive_core::ports::code_host::CodeHost;
+use buzz_hive_core::ports::relay::Relay;
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store};
 use buzz_hive_core::resolve::{resolve_actor, Actor};
 use buzz_hive_core::workflow::load::Catalog;
@@ -43,6 +44,9 @@ pub struct App {
     /// The Beehive account's pubkey, hex, empty when the service has no key. It posts to
     /// the update channel, so it must be a member of it.
     pub hive_pubkey: String,
+    /// Posts that belong to no card, such as the assistant's. `None` when the service has no
+    /// relay account. Posts a card makes go through the outbox instead.
+    pub relay: Option<Arc<dyn Relay>>,
     /// Wakes the outbox drain after a commit that queued a post.
     pub outbox: Arc<tokio::sync::Notify>,
     /// Wakes the timer loop after a commit that may have set a timer.

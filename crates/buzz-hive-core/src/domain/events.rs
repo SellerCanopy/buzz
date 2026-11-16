@@ -123,6 +123,13 @@ pub const EVENT_KINDS: &[(&str, u8)] = &[
     // whether it is a draft or approved, or how its checks stand. The payload has the repo, the
     // number and each of those.
     ("pull_request.changed", 18),
+    // The assistant's agent was asked for a job. The payload has the job id, its kind, who it is
+    // for, the thread the agent works in and the agent.
+    ("job.started", 20),
+    // A job ended, once, by the agent's result or by running out of time. A cancelled job has
+    // none. The payload has the job id, its kind, its state (done or failed), the agent's
+    // message and the proposal it stored, or why it failed.
+    ("job.result", 20),
 ];
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

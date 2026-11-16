@@ -8,6 +8,7 @@ mod access;
 mod activity;
 mod agents;
 mod artifacts;
+mod assistant;
 mod cards;
 mod inbox;
 pub mod intake;
@@ -105,6 +106,16 @@ pub const ROUTES: &[(&str, Level)] = &[
     ("ListIssueComments", Level::Read),
     ("MergeCard", Level::Run),
     ("SetMergeOrder", Level::Run),
+    // The assistant's calls only start work and read what it offered: a result is a proposal,
+    // and a person applies it with SaveWorkflow at their own level. The agent reports with
+    // AssistantResult, which the handler holds to the job's own agent.
+    ("StartChat", Level::Read),
+    ("StartProposeWorkflowEdit", Level::Read),
+    ("StartAdaptSkills", Level::Read),
+    ("CancelJob", Level::Read),
+    ("ListProposals", Level::Read),
+    ("ResolveProposal", Level::Read),
+    ("AssistantResult", Level::Read),
 ];
 
 /// Procedures this service does not serve, each with the reason.
@@ -130,7 +141,18 @@ pub const DROPPED: &[(&str, &str)] = &[
     ("SignOut", "team token secret"),
     ("GetCardFilePath", "no local files"),
     ("ReportUsage", "no usage reporter"),
-    ("WatchEvents", "replaced by PollEvents"),
+    (
+        "ListConversations",
+        "the assistant's thread in Buzz is the conversation",
+    ),
+    (
+        "GetConversation",
+        "the assistant's thread in Buzz is the conversation",
+    ),
+    (
+        "DeleteConversation",
+        "the assistant's thread in Buzz is the conversation",
+    ),
 ];
 
 /// The URL path of a procedure.
@@ -244,5 +266,16 @@ pub fn router() -> Router<App> {
     let r = route(r, "ListIssueComments", intake::list_issue_comments);
     let r = route(r, "MergeCard", merge::merge_card);
     let r = route(r, "SetMergeOrder", merge::set_merge_order);
+    let r = route(r, "StartChat", assistant::start_chat);
+    let r = route(
+        r,
+        "StartProposeWorkflowEdit",
+        assistant::start_propose_workflow_edit,
+    );
+    let r = route(r, "StartAdaptSkills", assistant::start_adapt_skills);
+    let r = route(r, "CancelJob", assistant::cancel_job);
+    let r = route(r, "ListProposals", assistant::list_proposals);
+    let r = route(r, "ResolveProposal", assistant::resolve_proposal);
+    let r = route(r, "AssistantResult", assistant::assistant_result);
     route(r, "GetUsage", status::get_usage)
 }

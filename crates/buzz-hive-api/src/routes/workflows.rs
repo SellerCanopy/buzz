@@ -257,7 +257,7 @@ async fn listed(app: &App, ctx: &Ctx, name: &str) -> Result<Workflow, HiveError>
     Ok(workflow_of(&catalog, name, &options))
 }
 
-fn to_findings(findings: &[Finding]) -> Vec<crate::proto::Finding> {
+pub(super) fn to_findings(findings: &[Finding]) -> Vec<crate::proto::Finding> {
     package_check("", "", findings).findings
 }
 

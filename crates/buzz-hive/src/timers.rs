@@ -1,4 +1,6 @@
-//! The loop that carries out timers: a stage's timeout, and the end of a retry's wait.
+//! The loop that carries out timers: a stage's timeout, and the end of a retry's wait. It also
+//! ends the assistant's jobs whose agent never reported: a job is no run, so it keeps its
+//! deadline on its own row, and each pass sweeps the ones that are past it.
 //!
 //! A timer is a row in the store (see `buzz_hive_core::orchestrator::timers`), so a restart
 //! loses nothing: the first pass takes up whatever is due. Timers that came due while the
@@ -18,6 +20,7 @@ use std::time::Duration;
 
 use buzz_hive_core::bus::Bus;
 use buzz_hive_core::domain::timer::Timer;
+use buzz_hive_core::orchestrator::assistant::{expire_jobs, next_deadline_in, SWEEP_BATCH};
 use buzz_hive_core::orchestrator::timers::{due, fire, next_in, spread};
 use buzz_hive_core::orchestrator::{Env, OpError};
 use buzz_hive_core::ports::store::{CommunityId, Directory, Store, StoreError};
@@ -151,6 +154,9 @@ impl TimerLoop {
         stop: &mut watch::Receiver<bool>,
     ) -> Pass {
         failing.prune(Instant::now());
+        if let Err(pass) = self.expire_jobs().await {
+            return pass;
+        }
         let timers = match due(self.store.as_ref(), self.community, BATCH).await {
             Ok(timers) => timers,
             Err(error) => {
@@ -159,7 +165,12 @@ impl TimerLoop {
             }
         };
         if timers.is_empty() {
-            return match next_in(self.store.as_ref(), self.community).await {
+            let next = async {
+                let timer = next_in(self.store.as_ref(), self.community).await?;
+                let job = next_deadline_in(self.store.as_ref(), self.community).await?;
+                Ok::<_, StoreError>(timer.into_iter().chain(job).min())
+            };
+            return match next.await {
                 Ok(next) => Pass::Idle(next.map_or(BACKSTOP, |next| next.min(BACKSTOP))),
                 Err(error) => {
                     tracing::warn!(%error, "cannot read the next timer");
@@ -241,6 +252,31 @@ impl TimerLoop {
             }
         }
         Pass::Worked
+    }
+
+    /// Ends the assistant's jobs that are past their deadline, as failed. `Err` carries the
+    /// pass to return when the store failed.
+    async fn expire_jobs(&self) -> Result<(), Pass> {
+        let catalog = self.catalog.load();
+        let env = Env {
+            store: self.store.as_ref(),
+            directory: self.directory.as_ref(),
+            catalog: &catalog,
+            hive: &self.hive,
+        };
+        match expire_jobs(&env, self.community, SWEEP_BATCH).await {
+            Ok(events) => {
+                if !events.is_empty() {
+                    tracing::info!(jobs = events.len(), "assistant jobs ended without a result");
+                    self.bus.publish(&events);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot end the assistant jobs that ran out of time");
+                Err(Pass::Failed)
+            }
+        }
     }
 
     /// Sets `timer` to fire `wait` from now, in place of the time it had.

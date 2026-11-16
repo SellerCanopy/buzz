@@ -68,7 +68,7 @@ seeded. A directory is `pending` until the phase that ports it names it.
 | `api` | 23 | pending | unassigned |
 | `cmd/carrier-runner` | 1 | dropped (local runner) | 1 |
 | `cmd/kiln-engine` | 88 | pending | unassigned |
-| `core/assistant` | 15 | pending | 20 |
+| `core/assistant` | 15 | changed (Phase 20: the assistant is a Buzz agent. `StartChat`, `StartProposeWorkflowEdit` and `StartAdaptSkills` open a job in `orchestrator/assistant.rs`, mention the agent named by the `assistant_agent` setting in the update channel, and return a job id. The agent reports once with the `assistant_result` tool, and the result reaches the client as one `job.result` event on `PollEvents`. A workflow it offers is a `hive.proposals` row for the requester, applied with `SaveWorkflow`. The Go prompt building, streaming and conversation store are not ported) | 20 |
 | `core/background` | 9 | changed (Phase 18: `background/pull_requests.rs` decides which cards are read and when, and `buzz-hive/src/intake.rs` runs it beside the comment loop. The rest of the Go background jobs are not ported) | 18 |
 | `core/config` | 1 | ported | 6 |
 | `core/domain` | 12 | pending | unassigned |
@@ -107,7 +107,7 @@ spec's title and are confirmed when that phase starts.
 | `answers` | changed (Phase 12 answers an approval with Approve or Reject and a reason, a `needs_input` result with a reply, and the other items with retry, skip, stop or dismiss, in `tests/inbox.rs`, `buzz-hive-api/tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`. The Go spec's permission requests and its field and multi-question forms are not ported: `AnswerInbox` refuses `values_json` and `answers`) | 12 |
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
 | `artifacts` | changed (Phase 9 ports the contract: save, versions, read, hand-off, the stage-declared outputs rule and the task message naming inputs, in `tests/artifacts.rs` and `buzz-hive-api/tests/artifacts.rs`. The Go spec's approval and image-review screens are not ported; buzz-app `e2e` carries the Files tab) | 9 |
-| `assistant` | pending | 20 |
+| `assistant` | changed (Phase 20: the contract is ported in `buzz-hive-api/tests/assistant.rs`, `buzz-hive-core/tests/event_coverage.rs`, `buzz-hive/tests/timer_loop.rs` and `buzz-hive-store/tests/postgres_jobs.rs`: a job result is one event, a dropped poll resumes, a cancelled job ends with none, a result from another agent is refused, a stale job ends failed and a thread runs one job. The Go spec's streamed answer, attachments and conversation list are not ported, and a script-agent end to end run is deferred) | 20 |
 | `auto-mode` | changed (Phase 13 ports the contract: a card in auto mode has its approval gates approved when every listed artifact has a saved version, a failed run started again twice and a stage with no result asked to carry on twice, each with its reason in Activity, and a loop that is never unbounded. The Go spec's cost-cap cases, its Ask recommendations and forms and its paused-turn reply are dropped, see the Phase 13 deliverables. The Switch and the Activity entry are covered in buzz-app `ActivityTab.test.tsx` and `BeehivePage.test.tsx`) | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
 | `boot` | pending | 3 |
@@ -604,3 +604,21 @@ spec's title and are confirmed when that phase starts.
   pause and skip of a wait, the rpi workflow resolving), `rules/wait.rs` units; api
   `tests/merge.rs`; store `tests/postgres_pull_requests.rs` and `postgres_runs.rs`; binary
   `tests/github_adapter.rs` and `tests/intake_loop.rs` (paused time).
+
+## Phase 20: the assistant's jobs
+
+- Migration `0018_assistant_jobs.sql` makes `hive.jobs`. A job has a kind, a requester, the
+  agent that may report it, the thread (`root_event_id`) and a `deadline`. A partial unique
+  index allows one running job per thread.
+- No conversation id: the first job's `root_event_id` names the thread, and a later chat turn
+  is a new job whose request names that root.
+- Beehive posts the mention and the reply straight through the `Relay` port, not the outbox,
+  because `hive.outbox.card_id` is not null.
+- Served: `StartChat`, `StartProposeWorkflowEdit`, `StartAdaptSkills`, `CancelJob`,
+  `ListProposals`, `ResolveProposal` and the tool `assistant_result`. All are Read: every
+  result is only a proposal, and `SaveWorkflow` checks the person's own level.
+- Dropped: `WatchEvents`, `ProposeWorkflowEdit`, `AdaptSkills` and `Chat` (the streaming
+  calls), and `ListConversations`, `GetConversation` and `DeleteConversation` (the thread in
+  Buzz is the conversation).
+- Events: `job.started` and `job.result`. A job that runs out of time ends `failed` with one
+  `job.result`, from the timer loop's sweep.

@@ -15,7 +15,7 @@ use buzz_hive_core::domain::card::{Card, CardState};
 use buzz_hive_core::domain::run::Run;
 use buzz_hive_core::domain::timer::TimerKind;
 use buzz_hive_core::orchestrator::timers::{due, next_in};
-use buzz_hive_core::ports::store::{CommunityId, Store, StoreError, Tx};
+use buzz_hive_core::ports::store::{CommunityId, Job, JobState, Store, StoreError, Tx};
 use buzz_hive_core::testing::{FakeDirectory, ManualClock, MemStore};
 use buzz_hive_core::workflow::source::Sources;
 use tokio::sync::{watch, Notify};
@@ -273,4 +273,44 @@ async fn a_stop_during_the_spread_ends_the_loop_at_once() {
         .await
         .expect("the loop ended within the stop")
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_that_is_never_reported_ends_failed_when_its_deadline_passes() {
+    let h = start();
+    tokio::time::sleep(secs(2) + CATCH_UP_WINDOW).await;
+    let id = Uuid::from_u128(5);
+    let mut tx = h.mem.begin(COMMUNITY).await.unwrap();
+    tx.jobs()
+        .insert(
+            &Job {
+                id,
+                kind: "chat".into(),
+                requester: "aa".into(),
+                state: JobState::Running,
+                channel: Uuid::from_u128(77),
+                root_event_id: Some("root".into()),
+                agent: "dd".into(),
+            },
+            Some(secs(120)),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    h.wake.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let state = |h: &Harness| {
+        let mem = h.mem.clone();
+        async move {
+            let mut tx = mem.begin(COMMUNITY).await.unwrap();
+            tx.jobs().get_for_update(id).await.unwrap().unwrap().state
+        }
+    };
+    assert_eq!(state(&h).await, JobState::Running, "not overdue yet");
+
+    // The loop sleeps until the deadline, not for the whole backstop.
+    h.clock.advance(secs(121));
+    tokio::time::sleep(secs(125)).await;
+    assert_eq!(state(&h).await, JobState::Failed);
+    h.finish().await;
 }

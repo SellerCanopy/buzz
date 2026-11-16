@@ -57,6 +57,7 @@ pub fn app_with(directory: FakeDirectory, store: MemStore) -> App {
         catalog: Arc::new(Sources(vec![builtin_source()])),
         community: community(),
         hive_pubkey: HIVE.into(),
+        relay: None,
         outbox: Arc::new(tokio::sync::Notify::new()),
         timers: Arc::new(tokio::sync::Notify::new()),
         code_host: None,
