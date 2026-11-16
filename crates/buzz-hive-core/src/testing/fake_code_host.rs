@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::card::PullRequest;
 use crate::domain::intake::{Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef};
 use crate::ports::code_host::{
-    Check, CodeHost, HostError, MergeMethod, NewPullRequest, PullStatus,
+    Check, CodeHost, HostError, MergeMethod, NewPullRequest, PullChecks, PullStatus,
 };
 
 #[derive(Default)]
@@ -24,6 +24,14 @@ struct Inner {
     /// The checks and labels of the pull requests, by repo and number.
     checks: std::collections::BTreeMap<(String, u64), Vec<Check>>,
     labels: std::collections::BTreeMap<(String, u64), Vec<String>>,
+    /// The head commit of the pull requests whose head was pushed to, by repo and number. One
+    /// not named has `head-1`.
+    heads: std::collections::BTreeMap<(String, u64), String>,
+    /// Pull requests whose head moves once their checks have been read.
+    moves_after_checks: std::collections::BTreeSet<(String, u64)>,
+    /// Every read of an issue's comments waits here after it has listed them, so a test can have
+    /// two passes read before either one records.
+    comment_gate: Option<Arc<tokio::sync::Barrier>>,
     /// Every call made, as a line such as `list_issues example-org/api page 1`.
     calls: Vec<String>,
 }
@@ -131,6 +139,33 @@ impl FakeCodeHost {
             .insert((repo.to_string(), number), checks);
     }
 
+    /// Makes every `list_comments` wait at `gate` once it has read the comments, and answer
+    /// when the gate opens. The answer is what was listed before the wait.
+    pub fn hold_comment_reads(&self, gate: Arc<tokio::sync::Barrier>) {
+        self.inner.lock().unwrap().comment_gate = Some(gate);
+    }
+
+    /// Pushes a new commit to the pull request's branch, as a person or an agent would.
+    pub fn push_to_pull(&self, repo: &RepoRef, number: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.push_head(&(repo.to_string(), number));
+    }
+
+    /// Makes the next read of the pull request's checks be followed by a push to its branch,
+    /// the way one lands between reading the checks and merging.
+    pub fn push_after_checks(&self, repo: &RepoRef, number: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .moves_after_checks
+            .insert((repo.to_string(), number));
+    }
+
+    /// The head commit the host reports for a pull request.
+    pub fn head_of(&self, repo: &RepoRef, number: u64) -> String {
+        self.inner.lock().unwrap().head(&(repo.to_string(), number))
+    }
+
     /// Sets the labels the host reports on a pull request.
     pub fn set_pull_labels(&self, repo: &RepoRef, number: u64, labels: &[&str]) {
         self.inner.lock().unwrap().labels.insert(
@@ -159,6 +194,25 @@ impl FakeCodeHost {
             Some(error) => Err(error),
             None => Ok(inner),
         }
+    }
+}
+
+impl Inner {
+    fn head(&self, pull: &(String, u64)) -> String {
+        self.heads
+            .get(pull)
+            .cloned()
+            .unwrap_or_else(|| "head-1".to_owned())
+    }
+
+    fn push_head(&mut self, pull: &(String, u64)) {
+        let next = self
+            .head(pull)
+            .trim_start_matches("head-")
+            .parse::<u64>()
+            .unwrap_or(0)
+            + 1;
+        self.heads.insert(pull.clone(), format!("head-{next}"));
     }
 }
 
@@ -247,16 +301,22 @@ impl CodeHost for FakeCodeHost {
         number: u64,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<Comment>, HostError> {
-        let inner = self.enter(format!("list_comments {repo}#{number}"))?;
-        let mut found: Vec<Comment> = inner
-            .comments
-            .iter()
-            .filter(|(r, n, c, _)| {
-                r == repo && *n == number && since.is_none_or(|s| c.created_at > s)
-            })
-            .map(|(_, _, c, _)| c.clone())
-            .collect();
+        let (mut found, gate): (Vec<Comment>, _) = {
+            let inner = self.enter(format!("list_comments {repo}#{number}"))?;
+            let found = inner
+                .comments
+                .iter()
+                .filter(|(r, n, c, _)| {
+                    r == repo && *n == number && since.is_none_or(|s| c.created_at > s)
+                })
+                .map(|(_, _, c, _)| c.clone())
+                .collect();
+            (found, inner.comment_gate.clone())
+        };
         found.sort_by_key(|c| (c.created_at, c.id));
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
         Ok(found)
     }
 
@@ -343,13 +403,17 @@ impl CodeHost for FakeCodeHost {
         })
     }
 
-    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError> {
-        let inner = self.enter(format!("list_checks {repo}#{number}"))?;
-        Ok(inner
-            .checks
-            .get(&(repo.to_string(), number))
-            .cloned()
-            .unwrap_or_default())
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<PullChecks, HostError> {
+        let mut inner = self.enter(format!("list_checks {repo}#{number}"))?;
+        let pull = (repo.to_string(), number);
+        let read = PullChecks {
+            head_sha: inner.head(&pull),
+            checks: inner.checks.get(&pull).cloned().unwrap_or_default(),
+        };
+        if inner.moves_after_checks.remove(&pull) {
+            inner.push_head(&pull);
+        }
+        Ok(read)
     }
 
     async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError> {
@@ -375,8 +439,10 @@ impl CodeHost for FakeCodeHost {
         repo: &RepoRef,
         number: u64,
         method: MergeMethod,
+        head_sha: Option<&str>,
     ) -> Result<(), HostError> {
         let mut inner = self.enter(format!("merge {repo}#{number} {}", method.as_str()))?;
+        let head = inner.head(&(repo.to_string(), number));
         let pull = inner
             .pulls
             .iter_mut()
@@ -386,6 +452,9 @@ impl CodeHost for FakeCodeHost {
         match pull.state.as_str() {
             "merged" => Ok(()),
             "closed" => Err(HostError::Rejected(format!("{repo}#{number} is closed"))),
+            _ if head_sha.is_some_and(|sha| sha != head) => Err(HostError::Rejected(format!(
+                "{repo}#{number}: head branch was modified"
+            ))),
             _ if pull.draft => Err(HostError::Rejected(format!("{repo}#{number} is a draft"))),
             _ => {
                 pull.state = "merged".into();

@@ -825,6 +825,8 @@ impl<'a> Walk<'a> {
                         .map_or("", ActionArg::text);
                     PullCall::Merge {
                         method: MergeMethod::parse(method).unwrap_or_default(),
+                        // Filled in from the stored pull request when the call is queued.
+                        head_sha: None,
                     }
                 };
                 self.run.state = RunState::Running;

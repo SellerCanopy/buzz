@@ -2,7 +2,8 @@
 //!
 //! The pull request is read from the host first, so the button works from what GitHub says now,
 //! not from the last sync. Nothing is merged unless the pull request is open, out of draft and
-//! its checks have finished and passed. After the host has merged it, a stage that waits for the
+//! its checks have finished and passed, and the merge names the commit those checks are of, so
+//! a push after they were read is refused instead of merged unchecked. After the host has merged it, a stage that waits for the
 //! merge passes, and a stage the workflow holds after it (the `cleanup` stage of the built-in
 //! workflows) starts.
 
@@ -74,7 +75,8 @@ pub async fn merge_card(
     };
     let repo = RepoRef::parse(&pull.repo).map_err(OpError::FailedPrecondition)?;
     let status = host.get_pull_request(&repo, pull.number).await?;
-    let checks = host.list_checks(&repo, pull.number).await?;
+    let read = host.list_checks(&repo, pull.number).await?;
+    let checks = read.checks;
     match status.pull.state.as_str() {
         "merged" => {}
         "closed" => return Err(precondition("the pull request is closed")),
@@ -91,9 +93,15 @@ pub async fn merge_card(
         _ => match summarize(&checks) {
             "failing" => return Err(precondition("the pull request has failing checks")),
             "pending" => return Err(precondition("the pull request's checks have not finished")),
+            // Pinned to the commit the checks are of: a push since then is refused by the host.
             _ => {
-                host.merge(&repo, pull.number, method.unwrap_or_default())
-                    .await?
+                host.merge(
+                    &repo,
+                    pull.number,
+                    method.unwrap_or_default(),
+                    Some(&read.head_sha),
+                )
+                .await?
             }
         },
     }
@@ -106,6 +114,7 @@ pub async fn merge_card(
             labels: status.labels,
         }),
         checks: Some(checks),
+        head_sha: Some(read.head_sha),
         gone: false,
         now: Utc::now(),
     };

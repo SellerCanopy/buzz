@@ -115,6 +115,33 @@ async fn nothing_is_merged_when_the_checks_have_not_passed() {
 }
 
 #[tokio::test]
+async fn a_push_after_the_checks_were_read_is_refused_and_the_next_try_merges() {
+    let (app, host, card, number) = with_ready_pull_request().await;
+    let repo = buzz_hive_core::domain::intake::RepoRef::parse("example-org/api").unwrap();
+    let checked = host.head_of(&repo, number);
+    // The branch moves between the read of the checks and the merge.
+    host.push_after_checks(&repo, number);
+    let (status, error) = call(&app, "MergeCard", OWNER, json!({"cardId": card["id"]})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert!(
+        error.to_string().contains("head branch was modified"),
+        "{error}"
+    );
+    assert_ne!(host.head_of(&repo, number), checked);
+    let (status, shown) = call(&app, "GetCard", OWNER, json!({"cardId": card["id"]})).await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_ne!(
+        shown["pullRequest"]["state"], "merged",
+        "the unchecked commit was not merged"
+    );
+
+    // The next try reads the checks of the new head and merges that commit.
+    let (status, merged) = call(&app, "MergeCard", OWNER, json!({"cardId": card["id"]})).await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert_eq!(merged["pullRequest"]["state"], "merged");
+}
+
+#[tokio::test]
 async fn a_host_that_refuses_the_token_is_told_and_a_service_with_no_token_says_how_to_set_one() {
     let (app, host, card, _) = with_ready_pull_request().await;
     host.fail_next(HostError::Unauthorized("Bad credentials".into()));

@@ -132,7 +132,8 @@ pub struct Comment {
     pub author: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
-    /// True for a comment Beehive wrote itself, which carries its marker.
+    /// True for a comment Beehive wrote itself: written by the login its token signs in as, and
+    /// carrying its marker. The marker alone does not count, since anyone can type it.
     pub from_hive: bool,
 }
 

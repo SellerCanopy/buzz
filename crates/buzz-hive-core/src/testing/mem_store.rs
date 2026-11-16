@@ -44,6 +44,9 @@ struct State {
     /// In creation order.
     intake: Vec<(CommunityId, IntakeRule)>,
     issues: Vec<(CommunityId, StoredIssue)>,
+    /// When each issue was last read, by community, repo and number.
+    issue_seen:
+        std::collections::BTreeMap<(CommunityId, String, u64), chrono::DateTime<chrono::Utc>>,
     pulls: std::collections::BTreeMap<(CommunityId, uuid::Uuid), PullRequest>,
 }
 
@@ -1481,10 +1484,24 @@ impl IssuesRepo for MemTx {
         issue: &Issue,
         seen_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<StoredIssue, StoreError> {
+        let key = (self.community, issue.repo.to_string(), issue.number);
+        // A read older than the one the row holds leaves it as it is.
+        let newer = self
+            .work
+            .issue_seen
+            .get(&key)
+            .is_none_or(|have| *have <= seen_at);
         if let Some(row) = self.issue_row(&issue.repo, issue.number) {
-            row.issue = issue.clone();
-            return Ok(row.clone());
+            if newer {
+                row.issue = issue.clone();
+            }
+            let row = row.clone();
+            if newer {
+                self.work.issue_seen.insert(key, seen_at);
+            }
+            return Ok(row);
         }
+        self.work.issue_seen.insert(key, seen_at);
         let row = StoredIssue {
             issue: issue.clone(),
             card_id: None,
@@ -1497,6 +1514,14 @@ impl IssuesRepo for MemTx {
     }
 
     async fn get(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError> {
+        Ok(self.issue_row(repo, number).map(|row| row.clone()))
+    }
+
+    async fn get_for_update(
         &mut self,
         repo: &RepoRef,
         number: u64,
@@ -1574,12 +1599,18 @@ impl IssuesRepo for MemTx {
         repo: &RepoRef,
         number: u64,
         left: &str,
-    ) -> Result<(), StoreError> {
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StoreError> {
+        let key = (self.community, repo.to_string(), number);
+        let held = self.work.issue_seen.get(&key).copied();
         let row = self
             .issue_row(repo, number)
             .ok_or_else(|| Self::missing_issue(repo, number))?;
+        if held.is_some_and(|have| have > seen_at) {
+            return Ok(false);
+        }
         row.left = left.to_owned();
-        Ok(())
+        Ok(true)
     }
 
     async fn set_last_comment(
@@ -1591,7 +1622,7 @@ impl IssuesRepo for MemTx {
         let row = self
             .issue_row(repo, number)
             .ok_or_else(|| Self::missing_issue(repo, number))?;
-        row.last_comment_at = Some(at);
+        row.last_comment_at = row.last_comment_at.max(Some(at));
         Ok(())
     }
 }

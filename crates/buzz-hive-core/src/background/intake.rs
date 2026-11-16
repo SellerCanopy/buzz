@@ -192,7 +192,11 @@ pub async fn refresh_rule(
         match row.card_id {
             // A card that was removed is not made again: a person took it off the board.
             Some(_) if row.left.is_empty() => {}
-            Some(_) => tx.issues().set_left(&issue.repo, issue.number, "").await?,
+            Some(_) => {
+                tx.issues()
+                    .set_left(&issue.repo, issue.number, "", now)
+                    .await?;
+            }
             None => {
                 let card = insert_card(
                     &mut *tx,
@@ -226,10 +230,18 @@ pub async fn refresh_rule(
         }
     }
     for (issue, why) in left {
-        tx.issues().upsert(&issue, now).await?;
-        tx.issues().set_left(&issue.repo, issue.number, why).await?;
-        let row = tx.issues().get(&issue.repo, issue.number).await?;
-        let card = match row.and_then(|r| r.card_id) {
+        // The upsert locks the row and returns it as it is now. A pass that read the issue
+        // since this one did, or that marked it already, has the last word.
+        let row = tx.issues().upsert(&issue, now).await?;
+        if !row.left.is_empty()
+            || !tx
+                .issues()
+                .set_left(&issue.repo, issue.number, why, now)
+                .await?
+        {
+            continue;
+        }
+        let card = match row.card_id {
             Some(id) => tx.cards().get(id).await?,
             None => None,
         };

@@ -79,21 +79,23 @@ pub trait CodeHost: Send + Sync {
     /// cannot see is `NotFound`.
     async fn get_pull_request(&self, repo: &RepoRef, number: u64) -> Result<PullStatus, HostError>;
 
-    /// The checks of the pull request's head commit, one per name. A head with none gives an
-    /// empty list.
-    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError>;
+    /// The checks of the pull request's head commit, one per name, with the commit they are
+    /// of. A head with none gives an empty list.
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<PullChecks, HostError>;
 
     /// Takes a draft pull request out of draft. One that is ready already is left as it is.
     async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError>;
 
-    /// Merges the pull request. One that is merged already is left as it is. `Rejected` means
-    /// the host refused: a conflict, a failing required check, a branch rule, or a closed pull
-    /// request.
+    /// Merges the pull request. One that is merged already is left as it is. With `head_sha`,
+    /// the host merges only if the pull request's head is still that commit, so what was
+    /// checked is what is merged. `Rejected` means the host refused: a head that moved, a
+    /// conflict, a failing required check, a branch rule, or a closed pull request.
     async fn merge(
         &self,
         repo: &RepoRef,
         number: u64,
         method: MergeMethod,
+        head_sha: Option<&str>,
     ) -> Result<(), HostError>;
 
     /// The repos the token reaches under `owner`, or every repo it reaches when empty.
@@ -123,6 +125,14 @@ pub struct PullStatus {
     /// is empty: the checks are read by `list_checks`.
     pub pull: PullRequest,
     pub labels: Vec<String>,
+}
+
+/// The checks of a pull request's head commit, and the commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullChecks {
+    /// The head commit the checks are of.
+    pub head_sha: String,
+    pub checks: Vec<Check>,
 }
 
 /// One check of a pull request's head commit.

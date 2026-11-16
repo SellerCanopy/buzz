@@ -101,6 +101,9 @@ pub struct PullRequest {
     /// How its checks stand as last read: empty when none were read, else `pending`, `passed`
     /// or `failed`.
     pub checks: String,
+    /// The head commit `checks` were read for, or empty when none were read. A merge the
+    /// workflow makes is pinned to it, so a push after the read is refused, not merged unchecked.
+    pub head_sha: String,
 }
 
 #[cfg(test)]

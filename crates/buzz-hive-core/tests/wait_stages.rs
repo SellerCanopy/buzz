@@ -19,8 +19,8 @@ use buzz_hive_core::orchestrator::run::{
 };
 use buzz_hive_core::orchestrator::settings::{set_setting, Scope};
 use buzz_hive_core::orchestrator::{timers, Ctx, Env, OpError};
-use buzz_hive_core::ports::code_host::{Check, CheckState, CodeHost, HostError};
-use buzz_hive_core::ports::store::{CommunityId, Store};
+use buzz_hive_core::ports::code_host::{Check, CheckState, CodeHost, HostError, MergeMethod};
+use buzz_hive_core::ports::store::{CommunityId, PullCall, Store};
 use buzz_hive_core::testing::{FakeCodeHost, FakeDirectory, FakeRelay, ManualClock, MemStore};
 use buzz_hive_core::workflow::load::{load, Catalog};
 use buzz_hive_core::workflow::source::{MemSource, Source, Sources};
@@ -78,6 +78,13 @@ fn files() -> MemSource {
             "selfmerge",
             format!(
                 "{code}{pr}  - id: ready\n    kind: action\n    action: mark_ready\n  - id: land\n    kind: action\n    action: merge\n    with: {{ method: rebase }}\n{after}"
+            ),
+        ),
+        // Green checks go on to ready and then to the merge the workflow makes.
+        (
+            "cimerge",
+            format!(
+                "{code}{pr}  - id: validate\n    kind: action\n    action: wait_for_ci\n    on: {{ passed: ready, failed: code }}\n    loop_limit: 2\n  - id: ready\n    kind: action\n    action: mark_ready\n  - id: land\n    kind: action\n    action: merge\n{after}"
             ),
         ),
         // A wait on the pull request with no route for a failure.
@@ -543,6 +550,61 @@ async fn a_workflows_merge_stage_merges_with_its_method_and_the_stage_passes() {
         "{calls:?}"
     );
     assert_eq!(w.stored_pull(card).await.state, "merged");
+}
+
+#[tokio::test]
+async fn a_workflows_merge_is_refused_when_the_branch_moved_after_its_checks_were_read() {
+    let (w, card) = with_pull_request("cimerge").await;
+    w.checks(&[passed("build")]);
+    // The sync reads green checks of the first head and queues the call that takes the pull
+    // request out of draft, which has not run.
+    sync_card(&w.env(), &w.host, COMMUNITY, card, Utc::now() + MINUTE)
+        .await
+        .unwrap();
+    assert_eq!(w.stage(card).await, "ready");
+    assert_eq!(
+        w.stored_pull(card).await.head_sha,
+        w.host.head_of(&repo(), w.number())
+    );
+    // A push lands before the merge is queued and made.
+    w.host.push_to_pull(&repo(), w.number());
+    w.drain().await;
+
+    // The host refused the merge, so nothing merged and the stage says why.
+    assert_eq!(w.host.pull_requests()[0].1.state, "open");
+    let run = w.run(card).await;
+    let failed: Vec<_> = run.steps.iter().filter(|s| s.result == "failed").collect();
+    assert_eq!(failed.len(), 1, "{run:?}");
+    assert!(failed[0].summary.contains("modified"), "{failed:?}");
+    assert_eq!(w.stored_pull(card).await.state, "open");
+}
+
+#[tokio::test]
+async fn a_workflows_merge_of_the_commit_whose_checks_were_read_goes_through() {
+    let (w, card) = with_pull_request("cimerge").await;
+    w.checks(&[passed("build")]);
+    w.sync(card, MINUTE).await;
+    assert_eq!(w.host.pull_requests()[0].1.state, "merged");
+    assert_eq!(w.stage(card).await, "after");
+}
+
+#[test]
+fn a_merge_row_queued_before_the_commit_was_stored_reads_back_unpinned() {
+    // The shape of a row written before the field existed.
+    let old: PullCall =
+        serde_json::from_value(json!({ "call": "merge", "method": "squash" })).unwrap();
+    assert_eq!(
+        old,
+        PullCall::Merge {
+            method: MergeMethod::Squash,
+            head_sha: None
+        }
+    );
+    // Without a sha the row stays as it was, so a queued row reads back the same.
+    assert_eq!(
+        serde_json::to_value(&old).unwrap(),
+        json!({ "call": "merge", "method": "squash" })
+    );
 }
 
 #[tokio::test]

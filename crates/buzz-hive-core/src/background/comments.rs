@@ -2,12 +2,17 @@
 //! agent of the card's current stage.
 //!
 //! Host calls per pass: one list request for each card that is running or waiting, and none
-//! for the rest. A comment is read once: the issue keeps the time of the last one read.
+//! for the rest. A comment is acted on once: the issue keeps a time that comments before it
+//! have been read up to, held [`CURSOR_MARGIN`] behind the newest one so a comment the host
+//! lists late is still found, and a comment already recorded as `comment.received` is skipped
+//! by its id.
 //!
 //! Text from an issue is written by someone outside the team. Only a comment by a login the
 //! card's rule lists as an author reaches an agent, and it reaches the agent quoted, marked as
 //! text from outside. Every other comment is recorded as `comment.received` and goes no
 //! further.
+
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -25,6 +30,11 @@ use crate::rules::run::task_key;
 
 /// The most of a comment an agent is shown, in bytes.
 pub const MAX_DELIVERED_BYTES: usize = 8 * 1024;
+/// How far behind the newest comment read the issue's cursor is kept. The host may list a
+/// comment some time after a newer one, and a comment older than the cursor is never asked for.
+pub const CURSOR_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+/// Events read at a time when looking for the comments already recorded.
+const SEEN_PAGE: i64 = 500;
 
 /// What a pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -121,27 +131,48 @@ async fn record(
     comments: Vec<Comment>,
     now: DateTime<Utc>,
 ) -> Result<(Polled, Vec<Event>), OpError> {
-    let since = row.last_comment_at;
-    let new: Vec<Comment> = comments
-        .into_iter()
-        .filter(|c| !c.from_hive && since.is_none_or(|s| c.created_at > s) && c.created_at <= now)
-        .collect();
     let mut polled = Polled::default();
     let Some(card_id) = row.card_id else {
         return Ok((polled, Vec::new()));
     };
-    if new.is_empty() {
+    let in_window = |c: &Comment, since: Option<DateTime<Utc>>| {
+        !c.from_hive && since.is_none_or(|s| c.created_at > s) && c.created_at <= now
+    };
+    // The cursor only moves forward, so what the snapshot's cursor rules out stays ruled out.
+    if !comments.iter().any(|c| in_window(c, row.last_comment_at)) {
         return Ok((polled, Vec::new()));
     }
     let mut tx = env.store.begin(community).await?;
+    // The issue row first: another pass over this issue waits here until this one commits, and
+    // then reads the cursor and the comments recorded as this one left them.
+    let Some(locked) = tx
+        .issues()
+        .get_for_update(&row.issue.repo, row.issue.number)
+        .await?
+    else {
+        return Ok((polled, Vec::new()));
+    };
+    let since = locked.last_comment_at;
+    let listed: Vec<Comment> = comments
+        .into_iter()
+        .filter(|c| in_window(c, since))
+        .collect();
+    if listed.is_empty() {
+        return Ok((polled, Vec::new()));
+    }
+    let seen = seen_comments(&mut *tx, card_id).await?;
     let trusted = match row.rule_id {
         Some(rule) => tx.intake().get(rule).await?.map(|r| r.filter),
         None => None,
     };
     let actor = system(env);
-    let mut latest = since;
-    for comment in &new {
+    let mut latest: Option<DateTime<Utc>> = None;
+    for comment in &listed {
         latest = latest.max(Some(comment.created_at));
+        // Listed again because the cursor is held back: it was recorded by an earlier pass.
+        if seen.contains(&comment.id) {
+            continue;
+        }
         let mut delivered = None;
         if trusted.as_ref().is_some_and(|f| f.trusts(&comment.author)) {
             delivered = deliver(&mut *tx, row, card_id, comment).await?;
@@ -181,12 +212,35 @@ async fn record(
             polled.delivered += 1;
         }
     }
-    if let Some(at) = latest {
+    if let Some(latest) = latest {
         tx.issues()
-            .set_last_comment(&row.issue.repo, row.issue.number, at)
+            .set_last_comment(
+                &row.issue.repo,
+                row.issue.number,
+                latest.min(now - CURSOR_MARGIN),
+            )
             .await?;
     }
     Ok((polled, tx.commit().await?))
+}
+
+/// The ids of the comments of the card's issue already recorded as `comment.received`.
+async fn seen_comments(tx: &mut dyn Tx, card_id: uuid::Uuid) -> Result<HashSet<u64>, OpError> {
+    let mut seen = HashSet::new();
+    let mut after = 0;
+    loop {
+        let page = tx
+            .events()
+            .of_card(card_id, "comment.received", after, SEEN_PAGE)
+            .await?;
+        for event in &page {
+            after = event.seq;
+            seen.extend(event.payload.get("comment_id").and_then(|id| id.as_u64()));
+        }
+        if (page.len() as i64) < SEEN_PAGE {
+            return Ok(seen);
+        }
+    }
 }
 
 /// Queues the comment into the thread of the card's current stage. `None` when the card has
@@ -231,6 +285,9 @@ async fn deliver(
         agent,
         text: delivered_text(&row.issue.repo, row.issue.number, comment),
     };
-    tx.outbox().enqueue(&key, card_id, &posting).await?;
+    // A key already queued is a comment already handed over.
+    if !tx.outbox().enqueue(&key, card_id, &posting).await? {
+        return Ok(None);
+    }
     Ok(Some((stage, visit)))
 }

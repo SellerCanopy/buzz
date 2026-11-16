@@ -422,12 +422,17 @@ pub enum Posting {
 }
 
 /// What a [`Posting::PullCall`] asks of the code host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum PullCall {
     MarkReady,
     Merge {
         method: crate::ports::code_host::MergeMethod,
+        /// The head commit whose checks were last read. The host merges only if the pull
+        /// request still has it. Rows queued before this field existed, and cards whose checks
+        /// were never read, have none and merge unpinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
     },
 }
 
@@ -507,7 +512,8 @@ pub trait IssuesRepo: Send {
     /// Writes what the host reports of an issue and keeps what Beehive made of it, then
     /// returns the row. The row stays locked until the transaction ends, so two passes
     /// that meet one issue do not both make a card for it. A new issue starts reading
-    /// comments from `seen_at`.
+    /// comments from `seen_at`. A read older than the one the row holds (`seen_at` before the
+    /// time it was last read) is not written: the row is returned as it is.
     async fn upsert(
         &mut self,
         issue: &Issue,
@@ -515,6 +521,13 @@ pub trait IssuesRepo: Send {
     ) -> Result<StoredIssue, StoreError>;
     async fn get(&mut self, repo: &RepoRef, number: u64)
         -> Result<Option<StoredIssue>, StoreError>;
+    /// Like `get`, and the row stays locked until the transaction ends, so what is read under
+    /// it is not changed by another transaction before this one commits.
+    async fn get_for_update(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError>;
     /// The issue a card was made from.
     async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<StoredIssue>, StoreError>;
     /// Every issue that has a card, for the board to show which issue each card came from.
@@ -532,9 +545,18 @@ pub trait IssuesRepo: Send {
         card: uuid::Uuid,
         rule: Option<uuid::Uuid>,
     ) -> Result<(), StoreError>;
-    /// Records why an issue left its rule's search, or clears it with an empty `left`.
-    async fn set_left(&mut self, repo: &RepoRef, number: u64, left: &str)
-        -> Result<(), StoreError>;
+    /// Records why an issue left its rule's search, or clears it with an empty `left`. `seen_at`
+    /// is when the read that decided it was made: a row read since then is left as it is, and
+    /// `false` says so.
+    async fn set_left(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+        left: &str,
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StoreError>;
+    /// Moves the time comments have been read up to `at`. It never moves back: an `at` before
+    /// the one held leaves it as it is.
     async fn set_last_comment(
         &mut self,
         repo: &RepoRef,

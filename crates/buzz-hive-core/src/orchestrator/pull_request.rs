@@ -161,7 +161,7 @@ pub async fn finish_call(
             RESULT_PASSED,
             format!("marked pull request #{number} in {repo} ready for review"),
         ),
-        (Ok(()), PullCall::Merge { method }) => (
+        (Ok(()), PullCall::Merge { method, .. }) => (
             Put::Merged,
             RESULT_PASSED,
             format!(

@@ -23,7 +23,7 @@ use crate::domain::inbox::{InboxItem, ANSWER_SUPERSEDED};
 use crate::domain::run::{Run, RunState};
 use crate::domain::timer::TimerKind;
 use crate::domain::workflow::Duration as SettingDuration;
-use crate::ports::store::{Posting, Pubkey, Tx};
+use crate::ports::store::{Posting, Pubkey, PullCall, Tx};
 use crate::rules::run::{
     entry_stage, step, task_key, Effect, Ended, Execution, Facts, Input, Note, Round, Step,
 };
@@ -460,6 +460,23 @@ pub(super) async fn apply(
                 call,
                 key,
             } => {
+                // A merge goes to the commit whose checks the sync last read. A card with none
+                // read merges unpinned, as the host's own rules decide.
+                let call = match call {
+                    PullCall::Merge {
+                        method,
+                        head_sha: None,
+                    } => PullCall::Merge {
+                        method,
+                        head_sha: tx
+                            .pull_requests()
+                            .by_card(id)
+                            .await?
+                            .map(|pull| pull.head_sha)
+                            .filter(|sha| !sha.is_empty()),
+                    },
+                    other => other,
+                };
                 let posting = Posting::PullCall {
                     stage,
                     visit,

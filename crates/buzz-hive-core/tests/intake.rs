@@ -255,6 +255,93 @@ async fn a_card_whose_issue_leaves_the_search_is_marked_once_with_why() {
     assert_eq!(tx.issues().get(&repo(), 1).await.unwrap().unwrap().left, "");
 }
 
+/// One pass whose read of the host is dated `now`, with its outcome and events.
+async fn pass_at(
+    f: &Fixture,
+    host: &FakeCodeHost,
+    rule: &IntakeRule,
+    now: chrono::DateTime<Utc>,
+) -> (Outcome, Vec<buzz_hive_core::domain::events::Event>) {
+    refresh_rule(&f.env(), host, COMMUNITY, rule.id, now)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_pass_that_read_the_host_before_a_newer_one_does_not_undo_its_mark() {
+    let f = Fixture::new();
+    let host = FakeCodeHost::new();
+    host.put_issue(issue(1, "Original"));
+    let mut r = rule("");
+    r.filter.label = Some("bug".into());
+    let r = saved(&f, r).await;
+    let t0 = Utc::now();
+    pass_at(&f, &host, &r, t0).await;
+
+    // A newer pass sees the label gone and marks the issue.
+    let mut relabelled = issue(1, "Newer title");
+    relabelled.labels = vec!["wontfix".into()];
+    host.put_issue(relabelled);
+    let (newer, events) = pass_at(&f, &host, &r, t0 + Duration::seconds(120)).await;
+    assert_eq!(newer.left, 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == "card.left_intake")
+            .count(),
+        1
+    );
+
+    // An older pass read the host while the label was still there, and commits after it.
+    host.put_issue(issue(1, "Older title"));
+    let (older, events) = pass_at(&f, &host, &r, t0 + Duration::seconds(60)).await;
+    assert_eq!(older.matched, 1, "it did read the issue as matching");
+    assert!(events.iter().all(|e| e.kind != "card.left_intake"));
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let row = tx.issues().get(&repo(), 1).await.unwrap().unwrap();
+    assert_eq!(row.left, "unmatched", "the mark stands");
+    assert_eq!(row.issue.title, "Newer title", "the newer read stands");
+    drop(tx);
+
+    // A pass later than both brings it back, as any pass would.
+    let back = pass_at(&f, &host, &r, t0 + Duration::seconds(180)).await.0;
+    assert_eq!((back.matched, back.added.len()), (1, 0));
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let row = tx.issues().get(&repo(), 1).await.unwrap().unwrap();
+    assert_eq!(
+        (row.left.as_str(), row.issue.title.as_str()),
+        ("", "Older title")
+    );
+}
+
+#[tokio::test]
+async fn a_pass_that_read_the_host_before_a_newer_one_does_not_mark_what_it_matched() {
+    let f = Fixture::new();
+    let host = FakeCodeHost::new();
+    host.put_issue(issue(1, "Original"));
+    let mut r = rule("");
+    r.filter.label = Some("bug".into());
+    let r = saved(&f, r).await;
+    let t0 = Utc::now();
+    pass_at(&f, &host, &r, t0).await;
+    // A newer pass finds the issue still matching.
+    pass_at(&f, &host, &r, t0 + Duration::seconds(120)).await;
+
+    // An older pass read the host after the label was removed, and commits after the newer one.
+    let mut relabelled = issue(1, "Stale title");
+    relabelled.labels = vec!["wontfix".into()];
+    host.put_issue(relabelled);
+    let (older, events) = pass_at(&f, &host, &r, t0 + Duration::seconds(60)).await;
+    assert_eq!(older.left, 0);
+    assert!(events.iter().all(|e| e.kind != "card.left_intake"));
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let row = tx.issues().get(&repo(), 1).await.unwrap().unwrap();
+    assert_eq!(
+        (row.left.as_str(), row.issue.title.as_str()),
+        ("", "Original")
+    );
+}
+
 #[tokio::test]
 async fn an_issue_that_is_gone_from_the_host_is_unmatched() {
     let f = Fixture::new();
@@ -561,6 +648,121 @@ async fn a_trusted_comment_reaches_the_stages_agent_quoted_and_others_do_not() {
         .unwrap();
     assert_eq!(again, Polled::default());
     assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn a_comment_the_host_lists_after_a_newer_one_is_still_delivered_once() {
+    let f = Fixture::new();
+    let host = FakeCodeHost::new();
+    let (_, card) = running_card(&f, &host).await;
+    let start = Utc::now();
+    // The newer comment is listed first. The older one is not visible yet.
+    let newer = host.put_comment(&repo(), 1, "octo", "second", start + Duration::seconds(30));
+    let (first, _) = poll_comments(&f.env(), &host, COMMUNITY, start + Duration::seconds(40))
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        Polled {
+            received: 1,
+            delivered: 1
+        }
+    );
+
+    // The older one shows up on a later pass. Its time is before the newer one's.
+    let older = host.put_comment(&repo(), 1, "octo", "first", start + Duration::seconds(20));
+    let (second, events) = poll_comments(&f.env(), &host, COMMUNITY, start + Duration::seconds(90))
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        Polled {
+            received: 1,
+            delivered: 1
+        },
+        "the newer comment was listed again and not taken twice"
+    );
+    assert_eq!(events[0].payload["comment_id"], older);
+
+    // Later passes find nothing new, and each comment was queued once.
+    for at in [100, 200, 300] {
+        let (again, events) =
+            poll_comments(&f.env(), &host, COMMUNITY, start + Duration::seconds(at))
+                .await
+                .unwrap();
+        assert_eq!(again, Polled::default());
+        assert!(events.is_empty());
+    }
+    let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+    let rows = tx.outbox().all().await.unwrap();
+    for id in [older, newer] {
+        let key = comment_key(&repo(), 1, id);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.card_id == card && r.key.contains(&key))
+                .count(),
+            1,
+            "comment {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_comment_already_queued_for_the_agent_is_not_logged_as_delivered_again() {
+    use buzz_hive_core::rules::run::task_key;
+
+    let f = Fixture::new();
+    let host = FakeCodeHost::new();
+    let (_, card) = running_card(&f, &host).await;
+    let start = Utc::now();
+    let id = host.put_comment(&repo(), 1, "octo", "hello", start + Duration::seconds(5));
+    // The post for this comment is queued already, as another pass would have left it.
+    let queued = {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        let rows = tx.outbox().all().await.unwrap();
+        rows.into_iter()
+            .find(|r| matches!(r.posting, Posting::StageTask { .. }))
+            .unwrap()
+    };
+    let Posting::StageTask {
+        channel,
+        agent,
+        agent_name,
+        ..
+    } = queued.posting.clone()
+    else {
+        unreachable!()
+    };
+    let (stage, visit) = f.at(card).await;
+    {
+        let mut tx = f.store.begin(COMMUNITY).await.unwrap();
+        let key = format!(
+            "{}:{}",
+            task_key(card, &stage, visit),
+            comment_key(&repo(), 1, id)
+        );
+        let posting = Posting::StageReply {
+            channel,
+            stage,
+            visit,
+            agent_name,
+            agent,
+            text: "queued before".into(),
+        };
+        assert!(tx.outbox().enqueue(&key, card, &posting).await.unwrap());
+        tx.commit().await.unwrap();
+    }
+    let (polled, events) = poll_comments(&f.env(), &host, COMMUNITY, start + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        polled,
+        Polled {
+            received: 1,
+            delivered: 0
+        }
+    );
+    assert!(events.iter().all(|e| e.kind != "comment.delivered"));
 }
 
 #[tokio::test]

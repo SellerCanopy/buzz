@@ -203,7 +203,10 @@ async fn host_call(
                 (Some(host), Ok(repo)) => {
                     let made = match call {
                         PullCall::MarkReady => host.mark_ready(&repo, *number).await,
-                        PullCall::Merge { method } => host.merge(&repo, *number, *method).await,
+                        PullCall::Merge { method, head_sha } => {
+                            host.merge(&repo, *number, *method, head_sha.as_deref())
+                                .await
+                        }
                     };
                     match made {
                         Ok(()) => Ok(()),

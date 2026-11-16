@@ -670,9 +670,8 @@ message Card {
   // idle, running, waiting, failed, done or stopped.
   string state = 6;
   // Why the card's issue left its intake rule's search after the card
-  // ran: closed, reassigned or unmatched. Empty while it is in the search.
-  // A repos-and-label rule keeps a held issue in its search, so there
-  // reassigned marks a card whose issue someone else holds.
+  // ran: closed or unmatched. Empty while it is in the search. Readers
+  // should also show reassigned, which a later engine may write.
   string intake_status = 7;
   // The newest pull request Kiln opened for the card's issue, unset when
   // there is none.
@@ -2593,11 +2592,11 @@ message Intake {
   // A search in the host's own syntax, such as
   // "repo:acme/api is:open label:kiln".
   string query = 2;
-  // How often the search runs, in seconds; 0 is five minutes, and the
+  // How often the search runs, in seconds; 0 is fifteen minutes, and the
   // least is 60.
   int32 interval_s = 3;
-  // unassigned_or_me (the default) takes issues no one, or the person, is
-  // assigned; anyone takes them all.
+  // anyone (the default, also written as empty) takes every issue;
+  // unassigned takes only issues no one is assigned.
   string assignees = 4;
   // When set, only issues these logins opened.
   repeated string authors = 5;

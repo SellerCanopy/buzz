@@ -40,6 +40,7 @@ fn pull(number: u64, state: &str) -> PullRequest {
         draft: true,
         approved: false,
         checks: String::new(),
+        head_sha: "abc123".into(),
     }
 }
 

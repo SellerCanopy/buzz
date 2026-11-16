@@ -129,7 +129,11 @@ async fn a_new_read_keeps_what_beehive_made_of_the_issue() {
         .attach(&repo(), 7, Uuid::from_u128(5), Some(Uuid::from_u128(1)))
         .await
         .unwrap();
-    tx.issues().set_left(&repo(), 7, "closed").await.unwrap();
+    assert!(tx
+        .issues()
+        .set_left(&repo(), 7, "closed", at(0))
+        .await
+        .unwrap());
     tx.issues()
         .set_last_comment(&repo(), 7, at(30))
         .await
@@ -168,7 +172,7 @@ async fn a_new_read_keeps_what_beehive_made_of_the_issue() {
     );
     // Closed and left, so nothing to poll comments on.
     assert!(tx.issues().watched().await.unwrap().is_empty());
-    tx.issues().set_left(&repo(), 7, "").await.unwrap();
+    assert!(tx.issues().set_left(&repo(), 7, "", at(90)).await.unwrap());
     tx.issues().upsert(&issue(7), at(120)).await.unwrap();
     assert_eq!(tx.issues().watched().await.unwrap().len(), 1);
 
@@ -260,5 +264,157 @@ async fn two_passes_that_meet_one_new_issue_make_one_card() {
     assert_eq!(
         tx.issues().get(&repo(), 7).await.unwrap().unwrap().card_id,
         Some(Uuid::from_u128(1))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn an_older_read_neither_overwrites_a_newer_one_nor_changes_its_left_mark() {
+    let (store, _guard, _relay) = store("hive_intake").await;
+    let mut tx = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    let mut newer = issue(7);
+    newer.title = "Newer".into();
+    tx.issues().upsert(&newer, at(100)).await.unwrap();
+    assert!(tx
+        .issues()
+        .set_left(&repo(), 7, "unmatched", at(100))
+        .await
+        .unwrap());
+
+    // A pass that read the host before the one above, and commits after it.
+    let mut older = issue(7);
+    older.title = "Older".into();
+    let row = tx.issues().upsert(&older, at(50)).await.unwrap();
+    assert_eq!(row.issue.title, "Newer");
+    assert_eq!(row.left, "unmatched");
+    assert!(!tx.issues().set_left(&repo(), 7, "", at(50)).await.unwrap());
+    let held = tx.issues().get(&repo(), 7).await.unwrap().unwrap();
+    assert_eq!(
+        (held.issue.title.as_str(), held.left.as_str()),
+        ("Newer", "unmatched")
+    );
+
+    // A read made at the same time or later is written.
+    assert!(tx.issues().set_left(&repo(), 7, "", at(100)).await.unwrap());
+    older.title = "Latest".into();
+    assert_eq!(
+        tx.issues()
+            .upsert(&older, at(150))
+            .await
+            .unwrap()
+            .issue
+            .title,
+        "Latest"
+    );
+    // An issue never read is still told apart from one read since.
+    assert!(tx.issues().set_left(&repo(), 8, "", at(0)).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn the_comment_cursor_does_not_move_back() {
+    let (store, _guard, _relay) = store("hive_intake").await;
+    let mut tx = store.begin(CommunityId::from_u128(1)).await.unwrap();
+    tx.issues().upsert(&issue(7), at(0)).await.unwrap();
+    tx.issues()
+        .set_last_comment(&repo(), 7, at(30))
+        .await
+        .unwrap();
+    tx.issues()
+        .set_last_comment(&repo(), 7, at(10))
+        .await
+        .unwrap();
+    let row = tx.issues().get(&repo(), 7).await.unwrap().unwrap();
+    assert_eq!(row.last_comment_at, Some(at(30)));
+    tx.issues()
+        .set_last_comment(&repo(), 7, at(40))
+        .await
+        .unwrap();
+    let row = tx.issues().get(&repo(), 7).await.unwrap().unwrap();
+    assert_eq!(row.last_comment_at, Some(at(40)));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn two_passes_over_the_same_comments_record_each_once_and_the_cursor_holds() {
+    use std::sync::Arc;
+
+    use buzz_hive_core::background::comments::{poll_comments, CURSOR_MARGIN};
+    use buzz_hive_core::orchestrator::Env;
+    use buzz_hive_core::testing::{FakeCodeHost, FakeDirectory};
+    use buzz_hive_core::workflow::load::Catalog;
+
+    let (store, _guard, _relay) = store("hive_intake").await;
+    let community = CommunityId::from_u128(1);
+    let start = at(0);
+    {
+        let mut tx = store.begin(community).await.unwrap();
+        let mut working = card(1);
+        working.state = CardState::Running;
+        tx.cards().insert(&working).await.unwrap();
+        tx.issues().upsert(&issue(7), start).await.unwrap();
+        tx.issues()
+            .attach(&repo(), 7, working.id, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let host = FakeCodeHost::new();
+    let first = host.put_comment(
+        &repo(),
+        7,
+        "mallory",
+        "one",
+        start + chrono::Duration::seconds(10),
+    );
+    let second = host.put_comment(
+        &repo(),
+        7,
+        "mallory",
+        "two",
+        start + chrono::Duration::seconds(20),
+    );
+    // Both passes list the comments before either one records them.
+    host.hold_comment_reads(Arc::new(tokio::sync::Barrier::new(2)));
+    let directory = FakeDirectory::new();
+    let catalog = Catalog::default();
+    let env = Env {
+        store: &store,
+        directory: &directory,
+        catalog: &catalog,
+        hive: "ee",
+    };
+    let now = start + chrono::Duration::seconds(200);
+    let (a, b) = tokio::join!(
+        poll_comments(&env, &host, community, now),
+        poll_comments(&env, &host, community, now)
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a.0.received + b.0.received, 2, "{a:?} {b:?}");
+
+    let mut tx = store.begin(community).await.unwrap();
+    let ids: Vec<u64> = tx
+        .events()
+        .of_card(Uuid::from_u128(1), "comment.received", 0, 100)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.payload["comment_id"].as_u64().unwrap())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        [first, second],
+        "each comment is recorded once: {ids:?}"
+    );
+
+    // The cursor is at the newest comment, which is older than the margin by now, and the pass
+    // that came second did not pull it back.
+    let held = tx.issues().get(&repo(), 7).await.unwrap().unwrap();
+    assert!(now - CURSOR_MARGIN > start + chrono::Duration::seconds(20));
+    assert_eq!(
+        held.last_comment_at,
+        Some(start + chrono::Duration::seconds(20))
     );
 }

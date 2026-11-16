@@ -81,6 +81,7 @@ pub async fn sync_card(
     let mut seen = Seen {
         status: None,
         checks: None,
+        head_sha: None,
         gone: false,
         now,
     };
@@ -89,7 +90,9 @@ pub async fn sync_card(
         match host.get_pull_request(&repo, pull.number).await {
             Ok(status) => {
                 if status.pull.state == "open" {
-                    seen.checks = Some(host.list_checks(&repo, pull.number).await?);
+                    let read = host.list_checks(&repo, pull.number).await?;
+                    seen.checks = Some(read.checks);
+                    seen.head_sha = Some(read.head_sha);
                 }
                 seen.status = Some(status);
             }

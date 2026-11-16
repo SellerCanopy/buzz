@@ -31,6 +31,8 @@ pub struct Seen {
     /// The pull request's checks, or `None` when they were not read: a pull request that is no
     /// longer open has none worth reading.
     pub checks: Option<Vec<Check>>,
+    /// The head commit `checks` are of, when they were read.
+    pub head_sha: Option<String>,
     /// The host no longer has the pull request.
     pub gone: bool,
     /// When the host was read.
@@ -78,6 +80,11 @@ pub(super) async fn store_pull(
     fresh.checks = match &seen.checks {
         Some(checks) => summarize(checks).to_owned(),
         None => stored.checks.clone(),
+    };
+    // The commit stays with the checks it belongs to.
+    fresh.head_sha = match (&seen.checks, &seen.head_sha) {
+        (Some(_), Some(sha)) => sha.clone(),
+        _ => stored.head_sha.clone(),
     };
     if fresh == stored {
         return Ok(());

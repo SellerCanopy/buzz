@@ -246,11 +246,13 @@ async fn a_search_names_the_repo_of_each_hit() {
 #[tokio::test]
 async fn comments_are_read_from_a_time_and_ones_beehive_wrote_are_known() {
     let since = Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap();
-    let replay = Replay::start(vec![Exchange::get(
-        "/repos/example-org/api/issues/42/comments",
-    )
-    .query("since", "2026-03-01T09:00:00Z")
-    .fixture("comments.json")])
+    let replay = Replay::start(vec![
+        Exchange::get("/repos/example-org/api/issues/42/comments")
+            .query("since", "2026-03-01T09:00:00Z")
+            .fixture("comments.json"),
+        // The marker is only believed from the token's own login.
+        Exchange::get("/user").fixture("user.json").any_order(),
+    ])
     .await;
     let comments = github(&replay)
         .await
@@ -264,6 +266,51 @@ async fn comments_are_read_from_a_time_and_ones_beehive_wrote_are_known() {
     assert_eq!(comments[1].author, "mallory");
     assert!(!comments[0].from_hive);
     assert!(comments[2].from_hive, "it carries Beehive's marker");
+    replay.finish();
+}
+
+#[tokio::test]
+async fn the_marker_in_someone_elses_comment_does_not_make_it_beehives() {
+    let list = "/repos/example-org/api/issues/42/comments";
+    let marker = "<!-- buzz-hive:card:example-org/api#42 -->";
+    let forged = format!(
+        r#"[{{"id":700,"body":"Looks fine.\n\n{marker}","created_at":"2026-03-01T10:00:00Z","user":{{"login":"mallory"}}}}]"#
+    );
+    let replay = Replay::start(vec![
+        // Read as comments to hear: the forged one is a stranger's comment.
+        Exchange::get(list).body(&forged),
+        // Written to: Beehive's comment for the key is not there, so it posts its own.
+        Exchange::get(list).body(&forged),
+        Exchange::post(list).status(201).body(r#"{"id": 701}"#),
+        Exchange::get("/user").fixture("user.json").any_order(),
+    ])
+    .await;
+    let github = github(&replay).await;
+    let comments = github.list_comments(&repo(), 42, None).await.unwrap();
+    assert_eq!(comments.len(), 1);
+    assert!(!comments[0].from_hive, "mallory is not the token's login");
+
+    let id = github
+        .comment(&repo(), 42, "Card made.", "card:example-org/api#42")
+        .await
+        .unwrap();
+    assert_eq!(
+        id, 701,
+        "the copied marker did not stand in for Beehive's comment"
+    );
+    let posts = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "POST")
+        .count();
+    assert_eq!(posts, 1);
+    // The login was read once for both calls.
+    let logins = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/user")
+        .count();
+    assert_eq!(logins, 1);
     replay.finish();
 }
 
@@ -309,6 +356,7 @@ async fn a_comment_is_written_once_for_a_key() {
         Exchange::get(list).body(
             r#"[{"id":555,"body":"Card made.\n\n<!-- buzz-hive:card:example-org/api#42 -->","created_at":"2026-03-01T10:00:00Z","user":{"login":"hive-bot"}}]"#,
         ),
+        Exchange::get("/user").fixture("user.json").any_order(),
     ])
     .await;
     let github = github(&replay).await;
@@ -585,11 +633,16 @@ async fn checks_come_from_check_runs_and_statuses_and_the_last_run_of_a_name_sta
         Exchange::get("/repos/example-org/api/commits/abc123/status").fixture("status_abc123.json"),
     ])
     .await;
-    let checks = github(&replay)
+    let read = github(&replay)
         .await
         .list_checks(&repo(), 12)
         .await
         .unwrap();
+    assert_eq!(
+        read.head_sha, "abc123",
+        "the checks name the commit they are of"
+    );
+    let checks = read.checks;
     let seen: Vec<(&str, CheckState)> = checks.iter().map(|c| (c.name.as_str(), c.state)).collect();
     assert_eq!(
         seen,
@@ -666,11 +719,11 @@ async fn a_merge_names_its_method_and_a_merged_pull_request_is_not_merged_again(
     .await;
     let github = github(&replay).await;
     github
-        .merge(&repo(), 12, MergeMethod::Rebase)
+        .merge(&repo(), 12, MergeMethod::Rebase, None)
         .await
         .unwrap();
     github
-        .merge(&repo(), 12, MergeMethod::Rebase)
+        .merge(&repo(), 12, MergeMethod::Rebase, None)
         .await
         .unwrap();
     let puts: Vec<_> = replay
@@ -681,6 +734,39 @@ async fn a_merge_names_its_method_and_a_merged_pull_request_is_not_merged_again(
     assert_eq!(puts.len(), 1);
     let sent: serde_json::Value = serde_json::from_str(&puts[0].body).unwrap();
     assert_eq!(sent, serde_json::json!({ "merge_method": "rebase" }));
+    replay.finish();
+}
+
+#[tokio::test]
+async fn a_merge_names_the_commit_it_was_checked_at_and_a_moved_head_is_refused() {
+    let merge = "/repos/example-org/api/pulls/12/merge";
+    let replay = Replay::start(vec![
+        Exchange::get(PULL_12).fixture("pull_12.json"),
+        Exchange::put(merge)
+            .status(409)
+            .body(r#"{"message":"Head branch was modified. Review and try the merge again."}"#),
+    ])
+    .await;
+    match github(&replay)
+        .await
+        .merge(&repo(), 12, MergeMethod::Squash, Some("abc123"))
+        .await
+        .unwrap_err()
+    {
+        HostError::Rejected(message) => assert!(message.contains("Head branch"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    let puts: Vec<_> = replay
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT")
+        .collect();
+    assert_eq!(puts.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&puts[0].body).unwrap();
+    assert_eq!(
+        sent,
+        serde_json::json!({ "merge_method": "squash", "sha": "abc123" })
+    );
     replay.finish();
 }
 
@@ -697,7 +783,7 @@ async fn a_merge_github_refuses_is_a_rejection_with_its_reason() {
         .await;
         match github(&replay)
             .await
-            .merge(&repo(), 12, MergeMethod::Squash)
+            .merge(&repo(), 12, MergeMethod::Squash, None)
             .await
             .unwrap_err()
         {

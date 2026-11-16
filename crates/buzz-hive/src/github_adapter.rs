@@ -17,7 +17,8 @@ use buzz_hive_core::domain::intake::{
     Comment, CommentId, Issue, IssueFilter, IssueState, Page, RepoRef,
 };
 use buzz_hive_core::ports::code_host::{
-    Check, CheckState, CodeHost, HostError, MergeMethod, NewPullRequest, PullStatus, MAX_REPOS,
+    Check, CheckState, CodeHost, HostError, MergeMethod, NewPullRequest, PullChecks, PullStatus,
+    MAX_REPOS,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ETAG, IF_NONE_MATCH, RETRY_AFTER};
@@ -50,6 +51,8 @@ pub struct GitHub {
     client: reqwest::Client,
     base: Url,
     cache: Mutex<HashMap<String, Cached>>,
+    /// The token's own login, read from the host the first time it is needed.
+    login: tokio::sync::OnceCell<String>,
 }
 
 impl GitHub {
@@ -87,6 +90,7 @@ impl GitHub {
             client,
             base,
             cache: Mutex::new(HashMap::new()),
+            login: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -246,7 +250,25 @@ impl GitHub {
         Ok(items(&body).first().and_then(|item| pull_from(item, repo)))
     }
 
-    /// Every comment on an issue, oldest first, up to [`MAX_COMMENT_PAGES`] pages.
+    /// The login the token signs in as. Read once: it does not change for a token.
+    async fn login(&self) -> Result<&str, HostError> {
+        self.login
+            .get_or_try_init(|| async {
+                let (me, _) = self.get(self.url(&["user"], &[])).await?;
+                me.get("login")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        HostError::Other("GitHub's reply for the token has no login".into())
+                    })
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    /// Every comment on an issue, oldest first, up to [`MAX_COMMENT_PAGES`] pages. A comment is
+    /// Beehive's own when the token's login wrote it and it carries the marker: anyone can
+    /// type the marker, so the text alone proves nothing.
     async fn all_comments(
         &self,
         repo: &RepoRef,
@@ -279,6 +301,13 @@ impl GitHub {
             found.extend(items.iter().filter_map(comment_from));
             if items.len() < COMMENT_PAGE as usize {
                 break;
+            }
+        }
+        // The login is only asked for when some comment carries the marker.
+        if found.iter().any(|c| c.from_hive) {
+            let me = self.login().await?;
+            for comment in &mut found {
+                comment.from_hive = comment.from_hive && comment.author.eq_ignore_ascii_case(me);
             }
         }
         Ok(found)
@@ -452,7 +481,7 @@ impl CodeHost for GitHub {
         Ok(PullStatus { pull, labels })
     }
 
-    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<Vec<Check>, HostError> {
+    async fn list_checks(&self, repo: &RepoRef, number: u64) -> Result<PullChecks, HostError> {
         let item = self.pull_item(repo, number).await?;
         let sha = item
             .get("head")
@@ -507,7 +536,10 @@ impl CodeHost for GitHub {
             checks.retain(|have| have.name != name);
             checks.push(Check { name, state });
         }
-        Ok(checks)
+        Ok(PullChecks {
+            head_sha: sha,
+            checks,
+        })
     }
 
     async fn mark_ready(&self, repo: &RepoRef, number: u64) -> Result<(), HostError> {
@@ -561,6 +593,7 @@ impl CodeHost for GitHub {
         repo: &RepoRef,
         number: u64,
         method: MergeMethod,
+        head_sha: Option<&str>,
     ) -> Result<(), HostError> {
         // Merged already: a repeat after a failure has nothing to do.
         let item = self.pull_item(repo, number).await?;
@@ -572,13 +605,14 @@ impl CodeHost for GitHub {
             &["repos", &repo.owner, &repo.name, "pulls", &number, "merge"],
             &[],
         );
-        self.send(
-            reqwest::Method::PUT,
-            url,
-            &json!({ "merge_method": method.as_str() }),
-        )
-        .await
-        .map(|_| ())
+        // With `sha`, GitHub answers 409 when the head is no longer that commit.
+        let mut body = json!({ "merge_method": method.as_str() });
+        if let Some(sha) = head_sha {
+            body["sha"] = json!(sha);
+        }
+        self.send(reqwest::Method::PUT, url, &body)
+            .await
+            .map(|_| ())
     }
 
     async fn list_repos(&self, owner: &str) -> Result<Vec<RepoRef>, HostError> {
@@ -838,6 +872,7 @@ fn comment_from(item: &Value) -> Option<Comment> {
         created_at: DateTime::parse_from_rfc3339(item.get("created_at")?.as_str()?)
             .ok()?
             .with_timezone(&Utc),
+        // Carries the marker. `all_comments` also checks who wrote it.
         from_hive: body.contains(MARKER_PREFIX),
         body,
     })

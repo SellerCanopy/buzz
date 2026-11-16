@@ -1894,12 +1894,13 @@ impl PullRequestsRepo for PgTx {
     async fn put(&mut self, card: uuid::Uuid, pull: &PullRequest) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO hive.pull_requests (community_id, card_id, repo, number, url, head, \
-             base, state, draft, approved, checks) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             base, state, draft, approved, checks, head_sha) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              ON CONFLICT (community_id, card_id) DO UPDATE SET repo = EXCLUDED.repo, \
              number = EXCLUDED.number, url = EXCLUDED.url, head = EXCLUDED.head, \
              base = EXCLUDED.base, state = EXCLUDED.state, draft = EXCLUDED.draft, \
-             approved = EXCLUDED.approved, checks = EXCLUDED.checks, updated_at = now()",
+             approved = EXCLUDED.approved, checks = EXCLUDED.checks, \
+             head_sha = EXCLUDED.head_sha, updated_at = now()",
         )
         .bind(self.community)
         .bind(card)
@@ -1912,6 +1913,7 @@ impl PullRequestsRepo for PgTx {
         .bind(pull.draft)
         .bind(pull.approved)
         .bind(&pull.checks)
+        .bind(&pull.head_sha)
         .execute(&mut *self.tx)
         .await
         .map_err(store_error)?;
@@ -1920,7 +1922,7 @@ impl PullRequestsRepo for PgTx {
 
     async fn by_card(&mut self, card: uuid::Uuid) -> Result<Option<PullRequest>, StoreError> {
         let row: Option<PullRow> = sqlx::query_as(
-            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks \
+            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks, head_sha \
              FROM hive.pull_requests WHERE community_id = $1 AND card_id = $2",
         )
         .bind(self.community)
@@ -1933,7 +1935,7 @@ impl PullRequestsRepo for PgTx {
 
     async fn open(&mut self) -> Result<Vec<(uuid::Uuid, PullRequest)>, StoreError> {
         let rows: Vec<PullRow> = sqlx::query_as(
-            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks \
+            "SELECT card_id, repo, number, url, head, base, state, draft, approved, checks, head_sha \
              FROM hive.pull_requests WHERE community_id = $1 AND state = 'open' \
              ORDER BY updated_at, card_id",
         )
@@ -1957,6 +1959,7 @@ struct PullRow {
     draft: bool,
     approved: bool,
     checks: String,
+    head_sha: String,
 }
 
 impl PullRow {
@@ -1973,6 +1976,7 @@ impl PullRow {
                 draft: self.draft,
                 approved: self.approved,
                 checks: self.checks,
+                head_sha: self.head_sha,
             },
         )
     }
@@ -1985,7 +1989,7 @@ impl IssuesRepo for PgTx {
         issue: &Issue,
         seen_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<StoredIssue, StoreError> {
-        let row: IssueRow = sqlx::query_as(concat!(
+        let row: Option<IssueRow> = sqlx::query_as(concat!(
             "INSERT INTO hive.issues (community_id, repo, number, title, body, labels, \
              assignees, author, state, url, etag, last_seen, last_comment_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) \
@@ -1993,6 +1997,7 @@ impl IssuesRepo for PgTx {
              body = EXCLUDED.body, labels = EXCLUDED.labels, assignees = EXCLUDED.assignees, \
              author = EXCLUDED.author, state = EXCLUDED.state, url = EXCLUDED.url, \
              etag = COALESCE(EXCLUDED.etag, hive.issues.etag), last_seen = EXCLUDED.last_seen \
+             WHERE hive.issues.last_seen <= EXCLUDED.last_seen \
              RETURNING ",
             issue_columns!()
         ))
@@ -2008,10 +2013,22 @@ impl IssuesRepo for PgTx {
         .bind(&issue.url)
         .bind(&issue.etag)
         .bind(seen_at)
-        .fetch_one(&mut *self.tx)
+        .fetch_optional(&mut *self.tx)
         .await
         .map_err(store_error)?;
-        decode_issue(row)
+        match row {
+            Some(row) => decode_issue(row),
+            // A newer read holds the row. It is locked by the conflict, so this reads it as the
+            // newer read left it.
+            None => IssuesRepo::get(self, &issue.repo, issue.number)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "issue {}#{} has not been read",
+                        issue.repo, issue.number
+                    ))
+                }),
+        }
     }
 
     async fn get(
@@ -2023,6 +2040,25 @@ impl IssuesRepo for PgTx {
             "SELECT ",
             issue_columns!(),
             " FROM hive.issues WHERE community_id = $1 AND repo = $2 AND number = $3"
+        ))
+        .bind(self.community)
+        .bind(repo.to_string())
+        .bind(issue_number(number)?)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .map_err(store_error)?;
+        row.map(decode_issue).transpose()
+    }
+
+    async fn get_for_update(
+        &mut self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Option<StoredIssue>, StoreError> {
+        let row: Option<IssueRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            issue_columns!(),
+            " FROM hive.issues WHERE community_id = $1 AND repo = $2 AND number = $3 FOR UPDATE"
         ))
         .bind(self.community)
         .bind(repo.to_string())
@@ -2117,19 +2153,30 @@ impl IssuesRepo for PgTx {
         repo: &RepoRef,
         number: u64,
         left: &str,
-    ) -> Result<(), StoreError> {
+        seen_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StoreError> {
         let done = sqlx::query(
             "UPDATE hive.issues SET left_reason = $4 \
-             WHERE community_id = $1 AND repo = $2 AND number = $3",
+             WHERE community_id = $1 AND repo = $2 AND number = $3 AND last_seen <= $5",
         )
         .bind(self.community)
         .bind(repo.to_string())
         .bind(issue_number(number)?)
         .bind(left)
+        .bind(seen_at)
         .execute(&mut *self.tx)
         .await
         .map_err(store_error)?;
-        missing_unless_one(done.rows_affected(), repo, number)
+        if done.rows_affected() == 1 {
+            return Ok(true);
+        }
+        // Nothing written: the issue is not there, or a newer read holds it.
+        match IssuesRepo::get(self, repo, number).await? {
+            Some(_) => Ok(false),
+            None => Err(StoreError::NotFound(format!(
+                "issue {repo}#{number} has not been read"
+            ))),
+        }
     }
 
     async fn set_last_comment(
@@ -2139,7 +2186,8 @@ impl IssuesRepo for PgTx {
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StoreError> {
         let done = sqlx::query(
-            "UPDATE hive.issues SET last_comment_at = $4 \
+            "UPDATE hive.issues \
+             SET last_comment_at = GREATEST(COALESCE(last_comment_at, $4), $4) \
              WHERE community_id = $1 AND repo = $2 AND number = $3",
         )
         .bind(self.community)
