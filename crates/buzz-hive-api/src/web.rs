@@ -26,7 +26,7 @@ img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 /// Serves the bundle in `dir` at [`WEB_PATH`]. A path that names no file gets `index.html`, so
 /// the page's own routes load. `None` when `dir` holds no `index.html`: the image carries an
 /// empty folder when it was built without a bundle, and then there is no page to serve.
-pub fn router(dir: &Path) -> Option<Router<App>> {
+fn router(dir: &Path) -> Option<Router<App>> {
     let index = dir.join("index.html");
     if !index.is_file() {
         return None;
@@ -37,6 +37,23 @@ pub fn router(dir: &Path) -> Option<Router<App>> {
             .nest_service(WEB_PATH, files)
             .layer(middleware::from_fn(content_security_policy)),
     )
+}
+
+/// The routes for the operator's `BUZZ_HIVE_WEB_DIR`: none when it is unset, and none (with a
+/// warning) when the folder holds no page.
+pub fn from_config(dir: Option<&Path>) -> Option<Router<App>> {
+    let dir = dir?;
+    let web = router(dir);
+    match web {
+        Some(_) => {
+            tracing::info!(dir = %dir.display(), "serving the Beehive web page at /beehive/");
+        }
+        None => tracing::warn!(
+            dir = %dir.display(),
+            "BUZZ_HIVE_WEB_DIR has no index.html: no Beehive web page is served"
+        ),
+    }
+    web
 }
 
 async fn content_security_policy(request: Request, next: Next) -> Response {

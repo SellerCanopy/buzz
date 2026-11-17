@@ -111,7 +111,23 @@ check_render() {
   grep -qE '^[[:space:]]*reverse_proxy relay:3000$' "$caddyfile" || return 1
   grep -q 'kiln.engine.v1.EngineService/\*' "$caddyfile" || return 1
   # The web page the phone loads is served by hive too.
-  grep -qE '^[[:space:]]*@hive path .*/beehive/\*' "$caddyfile" || return 1
+  # A bare /beehive reaches hive too, not only the paths under it.
+  grep -qE '^[[:space:]]*@hive path .*[[:space:]]/beehive[[:space:]]' "$caddyfile" || return 1
+  grep -qE '^[[:space:]]*@hive path .*[[:space:]]/beehive/\*' "$caddyfile" || return 1
+
+  # The image carries the page: an empty stage a build context can replace, copied to the
+  # folder the service serves, readable and not writable, set up before the user is dropped.
+  local dockerfile="$dir/deploy/aws/Dockerfile.hive"
+  grep -qE '^FROM scratch AS beehive-web$' "$dockerfile" || return 1
+  grep -qE '^ENV BUZZ_HIVE_WEB_DIR=/opt/buzz/beehive-web$' "$dockerfile" || return 1
+  grep -qE '^COPY --from=beehive-web / /opt/buzz/beehive-web/$' "$dockerfile" || return 1
+  grep -qE '^RUN .*chmod -R a\+rX,go-w /opt/buzz/beehive-web$' "$dockerfile" || return 1
+  # Symbolic --chmod on COPY is not supported by the syntax this file pins.
+  ! grep -qE '^COPY .*--chmod=' "$dockerfile" || return 1
+  local chmod_line user_line
+  chmod_line="$(grep -nE '^RUN .*chmod -R a\+rX,go-w /opt/buzz/beehive-web$' "$dockerfile" | head -1 | cut -d: -f1)"
+  user_line="$(grep -nE '^USER ' "$dockerfile" | head -1 | cut -d: -f1)"
+  [ -n "$chmod_line" ] && [ -n "$user_line" ] && [ "$chmod_line" -lt "$user_line" ] || return 1
 }
 
 d="$(stage ok)"
@@ -142,6 +158,13 @@ mutant caddy-waits-for-hive compose.hive.yml 's#^  caddy:$#  caddy:\n    depends
 mutant agents-mount-writable compose.hive.yml 's#^(      - \.\./aws/agents:/etc/buzz-hive/agents):ro$#\1#'
 mutant hive-paths-not-routed Caddyfile.hive 's#/auth/token ##'
 mutant beehive-page-not-routed Caddyfile.hive 's#/beehive/\* ##'
+mutant bare-beehive-not-routed Caddyfile.hive 's#/beehive /beehive/#/beehive/#'
+mutant web-stage-removed Dockerfile.hive 's#^FROM scratch AS beehive-web$#FROM scratch AS other-stage#'
+mutant web-dir-env-removed Dockerfile.hive 's#^ENV BUZZ_HIVE_WEB_DIR=.*$#ENV BUZZ_HIVE_WEB_DIR=/srv#'
+mutant web-copy-removed Dockerfile.hive 's#^COPY --from=beehive-web / /opt/buzz/beehive-web/$#COPY --from=beehive-web / /srv/#'
+mutant web-chmod-removed Dockerfile.hive 's#chmod -R a\+rX,go-w /opt/buzz/beehive-web#true#'
+mutant web-copy-symbolic-chmod Dockerfile.hive 's#^COPY --from=beehive-web / #COPY --from=beehive-web --chmod=a+rX,go-w / #'
+mutant web-chmod-after-user Dockerfile.hive 's#^USER buzz:buzz$#USER buzz:buzz\nRUN chmod -R a+rX,go-w /opt/buzz/beehive-web#; /^RUN mkdir -p \/opt\/buzz\/beehive-web/d'
 mutant fallback-removed Caddyfile.hive 's#reverse_proxy relay:3000#reverse_proxy hive:3100#'
 
 # Operators set in .env would open workspace creation, so the check must see them.

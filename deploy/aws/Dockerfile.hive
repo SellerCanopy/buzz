@@ -48,7 +48,10 @@ RUN apt-get update \
 COPY --from=builder /out/buzz-hive /usr/local/bin/buzz-hive
 COPY --from=builder /out/buzz-hive-mcp /usr/local/bin/buzz-hive-mcp
 COPY --from=builder /out/buzz-hive-supervisor /usr/local/bin/buzz-hive-supervisor
-COPY --from=beehive-web --chmod=a+rX,go-w / /opt/buzz/beehive-web/
+COPY --from=beehive-web / /opt/buzz/beehive-web/
+# Symbolic --chmod on COPY needs a newer Dockerfile frontend than the one this file pins.
+# This runs as root, before USER: the service reads the page and cannot change it.
+RUN mkdir -p /opt/buzz/beehive-web && chmod -R a+rX,go-w /opt/buzz/beehive-web
 RUN if [ -f /opt/buzz/beehive-web/index.html ]; then \
       echo "beehive-web: bundle copied to /opt/buzz/beehive-web"; \
     else \

@@ -15,7 +15,8 @@ import '../../shared/widgets/frosted_scaffold.dart';
 import '../../shared/widgets/load_error_view.dart';
 import 'beehive_token.dart';
 
-/// The channel the page asks for a token on. Messages are request ids.
+/// The channel the page asks for a token on. Messages are JSON objects with the
+/// request `id` and a `refresh` flag.
 const _channelName = 'BeehiveNativeChannel';
 
 /// The channel the page asks to open a thread on. Messages are JSON objects
@@ -26,7 +27,9 @@ const _threadChannelName = 'BeehiveThreadChannel';
 ///
 /// `token()` posts a request id to the native channel and resolves when native
 /// calls `__beehiveNativeSettle` with the same id. Only the token crosses into
-/// the page. `openThread(channelId, rootEventId)` posts the two ids to a second
+/// the page. `token({refresh: true})` makes native mint a new token instead of
+/// handing back the cached one, for the single retry after the engine refused a
+/// token. `openThread(channelId, rootEventId)` posts the two ids to a second
 /// channel, and native opens the app's own thread view for that root event. Safe
 /// to run more than once.
 @visibleForTesting
@@ -47,11 +50,13 @@ const beehiveShim =
   });
   Object.defineProperty(window, '__beehiveNative', {
     value: Object.freeze({
-      token: function () {
+      token: function (options) {
         return new Promise(function (resolve, reject) {
           var id = String(++next);
           waiting[id] = { resolve: resolve, reject: reject };
-          $_channelName.postMessage(id);
+          $_channelName.postMessage(
+            JSON.stringify({ id: id, refresh: !!(options && options.refresh) }),
+          );
         });
       },
       openThread: function (channelId, rootEventId) {
@@ -97,6 +102,40 @@ Uri? beehiveThreadLink(String message) {
   return parseMessageDeepLink(link) == null ? null : link;
 }
 
+/// A token request the page posted: its id, and whether it wants a new token.
+/// Null when the message is not that.
+@visibleForTesting
+({String id, bool refresh})? beehiveTokenRequest(String message) {
+  final Object? decoded;
+  try {
+    decoded = jsonDecode(message);
+  } on FormatException {
+    return null;
+  }
+  if (decoded is! Map) return null;
+  final id = decoded['id'];
+  if (id is! String || id.isEmpty) return null;
+  return (id: id, refresh: decoded['refresh'] == true);
+}
+
+/// Whether [url] is a Beehive page: [home]'s origin and a path under [home]'s.
+///
+/// The relay serves its own script-bearing pages on this origin, and the shim
+/// hands a token to whatever page asks, so the scheme, host and port are not
+/// enough. A user-info part, or a `.` or `..` segment that could climb out of
+/// the path once the web view resolves it, is refused.
+@visibleForTesting
+bool isBeehivePage(Uri home, String url) {
+  final uri = Uri.tryParse(url);
+  return uri != null &&
+      uri.scheme == home.scheme &&
+      uri.host == home.host &&
+      uri.port == home.port &&
+      uri.userInfo.isEmpty &&
+      uri.path.startsWith(home.path) &&
+      !uri.pathSegments.any((segment) => segment == '.' || segment == '..');
+}
+
 /// Beehive in a web view, signed in natively so the key never enters the page.
 class BeehiveScreen extends ConsumerStatefulWidget {
   const BeehiveScreen({super.key});
@@ -125,7 +164,7 @@ class _BeehiveScreenState extends ConsumerState<BeehiveScreen> {
       ..setNavigationDelegate(
         NavigationDelegate(
           // The shim hands a token to whatever page asks, so stay on Beehive.
-          onNavigationRequest: (request) => _isBeehive(request.url)
+          onNavigationRequest: (request) => isBeehivePage(_home, request.url)
               ? NavigationDecision.navigate
               : NavigationDecision.prevent,
           // The cross-platform API has no document-start script, so inject as
@@ -151,33 +190,36 @@ class _BeehiveScreenState extends ConsumerState<BeehiveScreen> {
     unawaited(_controller.loadRequest(_home));
   }
 
-  bool _isBeehive(String url) {
-    final uri = Uri.tryParse(url);
-    return uri != null &&
-        uri.scheme == _home.scheme &&
-        uri.host == _home.host &&
-        uri.port == _home.port;
-  }
-
   void _injectShim() => unawaited(_controller.runJavaScript(beehiveShim));
+
+  /// Whether the page showing now is a Beehive page. A message can arrive from
+  /// a page the web view has since left, so each reply checks again.
+  Future<bool> _onBeehivePage() async {
+    final url = await _controller.currentUrl();
+    return mounted && url != null && isBeehivePage(_home, url);
+  }
 
   /// Hands a valid thread link to the app's deep link dispatcher, which finds
   /// the channel and pushes the thread view on top of this screen.
-  void _onOpenThread(JavaScriptMessage message) {
+  Future<void> _onOpenThread(JavaScriptMessage message) async {
     final link = beehiveThreadLink(message.message);
-    if (link == null || !mounted) return;
+    if (link == null || !await _onBeehivePage()) return;
     ref.read(pendingDeepLinkProvider.notifier).open(link);
   }
 
   Future<void> _onToken(JavaScriptMessage message) async {
-    final id = jsonEncode(message.message);
+    final request = beehiveTokenRequest(message.message);
+    if (request == null || !await _onBeehivePage()) return;
+    final id = jsonEncode(request.id);
     String? token;
     try {
-      token = await ref.read(beehiveTokenProvider).token();
+      token = await ref
+          .read(beehiveTokenProvider)
+          .token(refresh: request.refresh);
     } catch (_) {
       // The page only learns that sign-in failed, never why.
     }
-    if (!mounted) return;
+    if (!await _onBeehivePage()) return;
     final arguments = token == null
         ? '$id, null, true'
         : '$id, ${jsonEncode(token)}, false';

@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::path::PathBuf;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -11,21 +13,31 @@ use common::{app_with, people};
 use tower::ServiceExt;
 
 /// A folder holding a built page, removed when dropped.
-struct Bundle(std::path::PathBuf);
+struct Bundle {
+    /// The folder that is served, inside `parent`.
+    dir: PathBuf,
+    /// Holds the folder and a file beside it that must never be served.
+    parent: PathBuf,
+}
+
+/// A line that appears only in the file beside the served folder.
+const SECRET: &str = "secret-beside-the-bundle-7f3a9c";
 
 impl Bundle {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("beehive-web-{}", uuid::Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("beehive-web-{}", uuid::Uuid::new_v4()));
+        let dir = parent.join("bundle");
         std::fs::create_dir_all(dir.join("assets")).unwrap();
         std::fs::write(dir.join("index.html"), "<html>beehive</html>").unwrap();
         std::fs::write(dir.join("assets/app.js"), "console.log('beehive');").unwrap();
-        Self(dir)
+        std::fs::write(parent.join("secret.txt"), SECRET).unwrap();
+        Self { dir, parent }
     }
 }
 
 impl Drop for Bundle {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.parent);
     }
 }
 
@@ -33,7 +45,7 @@ fn router(web: Option<&Bundle>) -> Router {
     let app = app_with(people(), MemStore::new());
     let mut routes = buzz_hive_api::routes();
     if let Some(bundle) = web {
-        routes = routes.merge(buzz_hive_api::web::router(&bundle.0).unwrap());
+        routes = routes.merge(buzz_hive_api::web::from_config(Some(&bundle.dir)).unwrap());
     }
     buzz_hive_api::finish(routes, app)
 }
@@ -93,9 +105,16 @@ async fn every_page_response_carries_the_strict_policy() {
             "{path}"
         );
     }
-    assert!(CONTENT_SECURITY_POLICY.contains("default-src 'self'"));
-    assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self'"));
-    assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+}
+
+#[test]
+fn the_policy_allows_nothing_beyond_the_page_itself() {
+    // Pinned whole: a new source in any directive is a decision to make on purpose.
+    assert_eq!(
+        CONTENT_SECURITY_POLICY,
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; \
+style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+    );
 }
 
 #[tokio::test]
@@ -112,8 +131,22 @@ async fn other_routes_carry_no_policy_and_still_work() {
 async fn a_path_outside_the_folder_is_not_served() {
     let bundle = Bundle::new();
     let router = router(Some(&bundle));
-    let (_, _, body) = get(&router, "/beehive/..%2f..%2fetc%2fpasswd").await;
-    assert!(!body.contains("root:"), "{body}");
+    // The file beside the folder is readable on disk, so a leak shows as its marker.
+    assert_eq!(
+        std::fs::read_to_string(bundle.parent.join("secret.txt")).unwrap(),
+        SECRET
+    );
+    for path in [
+        "/beehive/..%2fsecret.txt",
+        "/beehive/%2e%2e/secret.txt",
+        "/beehive/%2e%2e%2fsecret.txt",
+        "/beehive/../secret.txt",
+        "/beehive/assets/../../secret.txt",
+        "/beehive/..\\secret.txt",
+    ] {
+        let (_, _, body) = get(&router, path).await;
+        assert!(!body.contains(SECRET), "{path} leaked the file");
+    }
 }
 
 #[tokio::test]
@@ -127,10 +160,25 @@ async fn unset_serves_no_page() {
 }
 
 #[test]
+fn no_setting_means_no_routes() {
+    assert!(buzz_hive_api::web::from_config(None).is_none());
+}
+
+#[test]
 fn a_folder_with_no_index_serves_no_page() {
-    let dir = std::env::temp_dir().join(format!("beehive-web-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let router = buzz_hive_api::web::router(&dir);
-    std::fs::remove_dir_all(&dir).unwrap();
-    assert!(router.is_none());
+    let bundle = Bundle::new();
+    std::fs::remove_file(bundle.dir.join("index.html")).unwrap();
+    assert!(buzz_hive_api::web::from_config(Some(&bundle.dir)).is_none());
+}
+
+#[test]
+fn a_folder_that_does_not_exist_serves_no_page() {
+    let bundle = Bundle::new();
+    assert!(buzz_hive_api::web::from_config(Some(&bundle.parent.join("missing"))).is_none());
+}
+
+#[test]
+fn a_folder_with_an_index_serves_the_page() {
+    let bundle = Bundle::new();
+    assert!(buzz_hive_api::web::from_config(Some(&bundle.dir)).is_some());
 }
