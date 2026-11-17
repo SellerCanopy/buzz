@@ -151,6 +151,10 @@ pub const DROPPED: &[(&str, &str)] = &[
     ("ImportSkill", "skills come from agent images"),
     ("StartTestRun", "no local runner (open question 10)"),
     ("ListSkillRepos", "skills come from agent images"),
+    (
+        "ListSkills",
+        "skills come from agent images; a workflow's skills are not copied into the agent home (Phase 22 decision)",
+    ),
     ("RefreshSkills", "skills come from agent images"),
     ("PlanBundle", "no skill bundles"),
     ("BundleSkills", "no skill bundles"),
