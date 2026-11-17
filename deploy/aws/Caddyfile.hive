@@ -3,7 +3,7 @@
 {$BUZZ_DOMAIN} {
 	encode zstd gzip
 
-	@hive path /kiln.engine.v1.EngineService/* /auth/token /hive/* /.well-known/jwks.json
+	@hive path /kiln.engine.v1.EngineService/* /auth/token /hive/* /beehive/* /.well-known/jwks.json
 	reverse_proxy @hive hive:3100
 
 	reverse_proxy relay:3000

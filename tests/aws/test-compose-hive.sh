@@ -110,6 +110,8 @@ check_render() {
   grep -qE '^[[:space:]]*reverse_proxy @hive hive:3100$' "$caddyfile" || return 1
   grep -qE '^[[:space:]]*reverse_proxy relay:3000$' "$caddyfile" || return 1
   grep -q 'kiln.engine.v1.EngineService/\*' "$caddyfile" || return 1
+  # The web page the phone loads is served by hive too.
+  grep -qE '^[[:space:]]*@hive path .*/beehive/\*' "$caddyfile" || return 1
 }
 
 d="$(stage ok)"
@@ -139,6 +141,7 @@ mutant hive-off-network compose.hive.yml '/^  hive:/,/^  caddy:|^  # Caddy/ s/^ 
 mutant caddy-waits-for-hive compose.hive.yml 's#^  caddy:$#  caddy:\n    depends_on:\n      hive:\n        condition: service_started#'
 mutant agents-mount-writable compose.hive.yml 's#^(      - \.\./aws/agents:/etc/buzz-hive/agents):ro$#\1#'
 mutant hive-paths-not-routed Caddyfile.hive 's#/auth/token ##'
+mutant beehive-page-not-routed Caddyfile.hive 's#/beehive/\* ##'
 mutant fallback-removed Caddyfile.hive 's#reverse_proxy relay:3000#reverse_proxy hive:3100#'
 
 # Operators set in .env would open workspace creation, so the check must see them.

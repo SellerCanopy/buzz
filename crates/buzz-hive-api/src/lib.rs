@@ -12,6 +12,7 @@ pub mod routes;
 pub mod token;
 pub mod tools;
 pub mod unary;
+pub mod web;
 
 pub use app::{ApiConfig, App};
 pub use error::HiveError;

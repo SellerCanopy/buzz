@@ -323,7 +323,20 @@ async fn run() -> Result<(), String> {
         };
         tokio::spawn(drain.run(stopped))
     });
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app);
+    let mut routes = buzz_hive_api::routes();
+    if let Some(dir) = &config.web_dir {
+        match buzz_hive_api::web::router(dir) {
+            Some(web) => {
+                routes = routes.merge(web);
+                tracing::info!(dir = %dir.display(), "serving the Beehive web page at /beehive/");
+            }
+            None => tracing::warn!(
+                dir = %dir.display(),
+                "BUZZ_HIVE_WEB_DIR has no index.html: no Beehive web page is served"
+            ),
+        }
+    }
+    let router = buzz_hive_api::finish(routes, app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:buzz/features/beehive/beehive_token.dart';
 import 'package:buzz/features/channels/default_agent_launcher.dart';
 import 'package:buzz/features/agents/agents_page.dart';
 import 'package:buzz/features/channels/me/me_section.dart';
@@ -49,12 +50,14 @@ void main() {
     String? bestie,
     Stream<String?>? bestieUpdates,
     ValueChanged<String>? onOpenBestie,
+    String beehiveUrl = '',
   }) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
     return ProviderScope(
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
+        beehiveUrlProvider.overrideWithValue(beehiveUrl),
         inboxHasUnreadProvider.overrideWithValue(inboxUnread),
         defaultAgentProvider.overrideWith(
           (ref) => bestieUpdates ?? Stream.value(bestie),
@@ -96,6 +99,19 @@ void main() {
         ),
       ),
     );
+  }
+
+  for (final (url, shown) in [('', false), ('https://beehive.example', true)]) {
+    testWidgets('the Beehive entry is ${shown ? 'shown' : 'hidden'} '
+        'when BUZZ_BEEHIVE_URL is ${shown ? 'set' : 'unset'}', (tester) async {
+      await tester.pumpWidget(await buildHome(beehiveUrl: url));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Community menu'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Agents'), findsOneWidget);
+      expect(find.text('Beehive'), shown ? findsOneWidget : findsNothing);
+    });
   }
 
   testWidgets('feedback clears floating navigation and wraps large text', (

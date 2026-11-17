@@ -18,6 +18,8 @@ import '../../shared/widgets/bottom_up_page_route.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../activity/activity_page.dart';
 import '../activity/inbox_unread_provider.dart';
+import '../beehive/beehive_screen.dart';
+import '../beehive/beehive_token.dart';
 import '../channels/channels_page.dart';
 import '../search/search_page.dart';
 import 'home_screen_shortcut_host.dart';
@@ -93,6 +95,7 @@ class HomePage extends HookConsumerWidget {
         ? null
         : ref.watch(communityIconPresentationProvider(community.relayUrl));
     final role = ref.watch(currentCommunityRoleProvider).unwrapPrevious();
+    final beehiveEnabled = ref.watch(beehiveUrlProvider).isNotEmpty;
     final canInvite = role.hasError || canManageCommunityInvites(role.value);
     void openPage(WidgetBuilder builder) =>
         Navigator.of(context).push(MaterialPageRoute<void>(builder: builder));
@@ -127,6 +130,13 @@ class HomePage extends HookConsumerWidget {
             symbol: 'agent',
             onPressed: () => onAgents(context),
           ),
+          // Only a build configured with a Beehive engine offers it.
+          if (beehiveEnabled)
+            (
+              label: 'Beehive',
+              symbol: 'workspace',
+              onPressed: () => openPage((_) => const BeehiveScreen()),
+            ),
           if (communityAppearancePageBuilder != null)
             (
               label: 'Appearance',
