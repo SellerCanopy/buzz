@@ -1,0 +1,25 @@
+# Paths that exist only in this fork. A line ending in `/` is a directory prefix, any
+# other line is one exact file. Files under these paths cannot conflict with upstream,
+# so tests/aws/test-upstream-edits.sh does not ask for them in upstream-edits.txt.
+.aws.env.example
+.claude/skills/buzz-agent-config/
+.claude/skills/buzz-setup/
+Makefile
+crates/buzz-acp/src/requester.rs
+crates/buzz-cli/examples/attest_agent.rs
+crates/buzz-hive/
+crates/buzz-hive-api/
+crates/buzz-hive-core/
+crates/buzz-hive-mcp/
+crates/buzz-hive-store/
+crates/buzz-hive-supervisor/
+default_agents_names.png
+deploy/aws/
+docs/aws-deployment.md
+docs/superpowers/
+infra/
+mobile/integration_test/beehive_screen_test.dart
+mobile/lib/features/beehive/
+mobile/test/features/beehive/
+scripts/aws/
+tests/aws/

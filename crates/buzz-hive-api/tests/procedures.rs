@@ -10,11 +10,7 @@ use buzz_hive_api::routes::{DROPPED, ROUTES};
 const PROTO: &str = include_str!("../proto/kiln/engine/v1/engine.proto");
 
 /// Methods a later phase serves. Each phase removes its own.
-const PENDING: &[&str] = &[
-    // Phase 18
-    // Phase 22
-    "ListSkills",
-];
+const PENDING: &[&str] = &[];
 
 fn proto_methods() -> BTreeSet<String> {
     let mut methods = BTreeSet::new();

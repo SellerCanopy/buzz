@@ -1,0 +1,24 @@
+# Every upstream file this fork edits. tests/aws/test-upstream-edits.sh fails when
+# `git diff --name-only upstream/main...HEAD` touches a file that is neither listed
+# here nor under a fork-only path (scripts/aws/fork-only-paths.txt), and when a listed
+# file is absent from that diff. A line ending in `(only if ...)` is exempt from the
+# second check: it names a file the fork may need to edit later.
+.config/nextest.toml
+.gitignore
+Cargo.toml
+Cargo.lock
+Justfile
+scripts/run-tests.sh
+crates/buzz-acp/src/lib.rs
+crates/buzz-acp/src/pool.rs
+crates/buzz-acp/src/queue.rs
+crates/buzz-acp/src/runtime.rs       (only if the harness needs a runtime change for Beehive)
+crates/buzz-db/src/runtime/migration.rs
+crates/buzz-db/src/store/deletion.rs (only if validate_catalog_on needed visibility)
+deny.toml                            (only if cargo deny needed it)
+mobile/pubspec.yaml
+mobile/pubspec.lock
+mobile/ios/Podfile.lock
+mobile/lib/features/home/home_page.dart
+mobile/test/features/home/home_page_test.dart
+mobile/README.md

@@ -31,7 +31,7 @@ never edited. Phase numbers refer to the Beehive plan.
 | Engine lease and heartbeat | dropped (one `buzz-hive` per community) | 1 |
 | Permission prompts | dropped | 1 |
 | The `interrupted` inbox item | dropped | 1 |
-| `core/openspec` | kept, not dropped: the built-in `openspec` package calls `check_openspec`. Phase 5 ports the action's argument checks (`workflow/actions.rs`) and ships the package with its `NOTICE` and `LICENSE-OpenSpec`. Phase 18 does not run the action: the plan lists only `wait_for_ci`, `mark_ready` and `merge`, so a `check_openspec` stage still stops with "does not run yet; skip it". The document validator still has no owner | unassigned |
+| `core/openspec` | changed (kept: the built-in `openspec` package ships a `check_openspec` stage, `workflows/packages/openspec/workflow.yaml` near line 47. Phase 5 ports the action's argument checks, `workflow/actions.rs`. Phase 18 does not run the action, so the stage always stops at a Needs you item with Skip, `rules/run.rs` near line 847. The document validator is not ported) | 18 |
 | `core/issuefiles` | dropped (the Go package copies an issue's attached images into the card's folder; a card has no folder here and the Issue tab shows the issue's own text. Phase 16 does not fetch or store issue attachments) | 16 |
 | `core/config` | ported | 6 |
 | `worktrees` table and the `worktree.prepared` event | dropped (Phase 17: a card has no folder on the engine's disk. The card branch is `buzz/<8 hex of the card id>-<title slug>`, built by `card_branch`, and each stage agent clones or fetches it itself. The `worktree` stage template does that as a first stage) | 17 |
@@ -40,57 +40,57 @@ never edited. Phase numbers refer to the Beehive plan.
 ## Go test directories
 
 Counts are test files per directory in the kiln checkout when this ledger was
-seeded. A directory is `pending` until the phase that ports it names it.
+seeded. Each directory is `ported`, `changed` or `dropped`; a `changed` row names the Rust files and tests that carry the contract.
 
 | item (`engine/...`) | test files | decision | phase |
 |---|---|---|---|
 | `adapters/acp` | 9 | dropped | 1 |
 | `adapters/actions` | 1 | changed (Phase 18: `wait_for_ci`, `wait`, `mark_ready` and `merge` run, in `rules/wait.rs`, `orchestrator/{wait,merge}.rs` and the `Posting::PullCall` outbox row. `check_openspec`, `run_command`, `sync_base` and the review actions still do not run) | 18 |
 | `adapters/artifacts/local` | 2 | changed (documents live in the `hive.artifacts` tables of the relay's Postgres and a file is a pointer to a media-store blob, so there is no folder adapter; `postgres_artifacts.rs` and `tests/artifacts.rs` carry the contract) | 9 |
-| `adapters/downloadmark` | 3 | pending | unassigned |
+| `adapters/downloadmark` | 3 | dropped (its only caller was the Go wiring for downloaded issue files; `core/issuefiles` is dropped and Beehive writes no downloaded files) | 27 |
 | `adapters/github` | 20 | changed (Phase 16: `buzz-hive/src/github_adapter.rs` is the `CodeHost` over `reqwest` with `If-None-Match` etags, token only in an Authorization header; it lists issues, reads an issue and its comments, searches, lists repos and owners and writes a comment once per key. Phase 17 adds `open_pull_request` (finds an open pull request for the head first, then `POST /repos/{o}/{r}/pulls` with `draft`). Phase 18 adds `get_pull_request` (with the latest review verdict per reviewer), `list_checks` (check runs and commit statuses), `mark_ready` (GraphQL `markPullRequestReadyForReview`) and `merge` (`PUT /pulls/N/merge`). `buzz-hive/tests/github_adapter.rs` runs it against a local replay server, not GitHub) | 16 |
 | `adapters/gitwork` | 5 | dropped | 1 |
 | `adapters/keyring` | 1 | dropped | 23 |
 | `adapters/localrepo` | 2 | dropped (scratch folders) | 1 |
 | `adapters/mcptools` | 6 | dropped | 1 |
-| `adapters/notify` | 1 | pending | unassigned |
+| `adapters/notify` | 1 | dropped (Beehive raises no desktop banner of its own: run updates post to the update channel and the Needs you view shows a live count in the sidebar. Banners for `inbox.opened`, `inbox.resolved`, `card.moved` and `run.ended` are not built) | 27 |
 | `adapters/runner/local` | 2 | dropped | 1 |
 | `adapters/runner/remote` | 1 | dropped | 1 |
 | `adapters/runner/wire` | 1 | dropped | 1 |
-| `adapters/secrets/sqlcrypt` | 1 | pending | 23 |
+| `adapters/secrets/sqlcrypt` | 1 | dropped (the per-person sealed secret store of the login mode; Phase 23 keeps secrets write-only in SSM or a file, `ssm_adapter.rs` and `file_secrets.rs`) | 23 |
 | `adapters/signin/devissuer` | 1 | dropped | 1 |
 | `adapters/signin/issuerclient` | 1 | dropped | 1 |
 | `adapters/signin/jwt` | 1 | dropped | 1 |
-| `adapters/sqlite` | 28 | pending | unassigned |
-| `adapters/testenv` | 1 | pending | unassigned |
+| `adapters/sqlite` | 28 | changed (the store is Postgres in `buzz-hive-store`, covered by `tests/postgres_*.rs`. There is no SQLite adapter and no migration from the Go database, which the PRD puts out of scope) | 27 |
+| `adapters/testenv` | 1 | dropped (its callers were `adapters/acp`, `adapters/actions` and the wiring; `testrun` is dropped and the engine starts no test process) | 27 |
 | `adapters/usage` | 8 | dropped | 1 |
-| `adapters/webfetch` | 1 | pending | unassigned |
-| `api` | 23 | pending | unassigned |
+| `adapters/webfetch` | 1 | dropped (its file fetcher served `core/issuefiles` and the GitHub attachment download, both dropped; Phase 16 does not fetch issue attachments) | 27 |
+| `api` | 23 | changed (the Rust handlers are covered by `buzz-hive-api/tests/*.rs`. The error-code mapping is pinned by `tests/errors.rs` (`From<OpError>` and the host and store errors) and the limit bound and paging of `ListActivity` by `tests/activity.rs`. The dropped Go procedures are listed in `DROPPED` in `src/routes/mod.rs`) | 27 |
 | `cmd/carrier-runner` | 1 | dropped (local runner) | 1 |
-| `cmd/kiln-engine` | 88 | pending | unassigned |
+| `cmd/kiln-engine` | 88 | changed (the wiring is `buzz-hive/src`, covered by its `e2e_*`, `timer_loop.rs` and `intake_*.rs` tests. The shell runner, advise and recommend, workspaces and the repos flow totals with the median time to merged are not built. The Kiln footer is replaced by the `<!-- buzz-hive:key -->` marker, `github_adapter.rs` near line 52) | 27 |
 | `core/assistant` | 15 | changed (Phase 20: the assistant is a Buzz agent. `StartChat`, `StartProposeWorkflowEdit` and `StartAdaptSkills` open a job in `orchestrator/assistant.rs`, mention the agent named by the `assistant_agent` setting in the update channel, and return a job id. The agent reports once with the `assistant_result` tool, and the result reaches the client as one `job.result` event on `PollEvents`. A workflow it offers is a `hive.proposals` row for the requester, applied with `SaveWorkflow`. The Go prompt building, streaming and conversation store are not ported) | 20 |
 | `core/background` | 9 | changed (Phase 18: `background/pull_requests.rs` decides which cards are read and when, and `buzz-hive/src/intake.rs` runs it beside the comment loop. The rest of the Go background jobs are not ported) | 18 |
 | `core/config` | 1 | ported | 6 |
-| `core/domain` | 12 | pending | unassigned |
+| `core/domain` | 12 | changed (`src/domain/*.rs` with unit tests in each module, plus `tests/cards.rs` and `tests/event_coverage.rs`. The cost, runner and permission-ask types are gone) | 27 |
 | `core/events` | 1 | changed (Phase 4: `domain/events.rs`, `bus.rs` and the `hive.events` log; one Postgres transaction per change and a long poll replace the Go subscription) | 4 |
 | `core/events/schema` | 1 | changed (Phase 4: `EVENT_KINDS` and `check_new` refuse an unlisted kind or a payload over 64 KiB; each later phase registers the kinds it emits) | 4 |
 | `core/issuefiles` | 7 | dropped (see Features) | 16 |
-| `core/kinds` | 8 | pending | unassigned |
-| `core/openspec` | 1 | kept, not dropped (see Features): the validator ports with the action runner | 18 |
-| `core/orchestrator` | 56 | pending | unassigned |
+| `core/kinds` | 8 | changed (Phase 18 runs `wait_for_ci`, `wait`, `mark_ready`, `merge` and, from Phase 17, `open_pull_request`; Phase 17 makes `cleanup_worktree` pass at once. `run_command`, `sync_base`, the review actions and `check_openspec` are not built: a stage that names one opens a Needs you item with Skip and Stop, `rules/run.rs` near line 847. The per-kind Go tests have no one-to-one Rust tests) | 27 |
+| `core/openspec` | 1 | changed (see Features: the package ships `check_openspec`, the stage stops at a Needs you item with Skip, and the document validator is not ported) | 18 |
+| `core/orchestrator` | 56 | changed (the run, stage, timer, route, wait, inbox, auto mode and pull request logic is in `buzz-hive-core/src/orchestrator/` and `src/rules/`, covered by `tests/run_start.rs`, `run_stage_done.rs`, `run_timers.rs`, `routes.rs`, `wait_stages.rs`, `inbox.rs`, `auto_mode.rs` and `pull_request_action.rs`. A stage turn is a Buzz thread, not an ACP session. There is no per-test mapping to the 56 Go files) | 27 |
 | `core/pricing` | 1 | dropped | 1 |
 | `core/pullrequests` | 2 | changed (Phase 17: the `open_pull_request` action stage in `orchestrator/pull_request.rs`, `hive.pull_requests` and `GetCard.pull_request`; tests `pull_request_action.rs` and `postgres_pull_requests.rs`. Phase 18 adds `approved` and `checks` to the stored pull request (migration `0015`) and a sync that keeps it current while the card is open. The Go close tracking is not ported) | 17 |
-| `core/redact` | 1 | pending | unassigned |
-| `core/rules` | 21 | pending | unassigned |
-| `core/session` | 18 | pending | unassigned |
+| `core/redact` | 1 | dropped (its callers were `core/assistant` and `core/issuefiles`, neither ported as it was; `SecretString` prints `[redacted]`, Phase 23) | 27 |
+| `core/rules` | 21 | changed (`src/rules/*.rs`, covered by `tests/rules_decide.rs`, `routes.rs` and `wait_stages.rs`. The cost-cap and advisory rules are dropped in Phase 13. There is no per-test mapping to the 21 Go files) | 27 |
+| `core/session` | 18 | changed (each stage visit is a fresh Buzz thread recorded in `hive.stage_threads`, and a retry or a gate answer replies in that root, `buzz-hive/tests/e2e_fresh_session.rs` and `buzz-hive-api/tests/routing.rs`. The Go ACP session store and resume are not ported) | 27 |
 | `core/workflow` | 13 | changed (Phase 5: load, strict decode, `check` and the template variables in `buzz-hive-core/src/workflow/`, tests in `tests/workflow_*.rs`. A stage names one Buzz agent, so the profile, permission, skill and conversation codes are gone and `agent_object_removed`, `conversation_removed`, `idle_timeout_removed` and `agent_unknown` are new. `archive`, `convert`, `encode`, `plugin`, `render`, `skill` and `skills` move with the builder and import in Phases 19 and 20) | 5 |
 | `core/workflow/schema` | 1 | changed (Phase 5: `workflow.schema.json` is generated from the Rust types with schemars, the strict decoder reads it, and `tests/workflow_schema.rs` fails on drift) | 5 |
-| `internal/fakeagent` | 2 | pending | unassigned |
-| `internal/ghreplay` | 1 | pending | 16 |
-| `internal/gitconfig` | 1 | pending | unassigned |
-| `internal/proc` | 3 | pending | unassigned |
+| `internal/fakeagent` | 2 | changed (`buzz-hive/tests/support/script_agent.rs` plays scripted tool calls through `buzz-hive-mcp`; the ACP stream it faked is dropped) | 27 |
+| `internal/ghreplay` | 1 | changed (Phase 16: `buzz-hive/tests/support/github_replay.rs` and `tests/fixtures/github` are a replay server with no recorder) | 16 |
+| `internal/gitconfig` | 1 | dropped (its callers were `adapters/gitwork` and `adapters/localrepo`, both dropped) | 27 |
+| `internal/proc` | 3 | dropped (its callers ran agents, git and `run_command`; the engine spawns only `aws` in `buzz-hive/src/ssm_adapter.rs` and `docker` in `buzz-hive-supervisor/src/{calls,login,secrets}.rs`, each with an argument list and no shell) | 27 |
 | `internal/workflows` | 4 | changed (Phase 5: the six built-in packages and five stage templates are embedded from `buzz-hive-core/workflows/` by `build.rs`; `tests/workflow_load.rs` loads and checks each one. Every stage names the agent `builder` until Phase 6 reads agents from Buzz) | 5 |
-| `ports` | 4 | pending | unassigned |
+| `ports` | 4 | changed (`buzz-hive-core/tests/boundary.rs` carries the import rule and the compiler pins the port signatures; the session-spec clone and the runner errors went with ACP and the runner) | 27 |
 | `runnerd` | 1 | dropped (local runner) | 1 |
 
 ## `app/e2e` specs
@@ -102,7 +102,7 @@ spec's title and are confirmed when that phase starts.
 
 | item (`app/e2e/<name>.spec.ts`) | decision | phase |
 |---|---|---|
-| `actions` | pending | 11 |
+| `actions` | changed (the Skip stage button calls `SkipStage`, `buzz-hive-api/src/routes/stages.rs`; pause, resume, skip and reset are wired in buzz-app `useCard.ts`) | 11 |
 | `activity` | changed (Phase 12: a card's Activity tab lists what happened on it, newest first, and an answer shows who gave it and the reason; `buzz-hive-api/tests/inbox.rs`, buzz-app `ActivityTab.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. An answer is an `activity.added` event, not a `hive.activity` table) | 12 |
 | `answers` | changed (Phase 12 answers an approval with Approve or Reject and a reason, a `needs_input` result with a reply, and the other items with retry, skip, stop or dismiss, in `tests/inbox.rs`, `buzz-hive-api/tests/inbox.rs` and `buzz-hive/tests/e2e_approval.rs`. The Go spec's permission requests and its field and multi-question forms are not ported: `AnswerInbox` refuses `values_json` and `answers`) | 12 |
 | `archive` | changed (Phase 4 ports the contract in buzz-app `e2e/archive.spec.mjs`: archive leaves the board, the archive lists it, Restore returns it to Backlog. The Go spec drags a card onto Done; drag and drop returns with the phase that moves cards between columns) | 4 |
@@ -110,21 +110,21 @@ spec's title and are confirmed when that phase starts.
 | `assistant` | changed (Phase 20: the contract is ported in `buzz-hive-api/tests/assistant.rs`, `buzz-hive-core/tests/event_coverage.rs`, `buzz-hive/tests/timer_loop.rs` and `buzz-hive-store/tests/postgres_jobs.rs`: a job result is one event, a dropped poll resumes, a cancelled job ends with none, a result from another agent is refused, a stale job ends failed and a thread runs one job. The Go spec's streamed answer, attachments and conversation list are not ported, and a script-agent end to end run is deferred) | 20 |
 | `auto-mode` | changed (Phase 13 ports the contract: a card in auto mode has its approval gates approved when every listed artifact has a saved version, a failed run started again twice and a stage with no result asked to carry on twice, each with its reason in Activity, and a loop that is never unbounded. The Go spec's cost-cap cases, its Ask recommendations and forms and its paused-turn reply are dropped, see the Phase 13 deliverables. The Switch and the Activity entry are covered in buzz-app `ActivityTab.test.tsx` and `BeehivePage.test.tsx`) | 13 |
 | `board` | changed (Phase 3 ports the empty board against a real `buzz-hive`, in buzz-app `src/features/beehive/e2e/board.spec.mjs`; the drag, move and label-suggestion tests return in the phases that add cards, stages and intake) | 3 |
-| `boot` | pending | 3 |
+| `boot` | dropped (the Kiln desktop splash; Beehive runs inside Buzz) | 3 |
 | `browse` | changed (Phase 16: `SearchIssues` and `ListRepos` back the New card dialog's From an issue mode, in `buzz-hive-api/tests/intake.rs` and buzz-app `NewCardDialog.test.tsx`. The spec's typed GitHub query is not ported: a search is by repo, label and text) | 16 |
-| `builder-run` | pending | 19 |
-| `builder` | pending | 19 |
+| `builder-run` | changed (loop limits, auto mode and the version a running card keeps, in `buzz-hive-api/tests/routes.rs`, `auto_mode.rs` and `workflow_save.rs`, and Add stage in buzz-app `WorkflowEditor.test.tsx`; the skill call and the card parameter form are not ported) | 19 |
+| `builder` | changed (the editor saves stages, agents and added stages, buzz-app `WorkflowEditor.test.tsx`. Pausing a stage from the builder is not built; a stage's `pause` field is honored when it is in the saved text) | 19 |
 | `calls` | changed (Phase 8 routes a result to a call's target and honors `then` after `passed`; `give` carries documents; Phase 12 opens a Needs you item for a route that asks, with skip and stop) | 12 |
 | `card` | changed (Phase 4 ports adding a card, reading its details and a card added elsewhere reaching an open board, in buzz-app `e2e/card.spec.mjs`. Live, History, Usage and the stage controls return with runs and stages) | 4 |
 | `costs-pull-requests` | dropped (cost figures) | 1 |
 | `costs` | dropped (cost figures) | 1 |
 | `files` | changed (the Files tab lists a card's saved files and documents with a download link, in buzz-app `beehive.journey.mjs` and `BeehivePage.test.tsx`; `buzz-hive/tests/e2e_files.rs` proves the file round trip through the relay's media store. Issue attachments are dropped, see `core/issuefiles`) | 9 |
-| `filters` | pending (filters narrow by run state and search; a card now reaches Done, but the Stopped and Failed states the spec filters on arrive with StopRun and routing, Phase 11) | 11 |
-| `guide` | pending (the Go spec drives the workflow builder) | 19 |
-| `home` | pending | 3 |
-| `importexport` | pending | 19 |
+| `filters` | changed (search, state, repo and workflow narrow the cards, in buzz-app `Board.test.tsx` and the journey test; filters are not kept in the address) | 11 |
+| `guide` | dropped (the workflow guide is not built, Phase 19 lists it as not built from the mock) | 19 |
+| `home` | dropped (the approved mock's sidebar has no Home screen) | 3 |
+| `importexport` | changed (`workflow_save.rs` `a_workflow_exports_to_a_zip_and_imports_under_a_new_name` and buzz-app `ImportWorkflowDialog.test.tsx`; plugin and skill imports are dropped) | 19 |
 | `kilntask` | dropped (Carrier task kind, no Buzz stage) | 1 |
-| `list` | pending (the Go spec drives a List layout of the board; no phase in the plan builds one, so it needs an owner) | unassigned |
+| `list` | dropped (the board has no List layout; the sidebar has Board, Needs you, Intake, Workflows, Usage and Settings) | 27 |
 | `login` | dropped (team login and cookie session) | 1 |
 | `merge` | changed (Phase 18: `MergeCard` merges after a fresh read of the pull request and its checks, in `buzz-hive-api/tests/merge.rs` and `buzz-hive-core/tests/wait_stages.rs`, over `FakeCodeHost`. A person merges; an agent is refused. The spec's merge order across several repos is not ported: a card has one repo) | 18 |
 | `needs-you` | changed (Phase 12: the Needs you view lists open items with the card, the stage and a button per answer, and its tab counts them live; buzz-app `NeedsYou.test.tsx`, `beehive.journey.mjs` and `e2e/needs-you.spec.mjs`. A gate an agent opens is answered end to end in `buzz-hive/tests/e2e_approval.rs`, which needs a relay. Resolved items are not listed) | 12 |
@@ -136,24 +136,50 @@ spec's title and are confirmed when that phase starts.
 | `plugin-command` | dropped (plugins) | 1 |
 | `plugin-contents` | dropped (plugins) | 1 |
 | `prompt-skill` | dropped (prompt skills) | 1 |
-| `remove` | pending | 4 |
+| `remove` | changed (`RemoveCard` in `buzz-hive-api/tests/cards.rs`, `DeleteWorkflow` in `workflow_save.rs`, and buzz-app `BeehivePage.test.tsx` and `WorkflowEditor.test.tsx`; the list row has no Delete button) | 4 |
 | `repos` | changed (Phase 21: `AddIssueRepo` and `RemoveIssueRepo` in `buzz-hive-api/tests/diagnose.rs`, over `FakeCodeHost`. The spec's reorder is not ported: the merge order is the order added, see the Phase 21 section) | 21 |
-| `reset` | pending | 17 |
+| `reset` | changed (`ResetCard` stops the run and sets the card idle, keeping its documents, `orchestrator/run.rs` near line 483. It does not close the pull request and opens no `reset_failed` item. A later run reuses the pull request already open for the card branch) | 17 |
 | `runners` | dropped (runner pairing, stages run on Buzz agents) | 1 |
-| `select` | pending | 5 |
-| `session` | pending | 3 |
-| `sidebar` | pending | 3 |
+| `select` | changed (a Select button and a Move to menu replace the hold gesture; select, move and archive are in buzz-app `Board.test.tsx` and the journey test) | 5 |
+| `session` | changed (the session, the poll and the token are covered by buzz-app `engine/session.test.ts` and `engine/poll.test.ts` and `buzz-hive-api/tests/auth.rs`; the dev issuer and the `pol` token are dropped, see Features) | 3 |
+| `sidebar` | changed (the sidebar follows the approved mock, a Messages-style list with no rail collapse; buzz-app `BeehivePage.test.tsx`) | 3 |
 | `signin-token` | dropped (sign-in modes) | 1 |
 | `signin` | dropped (sign-in modes) | 1 |
 | `skills` | dropped | 1 |
-| `sources-layout` | pending | 16 |
-| `sources-repo-rule` | pending | 16 |
-| `stack-seed` | pending | 16 |
+| `sources-layout` | changed (buzz-app `IntakePage.test.tsx` and the Phase 16 browser pass; there is no geometry spec) | 16 |
+| `sources-repo-rule` | changed (a rule is one repo picked from `ListRepos`, Phase 16) | 16 |
+| `stack-seed` | dropped (the Kiln local dev-stack seed script and dev sign-in) | 16 |
 | `start` | ported (Phase 6: an idle card with a workflow sits in To do, Start run posts the status and the first stage task, the card moves to Running; the third Go test, opening the Issue tab, waits for the card's later tabs) | 6 |
 | `testrun` | dropped (`StartTestRun`) | 1 |
 | `usage` | changed (the Go spec checks the Dynatrace report. Phase 12 replaces it with the Usage view: runs, how long they took, and per week the cards and runs that agents started, with no token or cost figure; buzz-app `UsagePage.test.tsx`, `beehive.journey.mjs`, `e2e/needs-you.spec.mjs` and `buzz-hive-api/tests/inbox.rs`) | 12 |
 | `web` | dropped (token screen, sign-in modes) | 1 |
-| `workflow-options` | pending | 19 |
+| `workflow-options` | changed (`SetWorkflowOptions` is in the engine and covered by `buzz-hive-api/tests/workflow_save.rs`. No screen calls it: the options editor is not built, Phase 19 deviations) | 19 |
+
+## Spikes
+
+One row per check the TDD listed before building. A decision is `ported` (the check ran and
+the design holds), `changed` (the design changed, or the check was not run in full: the row
+says what was and was not run) or `dropped` (the check no longer applies). A row may not say
+`pending`.
+
+| TDD spike | decision | phase |
+|---|---|---|
+| 1 sqlx second migration history | ported (`buzz-hive-store/tests/migrate_postgres_tests.rs`: migrations apply into `hive`, a second run is a no-op and the relay's `_sqlx_migrations` count is unchanged) | 1 |
+| 2 tenant-deletion catalog skips `hive` | ported (the tenant catalog test passes with `hive` present) | 1 |
+| 3 `buzz-ws-client` subscriptions and resume | dropped (Phase 12 has no relay listener, since gates and questions are answered by buttons and tools; the raw `REQ` with `since` the plan described was never built, so subscribe and resume were not exercised) | 12 |
+| 4 `ctx.host.request` in the web build | dropped (Beehive is a host feature: the desktop build calls two narrow Tauri commands and the web build uses `fetch`, so the plugin call is not used) | 3 |
+| 5 shim reads the agent key, tools from a runtime table | ported (`buzz-hive-mcp` signs a NIP-98 event with the agent's key and lists its tools from the `TOOLS` table through a hand-written `ServerHandler` on rmcp 3.9.0) | 7 |
+| 6 image carries the shim and the Claude CLI | changed (the files are in place: `deploy/aws/Dockerfile.agents` builds and copies `buzz-hive-mcp` and installs the Claude adapter and CLI. The image was not built here, so the running image is not verified) | 7, 24 |
+| 7 adapter reads HTTP `.mcp.json` entries | changed (not verified against the live adapter: a shape test checks the golden `mcp.json` and the engine's parser, and `buzz-acp` never reads the file, so there is no Rust loader) | 22 |
+| 8 `claude mcp login` without a terminal | changed (not verified, needs a real container: the link and status formats are assumed and appear only in the stubs) | 24 |
+| 9 OAuth tokens survive a restart | changed (not verified, needs a real container: the credential directory under the `/home/agent` volume is untested) | 24 |
+| 10 push the card branch, author identity, second agent fetches | changed (ported against a local bare repo and the replay server, `buzz-hive/tests/branch_handoff.rs`; the real GitHub token scopes and branch rules were not tested) | 17 |
+| 11 `buzz-cli` in the image, upload and download | ported (`buzz` is already in `Dockerfile.agents`; `buzz-hive/tests/e2e_files.rs` uploads and reads with `buzz media get`) | 9 |
+| 12 media reads under `BUZZ_MEDIA_READ_MODE=enforce` | ported (`e2e_files.rs` ran against a local relay in enforce mode; a member outside the private channel was refused) | 9 |
+| 13 `buzz-acp` sets the triggering event per turn | ported (`buzz-acp/src/requester.rs` writes the file per turn and its tests and a pool test cover a steered message) | 15 |
+| 14 claim reaches an outside HTTP MCP server | ported (`buzz-hive/tests/claim_echo.rs`: a test server verifies the claim against the JWKS and rejects a forged or expired one) | 15 |
+| 15 `since` is inclusive, replies carry the channel tag | dropped (no relay listener was built in Phase 12, so the filter was never sent; claims read `public.events` directly) | 12 |
+| 16 supervisor as a host service with Docker and SSM | changed (`buzz-hive-supervisor` runs behind signed calls with a systemd unit in `deploy/aws/`; real Docker restarts were not exercised) | 22 |
 
 ## Phase 3 deliverables
 
@@ -745,8 +771,9 @@ be watched in the agent's log.
 
 ### Deviations
 
-- Plan question 8 (copy a workflow's skills into the agent home) is not built. `ListSkills`
-  stays pending.
+- Plan question 8 (copy a workflow's skills into the agent home) is not built, so
+  `ListSkills` is dropped with the other skill methods (Phase 27: `DROPPED` in
+  `buzz-hive-api/src/routes/mod.rs`, empty `PENDING`).
 - The wire types (`Call`, `Signer`, `Verifier`) live in `buzz-hive-core`, so the engine's client
   and the supervisor share one definition and one test.
 - The apply call carries the agent's whole server list, so the supervisor needs no database.

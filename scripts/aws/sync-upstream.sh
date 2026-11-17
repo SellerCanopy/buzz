@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Merges upstream/main into the current branch. Never pushes, never resolves conflicts.
+# Merges upstream/main into the current branch. Never pushes. A conflict stops the merge,
+# except one confined to the lock files (Cargo.lock, mobile/pubspec.lock): those are
+# regenerated from the merged manifests instead of resolved by hand.
 # Env: UPSTREAM_URL (default https://github.com/block/buzz.git).
 set -euo pipefail
 
@@ -7,7 +9,18 @@ UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/block/buzz.git}"
 
 die() { echo "sync-upstream: $*" >&2; exit 1; }
 
+# regenerate_lock <file>: take upstream's copy, then let the package manager add what this
+# fork's manifests need. Runs from the repository root.
+regenerate_lock() {
+  case "$1" in
+    Cargo.lock) git checkout --theirs -- Cargo.lock && cargo metadata --format-version 1 >/dev/null ;;
+    mobile/pubspec.lock) git checkout --theirs -- mobile/pubspec.lock && (cd mobile && flutter pub get) ;;
+  esac
+}
+
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+
+cd "$(git rev-parse --show-toplevel)"
 
 branch="$(git symbolic-ref --quiet --short HEAD || true)"
 [ -n "$branch" ] || die "HEAD is detached. Check out a branch first."
@@ -44,7 +57,23 @@ if ! merge_out="$(git merge --no-edit upstream/main 2>&1)"; then
   echo "$merge_out" >&2
   if [ -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
     conflicts="$(git diff --name-only --diff-filter=U)"
-    if [ -n "$conflicts" ]; then
+    if [ -n "$conflicts" ] \
+      && [ -z "$(printf '%s\n' "$conflicts" | grep -vxF -e Cargo.lock -e mobile/pubspec.lock)" ]; then
+      echo "sync-upstream: only lock files conflict. Regenerating them:" >&2
+      for lock in $conflicts; do
+        echo "  $lock" >&2
+        if ! regenerate_lock "$lock" >&2; then
+          echo "sync-upstream: could not regenerate $lock. The merge is left in place." >&2
+          echo "Fix the cause and regenerate it, then 'git add' it and run 'git commit', or run 'git merge --abort'." >&2
+          exit 1
+        fi
+        git add -- "$lock"
+      done
+      git commit -q --no-edit || die "the merge commit failed after the lock files were regenerated"
+      echo "Merged $count commit(s) from upstream/main into $branch, with the lock files regenerated. Nothing was pushed."
+      echo "To publish: git push origin $branch"
+      exit 0
+    elif [ -n "$conflicts" ]; then
       echo "sync-upstream: merge stopped on conflicts. Conflicting files:" >&2
       printf '%s\n' "$conflicts" | sed 's/^/  /' >&2
       echo "Resolve them, then run 'git commit', or run 'git merge --abort' to undo." >&2
