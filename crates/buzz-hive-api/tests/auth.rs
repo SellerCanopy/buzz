@@ -121,7 +121,11 @@ async fn a_stale_event_is_unauthenticated() {
     let router = router(&app(member(&keys), MemStore::new()));
     let (status, body) = send(
         &router,
-        token_request(&sign(&keys, "http://hive.test/auth/token", 120)),
+        token_request(&sign(
+            &keys,
+            "http://hive.test/auth/token",
+            buzz_auth::TIMESTAMP_TOLERANCE_SECS + 60,
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

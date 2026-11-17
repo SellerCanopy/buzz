@@ -339,6 +339,15 @@ pub struct Config {
     /// Set `BUZZ_AUDIT_ENABLED=false` for deployments that do not require it.
     pub audit_enabled: bool,
 
+    /// Which workflow runs may direct agents. With `owner` (owner-only agent
+    /// mentions), a workflow message carries `buzz:workflow-mention` tags only
+    /// if its run was started by the workflow's owner or by a timer and every
+    /// step of the definition is `send_message` or `delay`. Use `owner` when
+    /// people other than a workflow's owner can trigger it.
+    ///
+    /// Default: `any`. Set via `BUZZ_WORKFLOW_AGENT_MENTIONS=any|owner`.
+    pub workflow_agent_mentions: buzz_workflow::AgentMentions,
+
     /// Optional override for ephemeral channel TTL (in seconds).
     /// When set, any channel created with a TTL tag will use this value instead
     /// of the client-provided one. Useful for testing ephemeral expiry quickly.
@@ -545,6 +554,10 @@ fn parse_operator_api_origin(raw: &str) -> Result<String, ConfigError> {
     Ok(raw.trim_end_matches('/').to_string())
 }
 
+/// The gateway's platform-neutral delivery route, and its APNs-named alias,
+/// which gateways keep serving until relays have moved to the neutral route.
+const PUSH_GATEWAY_DELIVERY_PATHS: [&str; 2] = ["/v1/deliveries", "/v1/deliveries/apns"];
+
 fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
     let url = url::Url::parse(raw.trim()).map_err(|e| {
         ConfigError::InvalidValue(format!(
@@ -556,12 +569,12 @@ fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
         || (url.scheme() == "https" && url.port().is_some())
         || !url.username().is_empty()
         || url.password().is_some()
-        || url.path() != "/v1/deliveries/apns"
+        || !PUSH_GATEWAY_DELIVERY_PATHS.contains(&url.path())
         || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue(
-            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTP(S) /v1/deliveries/apns URL without credentials, query, or fragment; explicit ports are supported only for HTTP"
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTP(S) /v1/deliveries (or the older /v1/deliveries/apns) URL without credentials, query, or fragment; explicit ports are supported only for HTTP"
                 .to_string(),
         ));
     }
@@ -633,6 +646,19 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, ConfigError> {
                 "{name} must be true or false"
             ))),
         },
+    }
+}
+
+fn parse_workflow_agent_mentions() -> Result<buzz_workflow::AgentMentions, ConfigError> {
+    const NAME: &str = "BUZZ_WORKFLOW_AGENT_MENTIONS";
+    match std::env::var(NAME) {
+        Err(std::env::VarError::NotPresent) => Ok(buzz_workflow::AgentMentions::Any),
+        Err(error) => Err(ConfigError::InvalidValue(format!(
+            "{NAME} must be valid UTF-8: {error}"
+        ))),
+        Ok(value) => value
+            .parse()
+            .map_err(|error| ConfigError::InvalidValue(format!("{NAME}: {error}"))),
     }
 }
 
@@ -1291,6 +1317,7 @@ impl Config {
         let privacy_markdown = read_policy_markdown("BUZZ_PRIVACY_POLICY_MARKDOWN")?;
         let age_attestation_required = parse_optional_bool("BUZZ_AGE_ATTESTATION_REQUIRED")?;
         let audit_enabled = parse_bool("BUZZ_AUDIT_ENABLED", true)?;
+        let workflow_agent_mentions = parse_workflow_agent_mentions()?;
         let join_policy = if terms_markdown.is_none()
             && privacy_markdown.is_none()
             && !age_attestation_required
@@ -1553,6 +1580,7 @@ impl Config {
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
             audit_enabled,
+            workflow_agent_mentions,
             ephemeral_ttl_override,
             git_repo_path,
             git_pack_cache_path,
@@ -2670,6 +2698,32 @@ mod tests {
     }
 
     #[test]
+    fn workflow_agent_mentions_defaults_to_any_and_rejects_other_values() {
+        use buzz_workflow::AgentMentions;
+        const NAME: &str = "BUZZ_WORKFLOW_AGENT_MENTIONS";
+        let _guards = env_guards();
+        let previous = std::env::var_os(NAME);
+        std::env::remove_var(NAME);
+        assert_eq!(parse_workflow_agent_mentions().unwrap(), AgentMentions::Any);
+        std::env::set_var(NAME, "any");
+        assert_eq!(parse_workflow_agent_mentions().unwrap(), AgentMentions::Any);
+        std::env::set_var(NAME, "owner");
+        assert_eq!(
+            parse_workflow_agent_mentions().unwrap(),
+            AgentMentions::Owner
+        );
+        for invalid in ["true", "", "OWNER"] {
+            std::env::set_var(NAME, invalid);
+            assert!(parse_workflow_agent_mentions().is_err(), "{invalid:?}");
+        }
+        if let Some(value) = previous {
+            std::env::set_var(NAME, value);
+        } else {
+            std::env::remove_var(NAME);
+        }
+    }
+
+    #[test]
     fn audit_logging_rejects_invalid_boolean() {
         let _guards = env_guards();
         let previous = std::env::var_os("BUZZ_AUDIT_ENABLED");
@@ -2836,7 +2890,7 @@ mod tests {
 
         std::env::set_var(
             "BUZZ_PUSH_GATEWAY_DELIVERY_URL",
-            "https://push.example/v1/deliveries/apns",
+            "https://push.example/v1/deliveries",
         );
         let config = Config::from_env().expect("enabled push config");
         assert!(config.push_enabled);
@@ -2845,7 +2899,7 @@ mod tests {
                 .push_gateway_delivery_url
                 .as_ref()
                 .map(url::Url::as_str),
-            Some("https://push.example/v1/deliveries/apns")
+            Some("https://push.example/v1/deliveries")
         );
 
         std::env::set_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL", "");
@@ -2892,16 +2946,30 @@ mod tests {
 
     #[test]
     fn push_gateway_url_is_exact_and_fail_closed() {
-        assert!(parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns").is_ok());
-        let delivery_url = "http://push.example:8080/v1/deliveries/apns";
-        assert_eq!(
-            parse_push_gateway_delivery_url(delivery_url)
-                .unwrap()
-                .as_str(),
-            delivery_url
-        );
-        assert!(parse_push_gateway_delivery_url("http://push-gateway/v1/deliveries/apns").is_ok());
+        for delivery_url in [
+            "https://push.example/v1/deliveries",
+            "https://push.example/v1/deliveries/apns",
+            "http://push.example:8080/v1/deliveries",
+            "http://push.example:8080/v1/deliveries/apns",
+            "http://push-gateway/v1/deliveries",
+            "http://push-gateway/v1/deliveries/apns",
+        ] {
+            assert_eq!(
+                parse_push_gateway_delivery_url(delivery_url)
+                    .unwrap()
+                    .as_str(),
+                delivery_url
+            );
+        }
         for invalid in [
+            "http://push-gateway:8080/v1/deliveries?token=x",
+            "http://user@push-gateway:8080/v1/deliveries",
+            "http://push-gateway:8080/v1/deliveries#fragment",
+            "https://push.example:8443/v1/deliveries",
+            "https://push.example/v1/deliveries/",
+            "https://push.example/v1/deliveries?token=x",
+            "https://user@push.example/v1/deliveries",
+            "https://push.example/v1/deliveries/other",
             "ftp://push.example/v1/deliveries/apns",
             "http://push-gateway:8080/v1/deliveries/apns?token=x",
             "http://user@push-gateway:8080/v1/deliveries/apns",
