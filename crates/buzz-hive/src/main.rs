@@ -323,7 +323,11 @@ async fn run() -> Result<(), String> {
         };
         tokio::spawn(drain.run(stopped))
     });
-    let router = buzz_hive_api::finish(buzz_hive_api::routes(), app);
+    let mut routes = buzz_hive_api::routes();
+    if let Some(web) = buzz_hive_api::web::from_config(config.web_dir.as_deref()) {
+        routes = routes.merge(web);
+    }
+    let router = buzz_hive_api::finish(routes, app);
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:buzz/features/beehive/beehive_screen.dart';
+import 'package:buzz/features/beehive/beehive_token.dart';
 import 'package:buzz/features/channels/default_agent_launcher.dart';
 import 'package:buzz/features/agents/agents_page.dart';
 import 'package:buzz/features/channels/me/me_section.dart';
@@ -27,6 +29,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
+
+import '../beehive/fake_webview_platform.dart';
 
 // Production iOS capsules fit the semibold label plus 16 points on each side.
 double nativeFilterWidth(String label) =>
@@ -49,12 +54,14 @@ void main() {
     String? bestie,
     Stream<String?>? bestieUpdates,
     ValueChanged<String>? onOpenBestie,
+    String beehiveUrl = '',
   }) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
     return ProviderScope(
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
+        beehiveUrlProvider.overrideWithValue(beehiveUrl),
         inboxHasUnreadProvider.overrideWithValue(inboxUnread),
         defaultAgentProvider.overrideWith(
           (ref) => bestieUpdates ?? Stream.value(bestie),
@@ -97,6 +104,49 @@ void main() {
       ),
     );
   }
+
+  for (final (url, shown) in [('', false), ('https://beehive.example', true)]) {
+    testWidgets('the Beehive entry is ${shown ? 'shown' : 'hidden'} '
+        'when BUZZ_BEEHIVE_URL is ${shown ? 'set' : 'unset'}', (tester) async {
+      await tester.pumpWidget(await buildHome(beehiveUrl: url));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Community menu'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Agents'), findsOneWidget);
+      expect(find.text('Beehive'), shown ? findsOneWidget : findsNothing);
+    });
+  }
+
+  testWidgets('choosing Beehive in the menu opens the Beehive screen', (
+    tester,
+  ) async {
+    final previous = WebViewPlatform.instance;
+    final platform = FakeWebViewPlatform();
+    WebViewPlatform.instance = platform;
+    addTearDown(() {
+      if (previous != null) WebViewPlatform.instance = previous;
+    });
+    await tester.pumpWidget(
+      await buildHome(beehiveUrl: 'https://beehive.example'),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(BeehiveScreen), findsNothing);
+
+    await tester.tap(find.byTooltip('Community menu'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Beehive'));
+    // The page shows a spinner while it loads, so it never settles.
+    for (var i = 0; i < 6; i++) {
+      await tester.pump(const Duration(milliseconds: 250));
+    }
+
+    expect(find.byType(BeehiveScreen), findsOneWidget);
+    expect(
+      platform.controller.loaded.single.uri,
+      Uri.parse('https://beehive.example/beehive/'),
+    );
+  });
 
   testWidgets('feedback clears floating navigation and wraps large text', (
     tester,

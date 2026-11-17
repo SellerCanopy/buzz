@@ -4,6 +4,12 @@
 # The image also carries buzz-hive-mcp, the stdio tool server an agent runs, and
 # buzz-hive-supervisor, which the host copies out and runs as a systemd service
 # (deploy/aws/buzz-hive-supervisor.service). The service never runs it in a container.
+#
+# Optional: the Beehive web page the phone's web view loads, served at /beehive/. Build the
+# bundle in buzz-app first (output dist-beehive/), then pass it as a named build context:
+#   docker build --build-context beehive-web=/path/to/dist-beehive \
+#     -f deploy/aws/Dockerfile.hive -t buzz-hive:local .
+# Without it the image builds as before, prints a skip line, and serves no page.
 ARG RUST_VERSION=1.98
 ARG DEBIAN_VERSION=bookworm
 
@@ -26,6 +32,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -D -m 0755 target/release/buzz-hive-supervisor /out/buzz-hive-supervisor \
     && strip /out/buzz-hive /out/buzz-hive-mcp /out/buzz-hive-supervisor
 
+# Empty unless --build-context beehive-web=<dir> replaces it with the built page.
+FROM scratch AS beehive-web
+
 FROM debian:${DEBIAN_VERSION}-slim AS runtime
 LABEL org.opencontainers.image.title="Buzz Hive" \
       org.opencontainers.image.description="Beehive workflow engine service for Buzz" \
@@ -39,6 +48,17 @@ RUN apt-get update \
 COPY --from=builder /out/buzz-hive /usr/local/bin/buzz-hive
 COPY --from=builder /out/buzz-hive-mcp /usr/local/bin/buzz-hive-mcp
 COPY --from=builder /out/buzz-hive-supervisor /usr/local/bin/buzz-hive-supervisor
+COPY --from=beehive-web / /opt/buzz/beehive-web/
+# Symbolic --chmod on COPY needs a newer Dockerfile frontend than the one this file pins.
+# This runs as root, before USER: the service reads the page and cannot change it.
+RUN mkdir -p /opt/buzz/beehive-web && chmod -R a+rX,go-w /opt/buzz/beehive-web
+RUN if [ -f /opt/buzz/beehive-web/index.html ]; then \
+      echo "beehive-web: bundle copied to /opt/buzz/beehive-web"; \
+    else \
+      echo "beehive-web: skipped, no --build-context beehive-web=<dir> given; the image serves no Beehive page"; \
+    fi
+# The service serves the page only when this folder holds an index.html.
+ENV BUZZ_HIVE_WEB_DIR=/opt/buzz/beehive-web
 EXPOSE 3100
 USER buzz:buzz
 WORKDIR /var/lib/buzz

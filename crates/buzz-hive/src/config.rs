@@ -27,6 +27,9 @@ pub struct Config {
     /// `BUZZ_HIVE_WORKFLOWS_DIR`, a folder of workflow packages loaded beside the built-in
     /// ones. Unset means built-ins only.
     pub workflows_dir: Option<std::path::PathBuf>,
+    /// `BUZZ_HIVE_WEB_DIR`, a built Beehive web page served at `/beehive/` for the phone's web
+    /// view. Unset means the service serves no page.
+    pub web_dir: Option<std::path::PathBuf>,
     /// `BUZZ_HIVE_NOSTR_KEY`, the secret key of the Beehive account, as `nsec1...` or 64
     /// hex characters. It signs the posts in the update channel. Unset means the service
     /// runs but cannot start a run.
@@ -143,6 +146,7 @@ impl Config {
             workflows_dir: get("BUZZ_HIVE_WORKFLOWS_DIR")
                 .filter(|v| !v.trim().is_empty())
                 .map(Into::into),
+            web_dir: optional("BUZZ_HIVE_WEB_DIR").map(Into::into),
             nostr_key,
             relay_url,
             db_max_connections: count("BUZZ_HIVE_DB_MAX_CONNECTIONS", 10, 200)? as u32,
@@ -315,6 +319,19 @@ mod tests {
         pairs.push(("BUZZ_HIVE_WORKFLOWS_DIR", "/srv/workflows"));
         let config = Config::from_lookup(env(&pairs)).unwrap();
         assert_eq!(config.workflows_dir, Some("/srv/workflows".into()));
+    }
+
+    #[test]
+    fn the_web_folder_is_optional() {
+        let config = Config::from_lookup(env(&FULL)).unwrap();
+        assert_eq!(config.web_dir, None);
+        let mut pairs = FULL.to_vec();
+        pairs.push(("BUZZ_HIVE_WEB_DIR", " /opt/buzz/beehive-web "));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.web_dir, Some("/opt/buzz/beehive-web".into()));
+        pairs.push(("BUZZ_HIVE_WEB_DIR", "  "));
+        let config = Config::from_lookup(env(&pairs)).unwrap();
+        assert_eq!(config.web_dir, None);
     }
 
     #[test]

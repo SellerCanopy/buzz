@@ -14,9 +14,19 @@ The Beehive workflow engine service. It runs beside the Buzz relay, keeps its st
 | `BUZZ_HIVE_NOSTR_KEY` | to start runs | The Beehive account's secret key, `nsec1...` or 64 hex characters |
 | `BUZZ_HIVE_RELAY_URL` | with the key | The relay's address, such as `ws://relay:3000` |
 | `BUZZ_HIVE_LISTEN`, `BUZZ_HIVE_ALLOWED_ORIGINS`, `BUZZ_HIVE_WORKFLOWS_DIR` | no | See `src/config.rs` |
+| `BUZZ_HIVE_WEB_DIR` | no | A built Beehive web page, served at `/beehive/` for the phone's web view. Unset serves nothing |
 
 Without `BUZZ_HIVE_NOSTR_KEY` the service runs, and starting a run or saving the update
 channel is refused with a message that names the variable.
+
+## The phone's web page
+
+With `BUZZ_HIVE_WEB_DIR` set to a folder holding the built page (`index.html` at its root, base
+path `/beehive/`), the service serves it at `{BUZZ_HIVE_PUBLIC_URL}/beehive/`, on the same origin
+as `/auth/token`. It needs no sign-in, sends a strict Content-Security-Policy, and answers an
+unknown path under `/beehive/` with `index.html`. A folder with no `index.html` serves nothing
+and logs a warning. The AWS image takes the bundle as a named build context, and Caddy routes
+`/beehive/*` to the service; see the top of `deploy/aws/Dockerfile.hive`.
 
 ## Starting a run
 

@@ -104,6 +104,14 @@ and reconnect sign-in for a public build's `BUZZ_BUILDERLAB_RELAYS`. It
 defaults off: configure backend assertion issuance before enabling mobile
 authentication, and enable relay enforcement last.
 
+## Beehive
+
+`--dart-define=BUZZ_BEEHIVE_URL=https://beehive.example` adds a Beehive entry
+to the community menu. It opens `<url>/beehive/` in a web view. The app signs a
+NIP-98 event with the account key, trades it at `<url>/auth/token`, and hands
+the page only the resulting token through `window.__beehiveNative.token()`.
+Without the setting the entry is not shown.
+
 ## Setup
 
 Use the Flutter SDK pinned by the repository. Activate Hermit from the repo
